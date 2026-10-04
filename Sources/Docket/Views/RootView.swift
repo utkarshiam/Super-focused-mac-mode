@@ -3,6 +3,8 @@ import SwiftUI
 struct RootView: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var app: AppState
+    @EnvironmentObject var focus: FocusTimer
+    @EnvironmentObject var calendar: CalendarService
 
     var body: some View {
         HStack(spacing: 0) {
@@ -19,6 +21,7 @@ struct RootView: View {
         .background(Color.paper.ignoresSafeArea())
         .overlay(alignment: .top) { recoveryBanner }
         .overlay(alignment: .bottom) { toast }
+        .overlay { CelebrationOverlay() }
         .overlay {
             if app.showPalette {
                 CommandPalette()
@@ -26,6 +29,14 @@ struct RootView: View {
             }
         }
         .animation(Motion.fast, value: app.showPalette)
+        .sheet(item: $app.aiPlanner) { request in
+            // Sheets don't always inherit the window's environment objects.
+            AIPlanSheet(request: request)
+                .environmentObject(store)
+                .environmentObject(app)
+                .environmentObject(focus)
+                .environmentObject(calendar)
+        }
         .tint(Color.ink)
         .frame(minWidth: 980, minHeight: 600)
     }
@@ -34,6 +45,8 @@ struct RootView: View {
         switch app.selection {
         case .notes: NotesView()
         case .insights: InsightsView()
+        case .search: SearchView()
+        case .suggestions: SuggestionsView()
         default: TasksView()
         }
     }
@@ -99,6 +112,7 @@ struct SidebarView: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var app: AppState
     @EnvironmentObject var focus: FocusTimer
+    @ObservedObject private var integrations = Integrations.shared
     @State private var editingList: TaskList?
     @State private var listToDelete: TaskList?
     @Namespace private var ns
@@ -121,13 +135,21 @@ struct SidebarView: View {
             .padding(.top, 40)
             .padding(.bottom, Space.lg)
 
+            SidebarSearchField()
+                .padding(.horizontal, Space.md)
+                .padding(.bottom, Space.sm)
+
             ScrollView {
                 VStack(alignment: .leading, spacing: 2) {
                     navRow(.calendar, "Calendar", "calendar", count: store.count(for: .calendar), alert: overdue > 0)
                     navRow(.inbox, "Inbox", "tray", count: store.count(for: .inbox), dropToList: .some(nil))
+                    navRow(.waiting, "Waiting", "hourglass", count: store.count(for: .waiting))
                     navRow(.important, "Important", "flag", count: store.count(for: .important))
                     navRow(.all, "All tasks", "square.stack", count: nil)
                     navRow(.completed, "Completed", "checkmark.circle", count: nil)
+                    if integrations.isAnyConnected || integrations.pendingCount > 0 {
+                        navRow(.suggestions, "From Slack & Gmail", "tray.and.arrow.down", count: integrations.pendingCount)
+                    }
 
                     sectionLabel("Lists") {
                         Button {

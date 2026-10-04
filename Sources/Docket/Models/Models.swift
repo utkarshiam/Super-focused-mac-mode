@@ -119,12 +119,19 @@ struct TaskItem: Codable, Identifiable, Hashable {
     var noteLine: String?
     /// Manual position among the day's tasks (set by drag and drop). Nil = order by priority.
     var rank: Double?
+    /// Someone else is doing it (delegated); shown as "Waiting on Sam".
+    var waitingOn: String?
+    /// How many times its date has been pushed later. Drives the "slipping" nudge.
+    var postponeCount = 0
+    /// Where it came from (a Slack message, an email, AI). Links back to the original.
+    var source: TaskSource?
 
     init(title: String) { self.title = title }
 
     enum CodingKeys: String, CodingKey {
         case id, title, notes, listID, tags, priority, estimateMinutes, trackedSeconds, dueDate, dueHasTime
         case scheduledDate, reminders, recurrence, subtasks, completedAt, createdAt, updatedAt, linkedNoteID, noteLine, rank
+        case waitingOn, postponeCount, source
     }
 
     init(from decoder: Decoder) throws {
@@ -149,6 +156,9 @@ struct TaskItem: Codable, Identifiable, Hashable {
         linkedNoteID = c.value(.linkedNoteID, default: nil)
         noteLine = c.value(.noteLine, default: nil)
         rank = c.value(.rank, default: nil)
+        waitingOn = c.value(.waitingOn, default: nil)
+        postponeCount = c.value(.postponeCount, default: 0)
+        source = c.value(.source, default: nil)
     }
 
     var isCompleted: Bool { completedAt != nil }
@@ -190,6 +200,33 @@ struct TaskItem: Codable, Identifiable, Hashable {
 
     var hasAlarm: Bool { reminders.contains { $0.isAlarm } }
     var subtaskProgress: (done: Int, total: Int) { (subtasks.filter(\.done).count, subtasks.count) }
+}
+
+// MARK: - Task source
+
+/// The message or tool a task came from (Slack, Gmail, AI), so the task can link back to it.
+struct TaskSource: Codable, Hashable {
+    enum Kind: String, Codable { case slack, gmail, ai }
+    var kind: Kind
+    /// Stable id for de-duplication, e.g. "slack:C024BE91L/1712345678.000100", "gmail:18c2f…".
+    var externalID: String
+    /// Link back to the message (Slack permalink, Gmail thread URL).
+    var url: URL?
+    /// Short context shown small, e.g. "#leadership · Priya" or "Sam Lee · Q3 numbers".
+    var label: String
+}
+
+extension TaskSource {
+    private enum Keys: String, CodingKey { case kind, externalID, url, label }
+
+    // In an extension so the memberwise initializer stays available.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        kind = try c.decode(Kind.self, forKey: .kind)
+        externalID = try c.decode(String.self, forKey: .externalID)
+        url = c.value(.url, default: nil)
+        label = c.value(.label, default: "")
+    }
 }
 
 // MARK: - Note
@@ -377,6 +414,8 @@ extension Priority: Sendable {}
 extension Subtask: Sendable {}
 extension Reminder: Sendable {}
 extension Reminder.Trigger: Sendable {}
+extension TaskSource: Sendable {}
+extension TaskSource.Kind: Sendable {}
 extension TaskItem: Sendable {}
 extension Note: Sendable {}
 extension ListColor: Sendable {}

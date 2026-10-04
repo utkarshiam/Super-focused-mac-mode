@@ -325,8 +325,31 @@ extension Store {
             let items = open.filter { $0.tags.contains { $0.caseInsensitiveCompare(tag) == .orderedSame } }
             return [TaskSection(id: "tag", title: "#\(tag)", tasks: sorted(items, by: sort))].filter { !$0.tasks.isEmpty }
 
-        case .notes, .insights:
+        case .waiting:
+            let items = open.filter { !($0.waitingOn ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            // Smart order here is by when it's needed back; any other sort the user picked still applies.
+            let ordered = sort == .smart ? waitingOrder(items) : sorted(items, by: sort)
+            return [TaskSection(id: "waiting", title: "Waiting on others", tasks: ordered)].filter { !$0.tasks.isEmpty }
+
+        case .notes, .insights, .search, .suggestions:
             return []
+        }
+    }
+
+    /// Delegated tasks by deadline (or plan date when there's none), then title. Undated ones go last.
+    private func waitingOrder(_ items: [TaskItem]) -> [TaskItem] {
+        let cal = calendar
+        func when(_ t: TaskItem) -> Date {
+            if let due = t.dueDate { return t.dueHasTime ? due : cal.endOfDay(for: due) }
+            if let planned = t.scheduledDate { return cal.endOfDay(for: planned) }
+            return .distantFuture
+        }
+        return items.sorted { a, b in
+            let wa = when(a), wb = when(b)
+            if wa != wb { return wa < wb }
+            let byTitle = a.title.localizedStandardCompare(b.title)
+            if byTitle != .orderedSame { return byTitle == .orderedAscending }
+            return a.createdAt < b.createdAt
         }
     }
 

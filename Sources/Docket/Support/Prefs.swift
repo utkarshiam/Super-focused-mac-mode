@@ -22,6 +22,7 @@ enum Prefs {
         static let sortMode = "taskSortMode"
         static let showCompletedInLists = "showCompletedInLists"
         static let appearance = "appearance"
+        static let compactRows = "compactRows"
     }
 
     static func registerDefaults() {

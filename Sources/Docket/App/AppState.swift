@@ -7,20 +7,36 @@ enum SidebarItem: Hashable {
     case tag(String)
     case notes
     case insights
+    case search, waiting, suggestions
 
     var isTaskView: Bool {
         switch self {
-        case .notes, .insights: false
+        case .notes, .insights, .suggestions: false
         default: true
         }
     }
+}
+
+/// What the "Plan with AI" sheet starts from.
+struct AIPlannerRequest: Identifiable {
+    let id = UUID()
+    var text = ""
+    /// Set when planning from a note: created tasks link back to it.
+    var noteID: UUID?
+    /// Pre-filled drafts to review (e.g. from a Slack/Gmail suggestion); skips the prompt step when non-empty.
+    var drafts: [TaskDraft] = []
 }
 
 /// UI navigation state shared by the main window, menu bar popover, quick capture and command palette.
 @MainActor
 final class AppState: ObservableObject {
     @Published var selection: SidebarItem = .calendar {
-        didSet { if oldValue != selection { selectedTaskID = nil } }
+        didSet {
+            if oldValue != selection {
+                selectedTaskID = nil
+                selectedTaskIDs = []
+            }
+        }
     }
 
     enum CalendarMode: String { case agenda, month }
@@ -41,11 +57,36 @@ final class AppState: ObservableObject {
         withAnimation(Motion.sheet) { sidebarVisible.toggle() }
     }
 
+    /// ⌘F: puts the cursor in the sidebar search field, bringing the sidebar back first if it's hidden.
+    func beginSearch() {
+        guard sidebarVisible else {
+            toggleSidebar()
+            // The field only exists once the sidebar is back on screen.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in self?.focusSearch += 1 }
+            return
+        }
+        focusSearch += 1
+    }
+
     enum NoteMode: Hashable { case read, edit }
     /// Read (formatted) or Edit (Markdown) per note, settled when a note first opens:
     /// Read if it has content, Edit if it's empty.
     @Published var noteModes: [UUID: NoteMode] = [:]
     @Published var selectedTaskID: UUID?
+    /// Several tasks selected (⌘-click / ⇧-click / ⌘A). Two or more = bulk editing; selectedTaskID stays the focused one.
+    @Published var selectedTaskIDs: Set<UUID> = []
+    /// Global search text (sidebar field). Non-empty shows the Search view.
+    @Published var searchText = ""
+    /// Bumped to move keyboard focus into the sidebar search field (⌘F).
+    @Published var focusSearch = 0
+    /// The view to go back to when search is cleared.
+    var selectionBeforeSearch: SidebarItem = .calendar
+    /// Dense one-line rows. Remembered across launches (UserDefaults "compactRows").
+    @Published var compactRows = UserDefaults.standard.bool(forKey: Prefs.Key.compactRows) {
+        didSet { UserDefaults.standard.set(compactRows, forKey: Prefs.Key.compactRows) }
+    }
+    /// Opens the "Plan with AI" sheet.
+    @Published var aiPlanner: AIPlannerRequest?
     @Published var selectedNoteID: UUID?
     @Published var showPalette = false
     @Published var noteSearch = ""
@@ -191,6 +232,7 @@ final class AppState: ObservableObject {
             } else {
                 markRecentlyCompleted(id)
                 NSSound(named: "Pop")?.play()
+                Extras.didComplete(id, store: store, app: self)
             }
         }
     }
