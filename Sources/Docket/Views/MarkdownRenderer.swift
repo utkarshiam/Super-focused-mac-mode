@@ -57,8 +57,8 @@ enum MarkdownRenderer {
 
     private static func re(_ p: String) -> NSRegularExpression { try! NSRegularExpression(pattern: p) }
     /// Any indent (fences sit deep under nested list items) and a whole info string ("js title=…").
-    /// The possessive `*+` keeps a long line from backtracking for seconds.
-    private static let fence = re(#"^\s*(`{3,}|~{3,})[ \t]*([^`\s]*+)[^`]*$"#)
+    /// The possessive `*+`s keep a long line from backtracking for seconds.
+    private static let fence = re(#"^\s*(`{3,}|~{3,})[ \t]*+([^`\s]*+)[^`]*$"#)
     private static let rule = re(#"^\s{0,3}([-*_])(\s*\1){2,}\s*$"#)
     private static let heading = re(#"^\s{0,3}(#{1,6})(?:\s+(.*))?$"#)
     private static let quote = re(#"^\s{0,3}>\s?(.*)$"#)
@@ -177,10 +177,11 @@ enum MarkdownRenderer {
                 continue
             }
 
-            // ATX heading, without its optional closing #s (but keeping the one in "C#")
+            // ATX heading, without its optional closing #s (but keeping the one in "C#").
+            // The lookbehind tries each run of spaces once, so a long run can't take seconds.
             if let h = match(heading, line) {
                 let level = (h[1] ?? "#").count
-                let text = (h[2] ?? "").replacingOccurrences(of: #"(?:^|\s+)#+\s*$"#, with: "", options: .regularExpression)
+                let text = (h[2] ?? "").replacingOccurrences(of: #"(?:^|(?<!\s)\s+)#+\s*$"#, with: "", options: .regularExpression)
                 appendHeading(text.trimmingCharacters(in: .whitespaces), level: level, quotes: quotes, color: textColor, into: out)
                 i += 1
                 continue

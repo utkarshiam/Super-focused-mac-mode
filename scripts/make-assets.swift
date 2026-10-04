@@ -32,7 +32,7 @@ func drawIcon(size: CGFloat) -> NSBitmapImageRep {
     shape.fill()
     ctx.restoreGState()
 
-    // Ink and paper (octo-patient palette): flat ink body, no gradient.
+    // Ink and paper: flat ink body, no gradient.
     let ink = NSColor(srgbRed: 0x0E / 255, green: 0x0E / 255, blue: 0x0C / 255, alpha: 1)
     let paper = NSColor(srgbRed: 0xFB / 255, green: 0xFB / 255, blue: 0xF9 / 255, alpha: 1)
     let ink3 = NSColor(srgbRed: 0xA3 / 255, green: 0xA3 / 255, blue: 0x9E / 255, alpha: 1)

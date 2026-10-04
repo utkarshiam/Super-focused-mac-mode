@@ -112,3 +112,152 @@ final class ReaderCopyTests: XCTestCase {
         XCTAssertEqual(pb.string(forType: .string), "Run these:\nnpm install\nnpm start\nBuy milk\nPost letter\nFirst line\nsecond line")
     }
 }
+
+/// A file dragged in from Finder, on a private pasteboard.
+private final class FileDrag: NSObject, NSDraggingInfo {
+    let draggingPasteboard = NSPasteboard(name: NSPasteboard.Name("docket-tests-\(UUID().uuidString)"))
+    let draggingLocation: NSPoint
+
+    init(_ url: URL, at location: NSPoint = .zero) {
+        draggingLocation = location
+        draggingPasteboard.clearContents()
+        draggingPasteboard.writeObjects([url as NSURL])
+    }
+
+    deinit { draggingPasteboard.releaseGlobally() }
+
+    var draggingDestinationWindow: NSWindow? { nil }
+    var draggingSourceOperationMask: NSDragOperation { .copy }
+    var draggedImageLocation: NSPoint { draggingLocation }
+    var draggedImage: NSImage? { nil }
+    var draggingSource: Any? { nil }
+    var draggingSequenceNumber: Int { 1 }
+    var draggingFormation: NSDraggingFormation = .default
+    var animatesToDestination = false
+    var numberOfValidItemsForDrop = 1
+    var springLoadingHighlight: NSSpringLoadingHighlight { .none }
+    func slideDraggedImage(to screenPoint: NSPoint) {}
+    func resetSpringLoading() {}
+    func enumerateDraggingItems(options enumOpts: NSDraggingItemEnumerationOptions = [], for view: NSView?, classes classArray: [AnyClass],
+                                searchOptions: [NSPasteboard.ReadingOptionKey: Any] = [:],
+                                using block: @escaping (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void) {}
+}
+
+/// Photos and videos dropped on a note are copied in the background, then land where they were dropped.
+@MainActor
+final class NoteMediaDropTests: XCTestCase {
+    var dir: URL!
+    var previous: URL!
+    /// Holds the editor; it is never put on screen.
+    var window: NSWindow?
+
+    override func setUp() async throws {
+        dir = FileManager.default.temporaryDirectory.appendingPathComponent("docket-drop-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        previous = MediaLibrary.dataDirectory
+        MediaLibrary.dataDirectory = dir
+    }
+
+    override func tearDown() async throws {
+        window = nil
+        MediaLibrary.dataDirectory = previous
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    /// A small PNG outside the library, like one in Finder.
+    private func photo(_ name: String) throws -> URL {
+        let image = NSImage(size: NSSize(width: 8, height: 8), flipped: false) { r in
+            NSColor.red.setFill()
+            r.fill()
+            return true
+        }
+        let png = try XCTUnwrap(image.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:))?.representation(using: .png, properties: [:]))
+        let url = dir.appendingPathComponent(name)
+        try png.write(to: url)
+        return url
+    }
+
+    /// The editor's TextKit 1 setup, in `window` unless it should look already closed.
+    private func editor(_ text: String, inWindow: Bool) -> MarkdownTextView {
+        let storage = NSTextStorage()
+        let layout = NSLayoutManager()
+        storage.addLayoutManager(layout)
+        let container = NSTextContainer(size: NSSize(width: 600, height: CGFloat.greatestFiniteMagnitude))
+        layout.addTextContainer(container)
+        let tv = MarkdownTextView(frame: NSRect(x: 0, y: 0, width: 600, height: 400), textContainer: container)
+        tv.string = text
+        if inWindow {
+            let window = NSWindow(contentRect: tv.frame, styleMask: [.borderless], backing: .buffered, defer: true)
+            window.contentView = tv
+            self.window = window
+        }
+        return tv
+    }
+
+    /// Where a drop just before character `index` arrives, in window coordinates.
+    private func dropPoint(before index: Int, in tv: NSTextView) -> NSPoint {
+        let glyph = tv.layoutManager!.boundingRect(forGlyphRange: NSRange(location: index, length: 1), in: tv.textContainer!)
+        return tv.convert(NSPoint(x: glyph.minX + tv.textContainerOrigin.x + 0.5, y: glyph.midY + tv.textContainerOrigin.y), to: nil)
+    }
+
+    /// Runs the main queue until `done`, for at most a few seconds.
+    private func waitUntil(_ done: () -> Bool) {
+        let deadline = Date().addingTimeInterval(5)
+        while !done(), Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
+    }
+
+    func testReaderTakesADroppedPhotoAndAddsItOnceCopied() throws {
+        let storage = NSTextStorage(attributedString: MarkdownRenderer.render("Notes"))
+        let layout = NSLayoutManager()
+        storage.addLayoutManager(layout)
+        let container = NSTextContainer(size: NSSize(width: 600, height: CGFloat.greatestFiniteMagnitude))
+        layout.addTextContainer(container)
+        let reader = ReaderTextView(frame: NSRect(x: 0, y: 0, width: 600, height: 400), textContainer: container)
+        reader.isEditable = false
+        var added: [String] = []
+        reader.onAppend = { added.append($0) }
+
+        let drop = FileDrag(try photo("Whiteboard.png"))
+        XCTAssertTrue(reader.prepareForDragOperation(drop), "a read-only text view turns drops away unless told otherwise")
+        XCTAssertTrue(reader.performDragOperation(drop))
+        XCTAssertTrue(added.isEmpty, "the copy runs in the background")
+        waitUntil { !added.isEmpty }
+        XCTAssertEqual(added.count, 1)
+        XCTAssertTrue(added[0].hasPrefix("![Whiteboard](attachments/"), added[0])
+    }
+
+    func testEditorPutsTheDropWhereItWasDroppedAndLeavesTheCaretOfSomeoneStillTyping() throws {
+        let tv = editor("Hello world", inWindow: true)
+        XCTAssertTrue(tv.performDragOperation(FileDrag(try photo("Photo.png"), at: dropPoint(before: 5, in: tv))))
+        // The user carries on typing at the end while it copies.
+        tv.setSelectedRange(NSRange(location: 11, length: 0))
+        tv.insertText("!", replacementRange: tv.selectedRange())
+        waitUntil { tv.string.contains("attachments/") }
+
+        XCTAssertTrue(tv.string.hasPrefix("Hello\n![Photo](attachments/"), tv.string)
+        XCTAssertTrue(tv.string.hasSuffix(")\n world!"), tv.string)
+        XCTAssertEqual(tv.selectedRange(), NSRange(location: (tv.string as NSString).length, length: 0), "the caret stays after the typing")
+    }
+
+    func testEditorNeverSplitsACharacterWhenTheTextChangedMeanwhile() throws {
+        let tv = editor("abcdef", inWindow: true)
+        XCTAssertTrue(tv.performDragOperation(FileDrag(try photo("Photo.png"), at: dropPoint(before: 1, in: tv))))
+        tv.string = "😀xyz"   // offset 1 is now the middle of the emoji
+        waitUntil { tv.string.contains("attachments/") }
+
+        XCTAssertTrue(tv.string.hasPrefix("![Photo](attachments/"), tv.string)
+        XCTAssertTrue(tv.string.hasSuffix(")\n😀xyz"), tv.string)
+    }
+
+    func testEditorThatClosedMeanwhileAddsThePhotoToTheEndOfTheNote() throws {
+        let tv = editor("Hello", inWindow: false)   // like an editor SwiftUI has already removed
+        var added: [String] = []
+        tv.onAppend = { added.append($0) }
+        XCTAssertTrue(tv.performDragOperation(FileDrag(try photo("Photo.png"))))
+        waitUntil { !added.isEmpty }
+
+        XCTAssertEqual(tv.string, "Hello")
+        XCTAssertEqual(added.count, 1)
+        XCTAssertTrue(added[0].hasPrefix("![Photo](attachments/"), added[0])
+    }
+}

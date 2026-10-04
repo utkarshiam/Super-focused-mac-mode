@@ -183,6 +183,14 @@ final class MarkdownRendererTests: XCTestCase {
         XCTAssertEqual(Note(body: "# Plan\n1. [ ] a\n2. [x] b\n- [ ] c").openChecklistCount, 2)
     }
 
+    func testTasksInSpacedNestedQuotesToggle() throws {
+        // Read mode allows spaces before each ">", so ">  > - [ ]" is a nested quote's checkbox too.
+        let md = ">  > - [ ] spaced\n> >   1. [x] numbered"
+        XCTAssertEqual(taskLines(render(md)), [0, 1])
+        let once = try XCTUnwrap(NoteChecklist.toggle(lineAt: 0, in: md))
+        XCTAssertEqual(NoteChecklist.toggle(lineAt: 1, in: once), ">  > - [x] spaced\n> >   1. [ ] numbered")
+    }
+
     func testNumbersFromTenKeepTheirTextOnTheSameLine() {
         let items = layOut(render((1...12).map { "\($0). Step \($0)" }.joined(separator: "\n")))
         XCTAssertEqual(items.count, 12)
@@ -195,6 +203,15 @@ final class MarkdownRendererTests: XCTestCase {
         XCTAssertEqual(s.string, "Learning C#\nF#\nTitle\nIssue #5\n#######")
         XCTAssertEqual(font(of: "Learning C#", in: s)?.pointSize, 22)
         XCTAssertEqual(font(of: "#######", in: s)?.pointSize, MarkdownRenderer.bodySize, "seven #s are a paragraph")
+    }
+
+    func testLongRunsOfSpacesRenderQuickly() {
+        // The fence and closing-# patterns used to backtrack for seconds on lines like these.
+        let spaces = String(repeating: " ", count: 20_000)
+        let start = Date()
+        XCTAssertEqual(render("```" + spaces + "`").string, "```" + spaces + "`")
+        XCTAssertEqual(render("# a" + spaces + "b").string, "a" + spaces + "b")
+        XCTAssertLessThan(Date().timeIntervalSince(start), 2)
     }
 
     func testCellLineBreaksAndHiddenHTML() {

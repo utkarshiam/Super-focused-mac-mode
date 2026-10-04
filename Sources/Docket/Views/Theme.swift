@@ -1,10 +1,10 @@
 import AppKit
 import SwiftUI
 
-// Docket's design language is "ink and paper" system:
+// Docket's design language is an "ink and paper" system:
 // near-black ink on warm paper, big confident type, hairlines instead of shadows,
-// one obvious next step, fast physical motion. Values below are copied from
-// octo-patient/constants (Colors, Type, Layout, Motion) — change them there first.
+// one obvious next step, fast physical motion. Colours, type, spacing and motion
+// all come from the tokens below; change them here, not inline in views.
 
 // MARK: - Colour
 
@@ -198,7 +198,7 @@ enum Radius {
     static let xs: CGFloat = 6, sm: CGFloat = 10, md: CGFloat = 14, lg: CGFloat = 16, xl: CGFloat = 20, sheet: CGFloat = 28
 }
 
-// MARK: - Motion (springs from octo-patient Motion.ts)
+// MARK: - Motion (springs)
 
 enum Motion {
     static let press = Animation.interpolatingSpring(mass: 0.6, stiffness: 520, damping: 24)

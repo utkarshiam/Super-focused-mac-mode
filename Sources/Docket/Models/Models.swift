@@ -345,7 +345,8 @@ enum NoteChecklist {
         return ns.substring(with: m.range(at: 2))
     }
 
-    private static let boxOnLine = try! NSRegularExpression(pattern: #"^(\s*(?:>\s?)*\s*(?:[-*+]|\d{1,9}[.)])\s+)(\[[ xX]\])"#)
+    /// Any quote depth, spaced as Read mode allows (">  > - [ ] …" is a nested quote too).
+    private static let boxOnLine = try! NSRegularExpression(pattern: #"^(\s*+(?:>\s*+)*+(?:[-*+]|\d{1,9}[.)])\s+)(\[[ xX]\])"#)
 
     /// Flips the checkbox on line `index` (0-based), e.g. when it's clicked in Read mode.
     static func toggle(lineAt index: Int, in body: String) -> String? {

@@ -209,7 +209,8 @@ final class MarkdownTextView: NSTextView {
     }
 
     /// Copies the files without holding up the app, then puts them where they were pasted or dropped.
-    /// If the text changed meanwhile, nothing is replaced and they go in at the same offset.
+    /// If the user carried on meanwhile, nothing is replaced, they go in at the same offset, and the
+    /// caret stays where the user is typing.
     private func insertFiles(_ files: [URL], replacing range: NSRange) {
         let original = string
         let onAppend = onAppend
@@ -224,9 +225,19 @@ final class MarkdownTextView: NSTextView {
                 onAppend?(snippet)
                 return
             }
-            let length = (self.string as NSString).length
-            let target = self.string == original ? range : NSRange(location: min(range.location, length), length: 0)
-            self.insertOnOwnLine(snippet, at: target)
+            let caret = self.selectedRange()
+            guard self.string != original || caret != range else {
+                self.insertOnOwnLine(snippet, at: range)
+                return
+            }
+            let ns = self.string as NSString
+            let length = ns.length
+            let location = min(range.location, length)
+            // Never inside a character such as an emoji.
+            let target = location < length ? ns.rangeOfComposedCharacterSequence(at: location).location : location
+            self.insertOnOwnLine(snippet, at: NSRange(location: target, length: 0))
+            let added = (self.string as NSString).length - length
+            self.setSelectedRange(NSRange(location: caret.location >= target ? caret.location + added : caret.location, length: caret.length))
         }
     }
 
