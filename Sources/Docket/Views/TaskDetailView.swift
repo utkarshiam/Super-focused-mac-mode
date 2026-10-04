@@ -37,6 +37,7 @@ struct TaskDetailView: View {
                 }
 
                 whenHero(task, binding)
+                SlipNudge(taskID: taskID)
 
                 TextField("Add notes", text: binding.notes, axis: .vertical)
                     .textFieldStyle(.plain)
@@ -52,6 +53,7 @@ struct TaskDetailView: View {
                 detailsSection(task, binding)
                 checklistSection(task, binding)
 
+                SourceLinkButton(taskID: taskID)
                 if let noteID = task.linkedNoteID, let note = store.note(noteID) {
                     Button { app.reveal(note: noteID) } label: {
                         Label("Open note: \(note.title)", systemImage: "doc.text")
@@ -419,6 +421,7 @@ struct TaskDetailView: View {
                 .padding(.trailing, -6)
                 .help(store.list(task.listID)?.name ?? "Inbox")
             }
+            DelegateRow(taskID: taskID)
             VStack(alignment: .leading, spacing: Space.sm) {
                 HStack(alignment: .firstTextBaseline, spacing: Space.md) {
                     Image(systemName: "number")
@@ -507,6 +510,7 @@ struct TaskDetailView: View {
             }
             .padding(.horizontal, Space.md)
             .padding(.vertical, 12)
+            AIBreakdownRow(taskID: taskID)
         }
     }
 
