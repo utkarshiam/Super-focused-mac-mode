@@ -117,20 +117,26 @@ enum MediaLibrary {
         return nil
     }
 
-    /// Image formats a paste keeps byte for byte, best first: GIF so animations survive, then
-    /// camera originals. A pasteboard with only TIFF goes through `importImage` as PNG instead.
+    /// Image formats a paste keeps byte for byte, best first: an animated GIF so it keeps moving,
+    /// then camera originals. A still GIF (256 colours) is the last choice, and a pasteboard with
+    /// only TIFF goes through `importImage` as PNG instead.
     private static let pastedImageTypes: [UTType] = [.gif, .heic, .jpeg, .png]
 
     /// Saves the pasteboard's original image bytes (a copied JPEG stays a small JPEG);
     /// nil when it has none in those formats.
     private static func importImageData(from pb: NSPasteboard) -> String? {
+        var stillGIF: Data?
         for type in pastedImageTypes {
             guard let data = pb.data(forType: NSPasteboard.PasteboardType(type.identifier)),
                   let source = CGImageSourceCreateWithData(data as CFData, nil), CGImageSourceGetCount(source) > 0,
                   let ext = type.preferredFilenameExtension else { continue }
+            if type == .gif, CGImageSourceGetCount(source) == 1 {
+                stillGIF = data
+                continue
+            }
             return save(data, ext: ext, alt: "Image")
         }
-        return nil
+        return stillGIF.flatMap { save($0, ext: "gif", alt: "Image") }
     }
 
     // MARK: Housekeeping

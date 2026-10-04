@@ -222,6 +222,8 @@ final class MarkdownRendererTests: XCTestCase {
         XCTAssertEqual(taskLines(s), [12])
         // A list after an item's paragraph is still nested under it.
         XCTAssertEqual(render("1. Step\n\n   Details.\n\n   - sub\n2. Next").string, "1.\tStep\nDetails.\n◦\tsub\n2.\tNext")
+        // Code pasted into an item's fence stays in it even where its lines aren't indented.
+        XCTAssertEqual(render("1. Run this:\n   ```\nSELECT 1;\n   ```\n2. Then this").string, "1.\tRun this:\nSELECT 1;\n2.\tThen this")
     }
 
     func testTablesInsideQuotesStayInTheQuote() {

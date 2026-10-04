@@ -35,6 +35,17 @@ final class MediaLibraryTests: XCTestCase {
         return try XCTUnwrap(image.tiffRepresentation.flatMap(NSBitmapImageRep.init(data:)))
     }
 
+    /// The picture as a two-frame GIF, like a copied animation.
+    private func animatedGIF(_ rep: NSBitmapImageRep) throws -> Data {
+        let data = NSMutableData()
+        let frame = try XCTUnwrap(rep.cgImage)
+        let gif = try XCTUnwrap(CGImageDestinationCreateWithData(data, UTType.gif.identifier as CFString, 2, nil))
+        CGImageDestinationAddImage(gif, frame, nil)
+        CGImageDestinationAddImage(gif, frame, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(gif))
+        return data as Data
+    }
+
     func testGarbageCollectionKeepsFilesTheBackupsStillMention() throws {
         try withTemporaryLibrary { dir in
             for name in ["IN-BACKUP-1.png", "IN-ASIDE-2.png", "UNUSED-3.png"] { try addFile(name, daysOld: 30) }
@@ -101,15 +112,30 @@ final class MediaLibraryTests: XCTestCase {
             XCTAssertEqual(pasted.ext, "jpeg")
             XCTAssertEqual(pasted.data, jpeg)
 
-            // GIF wins over a PNG of its first frame, so animations survive.
-            let gif = try XCTUnwrap(rep.representation(using: .gif, properties: [:]))
+            // An animated GIF wins over a PNG of its first frame, so it keeps moving.
+            let gif = try animatedGIF(rep)
             let gifType = NSPasteboard.PasteboardType(UTType.gif.identifier)
+            let png = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
             pb.declareTypes([.png, gifType], owner: nil)
-            pb.setData(try XCTUnwrap(rep.representation(using: .png, properties: [:])), forType: .png)
+            pb.setData(png, forType: .png)
             pb.setData(gif, forType: gifType)
             pasted = try pastedFile()
             XCTAssertEqual(pasted.ext, "gif")
             XCTAssertEqual(pasted.data, gif)
+
+            // A still GIF only has 256 colours: the PNG beside it is kept instead, and a GIF on its own stays one.
+            let stillGIF = try XCTUnwrap(rep.representation(using: .gif, properties: [:]))
+            pb.declareTypes([.png, gifType], owner: nil)
+            pb.setData(png, forType: .png)
+            pb.setData(stillGIF, forType: gifType)
+            pasted = try pastedFile()
+            XCTAssertEqual(pasted.ext, "png")
+            XCTAssertEqual(pasted.data, png)
+            pb.clearContents()
+            pb.setData(stillGIF, forType: gifType)
+            pasted = try pastedFile()
+            XCTAssertEqual(pasted.ext, "gif")
+            XCTAssertEqual(pasted.data, stillGIF)
 
             // Only TIFF: converted to PNG as before.
             pb.clearContents()
