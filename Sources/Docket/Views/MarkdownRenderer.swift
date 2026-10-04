@@ -57,7 +57,8 @@ enum MarkdownRenderer {
 
     private static func re(_ p: String) -> NSRegularExpression { try! NSRegularExpression(pattern: p) }
     /// Any indent (fences sit deep under nested list items) and a whole info string ("js title=…").
-    private static let fence = re(#"^\s*(`{3,}|~{3,})[ \t]*([^`\s]*)[^`]*$"#)
+    /// The possessive `*+` keeps a long line from backtracking for seconds.
+    private static let fence = re(#"^\s*(`{3,}|~{3,})[ \t]*([^`\s]*+)[^`]*$"#)
     private static let rule = re(#"^\s{0,3}([-*_])(\s*\1){2,}\s*$"#)
     private static let heading = re(#"^\s{0,3}(#{1,6})(?:\s+(.*))?$"#)
     private static let quote = re(#"^\s{0,3}>\s?(.*)$"#)
@@ -67,8 +68,9 @@ enum MarkdownRenderer {
     private static let setextH2 = re(#"^\s{0,3}-+\s*$"#)
     /// A line that is only a picture/video: ![alt](path "optional title")
     private static let mediaLine = re(#"^\s*!\[([^\]]*)\]\(<?([^)\s>]+)>?(?:\s+"[^"]*")?\)\s*$"#)
-    /// A line that is only HTML comments, and one that opens a comment closed on a later line.
-    private static let commentLine = re(#"^\s*(?:<!--.*?-->\s*)+$"#)
+    /// A line that is only HTML comments (atomic, so a line of many can't backtrack for ever),
+    /// and one that opens a comment closed on a later line.
+    private static let commentLine = re(#"^\s*(?>(?:<!--.*?-->\s*))+$"#)
     private static let commentStart = re(#"^\s*<!--(?!.*-->)"#)
 
     private static func match(_ r: NSRegularExpression, _ s: String) -> [String?]? {
@@ -363,14 +365,15 @@ enum MarkdownRenderer {
                 var body: [String] = []
                 var fenceMarker: String?
                 var inComment = false
-                while i < lines.count, isBlank(lines[i]) || indentation(lines[i]) >= columns[owner] {
+                while i < lines.count {
                     let l = lines[i]
+                    // A fence or comment runs to its closing line, however that and its lines are indented.
                     if let marker = fenceMarker {
                         if closesFence(l, marker) { fenceMarker = nil }
                     } else if inComment {
                         inComment = !l.contains("-->")
-                    } else if match(listItem, l) != nil {
-                        break // nested items are laid out with the rest of the list
+                    } else if !isBlank(l), indentation(l) < columns[owner] || match(listItem, l) != nil {
+                        break // the item ends, or a nested item is laid out with the rest of the list
                     } else if let f = match(fence, l) {
                         fenceMarker = f[1] ?? "```"
                     } else {
@@ -435,7 +438,6 @@ enum MarkdownRenderer {
                 block.setContentWidth(100, type: .percentageValueType)
                 block.setWidth(owner < textXs.count ? textXs[owner] : 0, type: .absoluteValueType, for: .margin, edge: .minX)
                 renderBlocks(body, offset: offset + line, quotes: quotes + [block], color: color, into: out, ctx: &ctx)
-
             case let .item(level, number, run, task, text, line):
                 // A nested item's marker sits where its parent's text starts.
                 let markerX = level > 0 && level <= textXs.count ? textXs[level - 1] : 4 + CGFloat(level) * 22
@@ -616,9 +618,9 @@ enum MarkdownRenderer {
     }
 
     private static let lineBreakTag = re(#"(?i)</?br\s*/?>"#)
-    /// Comments and common formatting tags (their text still shows). Other HTML, such as a
-    /// "<branch>" placeholder, shows as typed.
-    private static let hiddenHTML = re(#"(?i)<!--[\s\S]*?-->|</?(?:a|abbr|b|big|cite|code|del|dfn|em|font|i|ins|kbd|mark|q|s|samp|small|span|strike|strong|sub|sup|tt|u|var)\b[^>]*>"#)
+    /// Comments and tags that only style their text (which still shows). Other HTML, such as a
+    /// "<branch>" placeholder or <del>, shows as typed.
+    private static let hiddenHTML = re(#"(?i)<!--[\s\S]*?-->|</?(?:abbr|b|big|cite|code|dfn|em|font|i|kbd|mark|samp|small|span|strong|tt|u|var)\b[^>]*>"#)
 
     /// What inline HTML shows as: <br> is a line break (the only way to get one in a table cell).
     private static func shownHTML(_ html: String) -> String {

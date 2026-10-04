@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-// Docket's design language is the octo-patient (Curo) "ink and paper" system:
+// Docket's design language is "ink and paper" system:
 // near-black ink on warm paper, big confident type, hairlines instead of shadows,
 // one obvious next step, fast physical motion. Values below are copied from
 // octo-patient/constants (Colors, Type, Layout, Motion) — change them there first.
