@@ -40,7 +40,16 @@ struct Persistence: Sendable {
     func load() -> LoadResult {
         let fm = FileManager.default
         try? fm.createDirectory(at: directory, withIntermediateDirectories: true)
-        guard fm.fileExists(atPath: fileURL.path) else { return .fresh }
+        guard fm.fileExists(atPath: fileURL.path) else {
+            // No data file but there are backups (it was moved or deleted): start from the newest backup,
+            // not sample data, so today's backup isn't overwritten with the samples either.
+            for backup in backups() {
+                if let data = try? Data(contentsOf: backup), let db = try? Self.decoder.decode(Database.self, from: data) {
+                    return .recovered(db, message: "Docket couldn't find its data file, so it restored the backup from \(backup.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "docket-", with: "")).")
+                }
+            }
+            return .fresh
+        }
         do {
             let data = try Data(contentsOf: fileURL)
             return .loaded(try Self.decoder.decode(Database.self, from: data))

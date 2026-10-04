@@ -11,6 +11,8 @@ struct TaskRow: View {
     var index = 0
     /// Calendar only: another task dropped on this row lands just above it (returns whether it was accepted).
     var onDropBefore: ((UUID) -> Bool)?
+    /// Whether a dragged task may land above this row (drags only reorder; they never change a date).
+    var canDropBefore: ((UUID) -> Bool)?
     @State private var hovering = false
     @State private var dropTarget = false
 
@@ -84,7 +86,7 @@ struct TaskRow: View {
         }
         .onHover { h in withAnimation(Motion.fast) { hovering = h } }
         .contextMenu { TaskContextMenu(task: task, inCalendar: context == .calendar) }
-        .draggable(task.id.uuidString) {
+        .draggable(dragPayload()) {
             Text(task.title)
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(Color.onPrimary)
@@ -92,9 +94,17 @@ struct TaskRow: View {
                 .frame(height: 32)
                 .background(Capsule().fill(Color.primaryFill))
         }
-        .modifier(RowDrop(enabled: onDropBefore != nil && !task.isCompleted, rowID: task.id, onDrop: onDropBefore, targeted: $dropTarget))
+        .modifier(RowDrop(enabled: onDropBefore != nil && !task.isCompleted, rowID: task.id, dragging: app.draggingTaskID,
+                          accepts: canDropBefore ?? { _ in true }, onDrop: onDropBefore, targeted: $dropTarget))
         .opacity(task.isCompleted && app.recentlyCompleted.contains(task.id) ? 0.5 : 1)
         .enterUp(index)
+    }
+
+    /// Evaluated when a drag starts: remember which task is moving.
+    private func dragPayload() -> String {
+        let id = task.id
+        DispatchQueue.main.async { app.draggingTaskID = id }
+        return id.uuidString
     }
 
     @ViewBuilder
@@ -164,20 +174,25 @@ struct TaskRow: View {
     }
 }
 
-/// Accepts a dragged task id (not the row's own) and reports hover so the row can draw its insertion line.
+/// Accepts a dragged task id (not the row's own) that `accepts` allows, and reports hover so the row
+/// can draw its insertion line. Rows that wouldn't take the dragged task show no line.
 private struct RowDrop: ViewModifier {
     let enabled: Bool
     let rowID: UUID
+    /// The task being dragged, when known.
+    let dragging: UUID?
+    let accepts: (UUID) -> Bool
     let onDrop: ((UUID) -> Bool)?
     @Binding var targeted: Bool
 
     func body(content: Content) -> some View {
         if enabled, let onDrop {
             content.dropDestination(for: String.self) { items, _ in
-                guard let dragged = items.compactMap(UUID.init(uuidString:)).first, dragged != rowID else { return false }
+                guard let dragged = items.compactMap(UUID.init(uuidString:)).first, dragged != rowID, accepts(dragged) else { return false }
                 return withAnimation(Motion.gentle) { onDrop(dragged) }
             } isTargeted: { t in
-                withAnimation(Motion.fast) { targeted = t }
+                let allowed = dragging.map { $0 != rowID && accepts($0) } ?? true
+                withAnimation(Motion.fast) { targeted = t && allowed }
             }
         } else {
             content

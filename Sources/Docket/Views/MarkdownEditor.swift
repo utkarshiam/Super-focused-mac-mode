@@ -105,7 +105,9 @@ struct MarkdownEditor: NSViewRepresentable {
             }
         }
 
-        private static let listPrefix = try! NSRegularExpression(pattern: #"^(\s*)([-*+] \[[ xX]\] |[-*+] |(\d+)[.)] )"#)
+        /// Indent, then the marker with its trailing space and optional box ("- ", "3. [ ] "),
+        /// the bullet or number token, and the number's digits.
+        private static let listPrefix = try! NSRegularExpression(pattern: #"^(\s*)(([-*+]|(\d{1,9})[.)]) (?:\[[ xX]\] )?)"#)
 
         private func currentLine(_ tv: NSTextView) -> (range: NSRange, text: String)? {
             let ns = tv.string as NSString
@@ -133,12 +135,12 @@ struct MarkdownEditor: NSViewRepresentable {
                 tv.insertText("", replacementRange: NSRange(location: range.location, length: m.range.length))
                 return true
             }
-            var next = marker
-            if marker.contains("[") {
-                next = String(marker.prefix(1)) + " [ ] "
-            } else if m.range(at: 3).location != NSNotFound, let n = Int(ns.substring(with: m.range(at: 3))) {
-                next = "\(n + 1)" + String(marker.dropFirst(String(n).count))
+            var token = ns.substring(with: m.range(at: 3))
+            if m.range(at: 4).location != NSNotFound, let n = Int(ns.substring(with: m.range(at: 4))) {
+                token = "\(n + 1)" + String(token.dropFirst(String(n).count))
             }
+            // A task item continues as a fresh, unticked task.
+            let next = token + (marker.contains("[") ? " [ ] " : " ")
             tv.insertText("\n" + indent + next, replacementRange: tv.selectedRange())
             return true
         }
@@ -166,7 +168,7 @@ final class MarkdownTextView: NSTextView {
     var onCreateTask: ((String) -> Void)?
     var onPastedDocument: (() -> Void)?
     var onAppend: ((String) -> Void)?
-    private static let checkbox = try! NSRegularExpression(pattern: #"^(\s*[-*+]\s+)(\[[ xX]\])"#)
+    private static let checkbox = try! NSRegularExpression(pattern: #"^(\s*+(?:>\s*+)*+(?:[-*+]|\d{1,9}[.)])\s+)(\[[ xX]\])"#)
     private static let markdownSyntax = try! NSRegularExpression(
         pattern: #"(?m)^(#{1,6}\s|\s*[-*+]\s|\s*\d+[.)]\s|>\s?|```|\|.*\|)|\*\*[^*]+\*\*|\[[^\]]+\]\([^)]+\)"#)
 
@@ -331,7 +333,7 @@ final class MarkdownTextView: NSTextView {
         } else {
             return ""
         }
-        text = text.replacingOccurrences(of: #"^\s*([-*+]\s+(\[[ xX]\]\s+)?|\d+[.)]\s+|#+\s+)"#, with: "", options: .regularExpression)
+        text = text.replacingOccurrences(of: #"^\s*((?:[-*+]|\d+[.)])\s+(\[[ xX]\]\s+)?|#+\s+)"#, with: "", options: .regularExpression)
         return text.split(separator: "\n").first.map(String.init)?.trimmingCharacters(in: .whitespaces) ?? ""
     }
 
@@ -359,8 +361,8 @@ enum MarkdownStyler {
     }
 
     private static let heading = re(#"^(#{1,6})\s+.*$"#, .anchorsMatchLines)
-    private static let checked = re(#"^(\s*[-*+]\s+\[[xX]\])(.*)$"#, .anchorsMatchLines)
-    private static let unchecked = re(#"^(\s*[-*+]\s+\[ \])"#, .anchorsMatchLines)
+    private static let checked = re(#"^(\s*+(?:>\s*+)*+(?:[-*+]|\d{1,9}[.)])\s+\[[xX]\])(.*)$"#, .anchorsMatchLines)
+    private static let unchecked = re(#"^(\s*+(?:>\s*+)*+(?:[-*+]|\d{1,9}[.)])\s+\[ \])"#, .anchorsMatchLines)
     private static let bullet = re(#"^(\s*(?:[-*+]|\d+[.)]))\s"#, .anchorsMatchLines)
     private static let quote = re(#"^>\s?.*$"#, .anchorsMatchLines)
     private static let rule = re(#"^(-{3,}|\*{3,})\s*$"#, .anchorsMatchLines)

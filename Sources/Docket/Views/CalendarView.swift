@@ -81,6 +81,7 @@ struct CalendarView: View {
 @MainActor
 func dropTasks(_ items: [String], on day: Date, store: Store, app: AppState) -> Bool {
     let ids = items.compactMap(UUID.init(uuidString:))
+    app.draggingTaskID = nil
     guard !ids.isEmpty else { return false }
     withAnimation(Motion.gentle) {
         for id in ids { store.move(id, toDay: day) }
@@ -141,11 +142,8 @@ struct AgendaList: View {
     private func row(_ entry: Store.TimelineEntry, index: Int) -> some View {
         switch entry.item {
         case .task(let t):
-            if let day = entry.day {
-                TaskRow(task: t, context: .calendar, day: day, index: index, onDropBefore: { drop($0, onto: t, day: day) })
-            } else {
-                TaskRow(task: t, context: .calendar, day: nil, index: index, onDropBefore: { dropOnOverdue($0, before: t.id) })
-            }
+            TaskRow(task: t, context: .calendar, day: entry.day, index: index,
+                    onDropBefore: { reorder($0, above: t) }, canDropBefore: { canReorder($0, above: t) })
         case .event(let e):
             EventRow(event: e, day: entry.day ?? Calendar.current.startOfDay(for: app.clock), index: index)
         }
@@ -159,28 +157,15 @@ struct AgendaList: View {
         app.scrollRequest = nil
     }
 
-    /// A task dropped on a line: move it to that line's date if needed, then slot it in just above
-    /// (tasks without a time only; timed tasks keep time order).
-    private func drop(_ dragged: UUID, onto target: TaskItem, day: Date) -> Bool {
-        guard let task = store.task(dragged) else { return false }
-        let cal = Calendar.current
-        let today = cal.startOfDay(for: app.clock)
-        let movedDay = store.isOverdueByDay(task, today: today) || store.calendarDay(of: task, today: today) != day
-        if movedDay { store.move(dragged, toDay: day) }
-
-        func isTimed(_ t: TaskItem) -> Bool { t.dueHasTime && t.dueDate.map { cal.isDate($0, inSameDayAs: day) } == true }
-        if let moved = store.task(dragged), !isTimed(moved) {
-            store.placeInDay(dragged, before: isTimed(target) ? nil : target.id, now: app.clock)
-        }
-        Haptics.success()
-        if movedDay { app.showToast("Moved to \(Fmt.absoluteDay(day))") }
-        return true
+    /// Dragging only reorders tasks that share a date; it never changes a date (see Store.reorderSlot).
+    private func canReorder(_ dragged: UUID, above target: TaskItem) -> Bool {
+        store.reorderSlot(dragged, above: target.id, now: app.clock) != nil
     }
 
-    /// Reordering inside the overdue group (a task from another date can't become overdue by dropping).
-    private func dropOnOverdue(_ dragged: UUID, before target: UUID) -> Bool {
-        guard let task = store.task(dragged), store.isOverdueByDay(task, today: Calendar.current.startOfDay(for: app.clock)) else { return false }
-        store.placeInDay(dragged, before: target, now: app.clock)
+    private func reorder(_ dragged: UUID, above target: TaskItem) -> Bool {
+        defer { app.draggingTaskID = nil }
+        guard let slot = store.reorderSlot(dragged, above: target.id, now: app.clock) else { return false }
+        store.placeInDay(dragged, before: slot, now: app.clock)
         Haptics.success()
         return true
     }

@@ -1,7 +1,5 @@
+.env
 .build/
-build/
 dist/
+build/
 .swiftpm/
-*.xcodeproj/
-DerivedData/
-.DS_Store

@@ -249,7 +249,7 @@ struct Note: Codable, Identifiable, Hashable {
             .filter { !$0.isEmpty }
         let text = lines.dropFirst().prefix(4).map { line in
             Self.describingMedia(line)
-                .replacingOccurrences(of: #"^(#{1,6}\s+|>\s?|[-*+]\s+(\[[ xX]\]\s+)?|\d+[.)]\s+)"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: #"^(#{1,6}\s+|>\s?|(?:[-*+]|\d+[.)])\s+(\[[ xX]\]\s+)?)"#, with: "", options: .regularExpression)
                 .replacingOccurrences(of: #"(\*\*|__|`)"#, with: "", options: .regularExpression)
                 .replacingOccurrences(of: #"(?<![\w*])[*_](\S(?:[^*_]*\S)?)[*_](?![\w*])"#, with: "$1", options: .regularExpression)
         }

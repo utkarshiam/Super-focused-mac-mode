@@ -183,6 +183,20 @@ extension Store {
         return (day, dayOrdered(same).map(\.id))
     }
 
+    /// Where a dragged task lands when dropped above `targetID` in the Calendar: before that task, or
+    /// (inner nil) at the end of the day's untimed tasks when the target is a timed task on the same date.
+    /// Outer nil means the drop isn't allowed: dragging only reorders tasks that share a date and never
+    /// changes a date (the date picker and the Month view do that). Timed tasks keep their time order.
+    func reorderSlot(_ draggedID: UUID, above targetID: UUID, now: Date = Date()) -> UUID?? {
+        guard draggedID != targetID, let list = dayList(containing: draggedID, now: now), let target = task(targetID) else { return nil }
+        if list.ids.contains(targetID) { return .some(targetID) }
+        let today = calendar.startOfDay(for: now)
+        guard let day = list.day, !target.isCompleted, !isOverdueByDay(target, today: today),
+              calendarDay(of: target, today: today) == day,
+              target.dueHasTime, let due = target.dueDate, calendar.isDate(due, inSameDayAs: day) else { return nil }
+        return .some(nil)
+    }
+
     /// Puts `id` just before `beforeID` (or last when nil) in its day, numbering that day's tasks 1…n.
     func placeInDay(_ id: UUID, before beforeID: UUID?, now: Date = Date()) {
         guard let list = dayList(containing: id, now: now) else { return }

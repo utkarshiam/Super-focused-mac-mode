@@ -268,14 +268,17 @@ enum MarkdownRenderer {
                                     into out: NSMutableAttributedString, ctx: Context) {
         guard let url = MediaLibrary.resolve(path), FileManager.default.fileExists(atPath: url.path),
               let kind = MediaLibrary.kind(of: url) else {
-            // Missing file or a web image: show it as a link rather than a broken box.
+            // Missing file, a web image, or a file Docket can't show (an .mkv, say): a link rather
+            // than a broken box. A local file opens in its own app.
             let label = alt.isEmpty ? (URL(string: path)?.lastPathComponent ?? path) : alt
-            let s = NSMutableAttributedString(string: "Image: \(label)\n", attributes: [
+            let local = MediaLibrary.resolve(path).flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
+            let prefix = local != nil ? "Attachment: " : "Image: "
+            let s = NSMutableAttributedString(string: prefix + label + "\n", attributes: [
                 .font: font(bodySize, .medium), .foregroundColor: Palette.ink2,
                 .paragraphStyle: style(blocks: quotes),
             ])
-            if let link = URL(string: path), link.scheme != nil {
-                s.addAttribute(.link, value: link, range: NSRange(location: 7, length: (label as NSString).length))
+            if let link = local ?? URL(string: path).flatMap({ $0.scheme != nil ? $0 : nil }) {
+                s.addAttribute(.link, value: link, range: NSRange(location: (prefix as NSString).length, length: (label as NSString).length))
             }
             out.append(s)
             return

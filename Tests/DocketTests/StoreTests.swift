@@ -270,6 +270,45 @@ final class DayOrderTests: XCTestCase {
         XCTAssertFalse(store.moveInDay(t.id, by: -1))
         XCTAssertEqual(titles(store, day: today), ["Anytime", "Call at 23:00"])
     }
+
+    func testDraggingOnlyReordersWithinADateAndNeverChangesIt() {
+        let store = Store(persistence: Persistence(directory: dir), seedIfEmpty: false)
+        let cal = Calendar.current
+        let now = cal.date(bySettingHour: 9, minute: 0, second: 0, of: Date())!
+        let today = cal.startOfDay(for: now)
+        let tomorrow = cal.date(byAdding: .day, value: 1, to: today)!
+        func add(_ title: String, planned: Date? = nil, due: Date? = nil, timed: Bool = false) -> UUID {
+            var t = TaskItem(title: title)
+            t.scheduledDate = planned
+            t.dueDate = due
+            t.dueHasTime = timed
+            return store.addTask(t).id
+        }
+        let a = add("A", planned: today), b = add("B", planned: today)
+        let c = add("C", planned: tomorrow)
+        let call = add("Call", due: cal.date(bySettingHour: 23, minute: 0, second: 0, of: today), timed: true)
+        let late1 = add("Late 1", due: cal.date(byAdding: .day, value: -2, to: today))
+        let late2 = add("Late 2", due: cal.date(byAdding: .day, value: -1, to: today))
+        let dates = { Dictionary(uniqueKeysWithValues: store.tasks.map { ($0.id, [$0.dueDate, $0.scheduledDate]) }) }
+        let before = dates()
+
+        // Same date: lands above the target. Onto a timed task of that date: end of the untimed run.
+        XCTAssertEqual(store.reorderSlot(b, above: a, now: now), .some(a))
+        XCTAssertEqual(store.reorderSlot(a, above: call, now: now), .some(nil))
+        XCTAssertEqual(store.reorderSlot(late2, above: late1, now: now), .some(late1))
+        // Another date, a timed task, or across the overdue group: refused.
+        XCTAssertNil(store.reorderSlot(c, above: a, now: now))
+        XCTAssertNil(store.reorderSlot(a, above: c, now: now))
+        XCTAssertNil(store.reorderSlot(call, above: a, now: now))
+        XCTAssertNil(store.reorderSlot(late1, above: a, now: now))
+        XCTAssertNil(store.reorderSlot(a, above: late1, now: now))
+
+        // The allowed drops reorder and leave every date alone.
+        store.placeInDay(b, before: a, now: now)
+        store.placeInDay(late2, before: late1, now: now)
+        XCTAssertEqual(titles(store, day: today), ["B", "A", "Call"])
+        XCTAssertEqual(dates(), before)
+    }
 }
 
 @MainActor

@@ -29,6 +29,8 @@ final class AppState: ObservableObject {
     @Published var selectedDay = Calendar.current.startOfDay(for: Date())
     /// Set to scroll the agenda to a day; the view clears it once it has scrolled.
     @Published var scrollRequest: Date?
+    /// The task being dragged right now, so rows can tell whether they'd accept it before the drop.
+    @Published var draggingTaskID: UUID?
 
     /// The sidebar can be hidden for a focused, full-width view (⌃⌘S). Remembered across launches.
     @Published var sidebarVisible = UserDefaults.standard.object(forKey: "sidebarVisible") as? Bool ?? true {
