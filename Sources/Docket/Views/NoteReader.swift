@@ -57,6 +57,9 @@ struct MarkdownReader: NSViewRepresentable {
         tv.autoresizingMask = [.width]
         tv.isEditable = false
         tv.isSelectable = true
+        // ⌘F in a note finds within it, in Read mode as in Edit mode.
+        tv.usesFindBar = true
+        tv.isIncrementalSearchingEnabled = true
         tv.drawsBackground = false
         tv.textContainerInset = NSSize(width: 34, height: 24)
         tv.linkTextAttributes = [.foregroundColor: Palette.ink, .underlineStyle: NSUnderlineStyle.single.rawValue, .cursor: NSCursor.pointingHand]

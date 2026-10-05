@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct TaskRow: View {
@@ -16,10 +17,61 @@ struct TaskRow: View {
     @State private var hovering = false
     @State private var dropTarget = false
 
-    private var isSelected: Bool { app.selectedTaskID == task.id }
+    /// The focused task and every task in a multi-selection share the selected look.
+    private var isSelected: Bool { app.isSelected(task.id) }
     private var dimmed: Bool { task.isCompleted }
+    private var compact: Bool { app.compactRows }
 
     var body: some View {
+        let shape = RoundedRectangle(cornerRadius: compact ? Radius.sm : Radius.md, style: .continuous)
+        Group {
+            if compact { compactLine } else { regularLine }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, compact ? 6 : 11)
+        .background(shape.fill(isSelected ? Color.fill : (hovering ? Color.pressedTint : Color.clear)))
+        .overlay(shape.strokeBorder(isSelected ? Color.hairStrong : Color.clear, lineWidth: 1))
+        .overlay(alignment: .leading) {
+            // A grip on hover says "you can drag this".
+            if onDropBefore != nil, hovering, !task.isCompleted {
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Color.ink3)
+                    .padding(.leading, 2)
+                    .transition(.opacity)
+            }
+        }
+        .overlay(alignment: .top) {
+            // Where a dragged task will land.
+            if dropTarget {
+                Capsule()
+                    .fill(Color.ink)
+                    .frame(height: 2.5)
+                    .padding(.horizontal, 8)
+                    .offset(y: -2)
+                    .transition(.opacity)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture(perform: handleClick)
+        .onHover { h in withAnimation(Motion.fast) { hovering = h } }
+        .contextMenu { TaskContextMenu(task: task, inCalendar: context == .calendar) }
+        .draggable(dragPayload()) {
+            Text(task.title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Color.onPrimary)
+                .padding(.horizontal, 14)
+                .frame(height: 32)
+                .background(Capsule().fill(Color.primaryFill))
+        }
+        .modifier(RowDrop(enabled: onDropBefore != nil && !task.isCompleted, rowID: task.id, dragging: app.draggingTaskID,
+                          accepts: canDropBefore ?? { _ in true }, onDrop: onDropBefore, targeted: $dropTarget))
+        .opacity(task.isCompleted && app.recentlyCompleted.contains(task.id) ? 0.5 : 1)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .enterUp(index)
+    }
+
+    private var regularLine: some View {
         HStack(alignment: .center, spacing: 14) {
             CheckCircle(done: task.isCompleted, priority: task.priority) {
                 app.toggle(task.id, in: store)
@@ -44,60 +96,123 @@ struct TaskRow: View {
                 .fixedSize()
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 11)
-        .background(
-            RoundedRectangle(cornerRadius: Radius.md, style: .continuous)
-                .fill(isSelected ? Color.fill : (hovering ? Color.pressedTint : Color.clear))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: Radius.md, style: .continuous)
-                .strokeBorder(isSelected ? Color.hairStrong : Color.clear, lineWidth: 1)
-        )
-        .overlay(alignment: .leading) {
-            // A grip on hover says "you can drag this".
-            if onDropBefore != nil, hovering, !task.isCompleted {
-                Image(systemName: "line.3.horizontal")
-                    .font(.system(size: 9, weight: .bold))
+    }
+
+    /// Compact rows: one ~30pt line. Small check, the title (truncated, never wrapped), tiny glyphs for
+    /// the details, then the date and duration on the right.
+    private var compactLine: some View {
+        HStack(alignment: .center, spacing: 10) {
+            CheckCircle(done: task.isCompleted, priority: task.priority, size: 16) {
+                app.toggle(task.id, in: store)
+            }
+            HStack(spacing: 6) {
+                Text(task.title)
+                    .font(.system(size: 13.5, weight: .semibold))
+                    .tracking(-0.1)
+                    .foregroundStyle(dimmed ? Color.ink3 : Color.ink)
+                    .strikethrough(dimmed, color: .ink3)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(1)
+                compactGlyphs
+                    .fixedSize()
+                // Source, delegation and tags only when the whole title fits beside them.
+                ViewThatFits(in: .horizontal) {
+                    compactExtras(tagCount: 2)
+                    compactExtras(tagCount: 0)
+                    Color.clear.frame(width: 0, height: 0)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 6) {
+                if focus.taskID == task.id {
+                    Image(systemName: "timer")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(Color.ink)
+                        .help("Focusing on this now")
+                }
+                WhenLabel(task: task, context: context, day: day, now: app.clock, compact: true)
+            }
+            .fixedSize()
+        }
+        .frame(minHeight: 18)
+    }
+
+    /// The compact row's details as tiny icons; each one says what it means on hover.
+    private var compactGlyphs: some View {
+        let list = store.list(task.listID)
+        let progress = task.subtaskProgress
+        return HStack(spacing: 5) {
+            if let tone = task.priority.tone, !task.isCompleted {
+                Image(systemName: "flag.fill")
+                    .foregroundStyle(tone.fg)
+                    .help("\(task.priority.label) priority")
+            }
+            if let list, !isListContext {
+                Image(systemName: list.icon).help(list.name)
+            }
+            if context == .calendar, let day, let due = task.dueDate, !task.isCompleted,
+               !Calendar.current.isDate(due, inSameDayAs: day) {
+                Image(systemName: "flag").help("Due \(Fmt.absoluteDay(due, now: app.clock))")
+            }
+            if progress.total > 0 {
+                Text("\(progress.done)/\(progress.total)")
+                    .monospacedDigit()
+                    .help("\(progress.done) of \(progress.total) steps done")
+            }
+            if let rule = task.recurrence {
+                Image(systemName: "repeat").help(rule.summary)
+            }
+            if !task.reminders.isEmpty, !task.isCompleted {
+                Image(systemName: task.hasAlarm ? "alarm" : "bell").help(task.hasAlarm ? "Has an alarm" : "Has a reminder")
+            }
+            if task.linkedNoteID != nil {
+                Image(systemName: "doc.text").help("From a note")
+            } else if !task.notes.isEmpty {
+                Image(systemName: "text.alignleft").help("Has notes")
+            }
+        }
+        .font(.system(size: 10.5, weight: .semibold))
+        .foregroundStyle(Color.ink3)
+    }
+
+    /// Where it came from, who it's waiting on, and the first tags: shown in compact rows only when they fit.
+    private func compactExtras(tagCount: Int) -> some View {
+        HStack(spacing: 6) {
+            if let source = task.source {
+                SourceBadge(source: source)
+            }
+            TaskRowBadges(task: task)
+            if tagCount > 0, !task.tags.isEmpty {
+                Text(task.tags.prefix(tagCount).map { "#\($0)" }.joined(separator: " "))
                     .foregroundStyle(Color.ink3)
-                    .padding(.leading, 2)
-                    .transition(.opacity)
             }
         }
-        .overlay(alignment: .top) {
-            // Where a dragged task will land.
-            if dropTarget {
-                Capsule()
-                    .fill(Color.ink)
-                    .frame(height: 2.5)
-                    .padding(.horizontal, 8)
-                    .offset(y: -2)
-                    .transition(.opacity)
-            }
+        .font(.system(size: 11.5, weight: .medium))
+        .foregroundStyle(Color.ink2)
+        .lineLimit(1)
+        .fixedSize()
+    }
+
+    /// Plain click, ⌘-click (add or remove), ⇧-click (a range) or double-click (open), read from the click itself.
+    private func handleClick() {
+        let event = NSApp?.currentEvent
+        let flags = event?.modifierFlags ?? NSEvent.modifierFlags
+        let kind: AppState.RowClick
+        if flags.contains(.command) {
+            kind = .toggle
+        } else if flags.contains(.shift) {
+            kind = .range
+        } else if let event, [NSEvent.EventType.leftMouseDown, .leftMouseUp].contains(event.type), event.clickCount >= 2 {
+            kind = .open
+        } else {
+            kind = .plain
         }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            // Opening and closing the panel animate; switching to another task is instant.
-            if app.selectedTaskID == nil || isSelected {
-                withAnimation(Motion.sheet) { app.selectedTaskID = isSelected ? nil : task.id }
-            } else {
-                app.selectedTaskID = task.id
-            }
+        // Clicking a row puts the keyboard on the list (arrows, Return, t / m / w / x), out of any text field.
+        if let window = NSApp?.keyWindow, window.firstResponder is NSText {
+            window.makeFirstResponder(nil)
         }
-        .onHover { h in withAnimation(Motion.fast) { hovering = h } }
-        .contextMenu { TaskContextMenu(task: task, inCalendar: context == .calendar) }
-        .draggable(dragPayload()) {
-            Text(task.title)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(Color.onPrimary)
-                .padding(.horizontal, 14)
-                .frame(height: 32)
-                .background(Capsule().fill(Color.primaryFill))
-        }
-        .modifier(RowDrop(enabled: onDropBefore != nil && !task.isCompleted, rowID: task.id, dragging: app.draggingTaskID,
-                          accepts: canDropBefore ?? { _ in true }, onDrop: onDropBefore, targeted: $dropTarget))
-        .opacity(task.isCompleted && app.recentlyCompleted.contains(task.id) ? 0.5 : 1)
-        .enterUp(index)
+        app.click(task.id, kind, in: store)
     }
 
     /// Evaluated when a drag starts: remember which task is moving.
@@ -115,6 +230,7 @@ struct TaskRow: View {
         let hasMeta = showList || task.trackedSeconds >= 60 || !task.tags.isEmpty || progress.total > 0
             || (context == .calendar && day != nil && task.dueDate.map { !Calendar.current.isDate($0, inSameDayAs: day!) } == true)
             || task.recurrence != nil || !task.reminders.isEmpty || !task.notes.isEmpty || task.linkedNoteID != nil || task.priority.tone != nil
+            || task.source != nil || task.waitingOn != nil || task.postponeCount >= 3
 
         if hasMeta {
             HStack(spacing: 10) {
@@ -139,6 +255,12 @@ struct TaskRow: View {
                     metaItem("checklist", "\(progress.done)/\(progress.total)")
                         .layoutPriority(2)
                 }
+                if let source = task.source {
+                    SourceBadge(source: source)
+                        .layoutPriority(1)
+                }
+                TaskRowBadges(task: task)
+                    .layoutPriority(2)
                 if let first = task.tags.first {
                     // Whole tags or none: squeezed tags would show as stray dots.
                     ViewThatFits(in: .horizontal) {
@@ -208,19 +330,28 @@ struct WhenLabel: View {
     /// In the Calendar list: the date this line sits on (nil for overdue tasks).
     var day: Date?
     var now: Date
+    /// Compact rows: a smaller date, and the duration as plain text instead of a pill.
+    var compact = false
 
     var body: some View {
-        HStack(spacing: Space.sm) {
+        HStack(spacing: compact ? 6 : Space.sm) {
             if let text = dateText {
                 Text(text)
-                    .font(.system(size: 15, weight: .bold))
-                    .tracking(-0.2)
+                    .font(.system(size: compact ? 13 : 15, weight: .bold))
+                    .tracking(compact ? -0.1 : -0.2)
                     .monospacedDigit()
                     .foregroundStyle(color)
                     .lineLimit(1)
             }
             if let minutes = task.estimateMinutes, !task.isCompleted {
-                DurationPill(minutes: minutes)
+                if compact {
+                    Text(Fmt.duration(minutes: minutes))
+                        .font(.system(size: 12, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(Color.ink2)
+                } else {
+                    DurationPill(minutes: minutes)
+                }
             }
         }
         .fixedSize()
@@ -327,9 +458,19 @@ struct EventRow: View {
     let event: CalendarService.Event
     var day: Date
     var index = 0
+    /// Compact rows: one line, like the tasks around it.
+    var compact = false
 
     var body: some View {
-        let cal = Calendar.current
+        Group {
+            if compact { compactLine } else { regularLine }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, compact ? 6 : 9)
+        .enterUp(index)
+    }
+
+    private var regularLine: some View {
         HStack(alignment: .center, spacing: 14) {
             Capsule()
                 .fill(Color.ink3)
@@ -348,24 +489,72 @@ struct EventRow: View {
                         .lineLimit(1)
                 }
                 HStack(spacing: Space.sm) {
-                    Text(event.isAllDay ? "\(Fmt.absoluteDay(day)) · All day"
-                         : (cal.isDate(event.start, inSameDayAs: day) ? "\(Fmt.absoluteDay(day)) · \(Fmt.time(event.start))" : "\(Fmt.absoluteDay(day)) · Ongoing"))
+                    Text(whenText)
                         .font(.system(size: 15, weight: .bold))
                         .tracking(-0.2)
                         .monospacedDigit()
                         .foregroundStyle(Color.ink2)
                         .lineLimit(1)
                     if !event.isAllDay {
-                        DurationPill(minutes: max(1, Int(event.end.timeIntervalSince(event.start) / 60)))
+                        DurationPill(minutes: minutes)
                     }
                 }
                 .fixedSize()
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 9)
-        .enterUp(index)
     }
+
+    private var compactLine: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Capsule()
+                .fill(Color.ink3)
+                .frame(width: 3, height: 14)
+                .frame(width: 16)
+            HStack(spacing: 6) {
+                Text(event.title)
+                    .font(.system(size: 13.5, weight: .medium))
+                    .tracking(-0.1)
+                    .foregroundStyle(Color.ink2)
+                    .lineLimit(1)
+                    .layoutPriority(1)
+                // The calendar's name only when it fits whole.
+                ViewThatFits(in: .horizontal) {
+                    Text(event.calendarName)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(Color.ink3)
+                        .lineLimit(1)
+                        .fixedSize()
+                    Color.clear.frame(width: 0, height: 0)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 6) {
+                Text(whenText)
+                    .font(.system(size: 13, weight: .bold))
+                    .tracking(-0.1)
+                    .monospacedDigit()
+                    .foregroundStyle(Color.ink2)
+                    .lineLimit(1)
+                if !event.isAllDay {
+                    Text(Fmt.duration(minutes: minutes))
+                        .font(.system(size: 12, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(Color.ink2)
+                }
+            }
+            .fixedSize()
+        }
+        .frame(minHeight: 18)
+    }
+
+    /// "Mon 5 Oct · 10:00 AM", "… · All day", or "… · Ongoing" for a meeting that started on an earlier day.
+    private var whenText: String {
+        let date = Fmt.absoluteDay(day)
+        if event.isAllDay { return "\(date) · All day" }
+        return Calendar.current.isDate(event.start, inSameDayAs: day) ? "\(date) · \(Fmt.time(event.start))" : "\(date) · Ongoing"
+    }
+
+    private var minutes: Int { max(1, Int(event.end.timeIntervalSince(event.start) / 60)) }
 }
 
 struct TaskContextMenu: View {
@@ -376,6 +565,53 @@ struct TaskContextMenu: View {
     var inCalendar = false
 
     var body: some View {
+        // Right-clicking one of several selected tasks acts on all of them.
+        if app.isMultiSelecting && app.selectedTaskIDs.contains(task.id) {
+            selectionItems
+        } else {
+            taskItems
+        }
+    }
+
+    @ViewBuilder
+    private var selectionItems: some View {
+        let count = app.selectedTaskIDs.count
+        let anyOpen = store.tasks.contains { !$0.isCompleted && app.selectedTaskIDs.contains($0.id) }
+        Button(anyOpen ? "Mark \(count) as Done" : "Mark \(count) as Not Done") {
+            app.toggleDone(targets, in: store)
+            app.deselectAll()
+        }
+        Divider()
+        ForEach(QuickDay.allCases, id: \.self) { day in
+            Button(day == .nextWeek ? "Move to Next Monday" : "Move to \(day.label)") {
+                app.move(targets, toDay: day.date(), in: store)
+            }
+        }
+        Button("Remove Dates") { app.clearDates(targets, in: store) }
+        Menu("Priority") {
+            ForEach(Priority.allCases.reversed()) { p in
+                Button(p.label) { app.setPriority(p, for: targets, in: store) }
+            }
+        }
+        Menu("Move to List") {
+            Button("Inbox") { app.setList(nil, for: targets, in: store) }
+            ForEach(store.lists) { list in
+                Button(list.name) { app.setList(list.id, for: targets, in: store) }
+            }
+        }
+        Divider()
+        Button("Copy as Checklist") { app.copyChecklist(targets, in: store) }
+        Divider()
+        Button("Delete \(count) Tasks", role: .destructive) {
+            app.delete(targets, in: store) { app.deselectAll() }
+        }
+    }
+
+    /// The selected tasks in list order, worked out when a command runs rather than while drawing the menu.
+    private var targets: [UUID] { app.actionTargets(in: store) }
+
+    @ViewBuilder
+    private var taskItems: some View {
         let cal = Calendar.current
         let today = cal.startOfDay(for: Date())
         let tomorrow = cal.date(byAdding: .day, value: 1, to: today)!
@@ -430,11 +666,12 @@ struct TaskContextMenu: View {
             Button("Start Focus (\(Fmt.duration(minutes: minutes)))") { focus.start(taskID: task.id, minutes: minutes) }
         }
         Button("Duplicate") {
-            if let copy = store.duplicateTask(task.id) { app.selectedTaskID = copy.id }
+            if let copy = store.duplicateTask(task.id) { app.selectOnly(copy.id) }
         }
         Divider()
         Button("Delete", role: .destructive) {
             if app.selectedTaskID == task.id { app.selectedTaskID = nil }
+            app.selectedTaskIDs.remove(task.id)
             store.deleteTasks([task.id])
         }
     }

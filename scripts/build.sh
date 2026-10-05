@@ -9,6 +9,13 @@
 #   (create the profile once: xcrun notarytool store-credentials docket-notary --apple-id you@x.com --team-id TEAMID)
 #
 # Optional: VERSION=1.2.0 BUNDLE_ID=com.yourco.docket
+#
+# Secrets: by default nothing secret goes into the app; people paste their own Gemini API key in
+# Settings → AI. For a private build handed to someone you know, embed keys from .env (git-ignored):
+#   EMBED_SECRETS=1 scripts/build.sh
+# .env holds KEY=VALUE lines (blank lines and # comments are ignored): GEMINI_API_KEY, GEMINI_MODEL,
+# GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET. Values already set in the environment win over .env.
+# They're copied into Info.plist, so that DMG contains the keys: never share it publicly.
 set -euo pipefail
 
 APP_NAME="Docket"
@@ -48,6 +55,46 @@ BIN_DIR="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)"
 lipo -info "$BIN_DIR/$APP_NAME"
 
 step "Assembling $APP_NAME.app"
+# Private builds only (EMBED_SECRETS=1): Info.plist entries for the keys. Values are never printed.
+SECRET_PLIST=""
+if [[ "${EMBED_SECRETS:-}" == "1" ]]; then
+  # Prints the last value for key $2 in the .env file $1 ("export " prefixes, quotes and trailing # comments handled).
+  dotenv_value() {
+    local line key value found=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%$'\r'}"
+      line="${line#"${line%%[![:space:]]*}"}"
+      if [[ -z "$line" || "$line" == \#* || "$line" != *=* ]]; then continue; fi
+      line="${line#export }"
+      key="${line%%=*}"
+      key="${key//[[:space:]]/}"
+      if [[ "$key" != "$2" ]]; then continue; fi
+      value="${line#*=}"
+      value="${value#"${value%%[![:space:]]*}"}"
+      if [[ ${#value} -ge 2 && ( "$value" == \"*\" || "$value" == \'*\' ) ]]; then
+        value="${value:1:${#value}-2}"
+      else
+        value="${value%%[[:space:]]#*}"
+        value="${value%"${value##*[![:space:]]}"}"
+      fi
+      found="$value"
+    done < "$1"
+    printf '%s' "$found"
+  }
+  xml_escape() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"
+  }
+  for pair in GEMINI_API_KEY:DocketGeminiAPIKey GEMINI_MODEL:DocketGeminiModel \
+              GOOGLE_CLIENT_ID:DocketGoogleClientID GOOGLE_CLIENT_SECRET:DocketGoogleClientSecret; do
+    name="${pair%%:*}"
+    value="${!name:-}"
+    if [[ -z "$value" && -f "$ROOT/.env" ]]; then value="$(dotenv_value "$ROOT/.env" "$name")"; fi
+    if [[ -n "$value" ]]; then
+      SECRET_PLIST+="  <key>${pair#*:}</key><string>$(xml_escape "$value")</string>"$'\n'
+    fi
+  done
+  unset value
+fi
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Library/Sounds"
 cp "$BIN_DIR/$APP_NAME" "$APP/Contents/MacOS/$APP_NAME"
@@ -78,10 +125,19 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSHumanReadableCopyright</key><string>© $(date +%Y) Docket</string>
   <key>NSCalendarsUsageDescription</key><string>Docket reads today's meetings to work out how much free time you have for your tasks.</string>
   <key>NSCalendarsFullAccessUsageDescription</key><string>Docket reads today's meetings to work out how much free time you have for your tasks.</string>
-</dict>
+${SECRET_PLIST}</dict>
 </plist>
 PLIST
 printf "APPL????" > "$APP/Contents/PkgInfo"
+if [[ -n "$SECRET_PLIST" ]]; then
+  echo "Secrets embedded: yes (private build — don't share this DMG publicly)"
+else
+  echo "Secrets embedded: no"
+  if [[ "${EMBED_SECRETS:-}" == "1" ]]; then
+    echo "  (EMBED_SECRETS=1, but neither .env nor the environment had GEMINI_API_KEY, GEMINI_MODEL, GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET)"
+  fi
+fi
+SECRET_PLIST=""
 
 step "Code signing"
 ENTITLEMENTS="$ROOT/build/Docket.entitlements"

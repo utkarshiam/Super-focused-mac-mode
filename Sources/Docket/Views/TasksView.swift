@@ -16,14 +16,45 @@ struct TasksView: View {
             }
             .frame(minWidth: 368, maxWidth: .infinity, alignment: .leading)
 
-            if let id = app.selectedTaskID, store.task(id) != nil {
+            // Several tasks selected: edit them together. One task: its details.
+            let bulk = showsBulkPanel
+            let detailID = app.selectedTaskID.flatMap { store.task($0) != nil ? $0 : nil }
+            if bulk || detailID != nil {
                 Rectangle().fill(Color.hair).frame(width: 1).ignoresSafeArea()
-                TaskDetailView(taskID: id)
-                    .frame(width: 370)
-                    .id(id)
-                    .transition(.asymmetric(insertion: .opacity.combined(with: .offset(x: 16)), removal: .opacity))
+                if bulk {
+                    BulkEditPanel()
+                        .frame(width: 370)
+                        .transition(.asymmetric(insertion: .opacity.combined(with: .offset(x: 16)), removal: .opacity))
+                } else if let detailID {
+                    TaskDetailView(taskID: detailID)
+                        .frame(width: 370)
+                        .id(detailID)
+                        .transition(.asymmetric(insertion: .opacity.combined(with: .offset(x: 16)), removal: .opacity))
+                }
             }
         }
+    }
+
+    /// At least two of the selected tasks still exist.
+    private var showsBulkPanel: Bool {
+        app.isMultiSelecting && store.tasks.lazy.filter { app.selectedTaskIDs.contains($0.id) }.prefix(2).count == 2
+    }
+}
+
+/// The header button for dense one-line rows (same as View ▸ Compact Rows, ⌥⌘C). Filled while it's on.
+struct CompactRowsToggle: View {
+    @EnvironmentObject var app: AppState
+
+    var body: some View {
+        Button {
+            withAnimation(Motion.snappy) { app.compactRows.toggle() }
+        } label: {
+            Image(systemName: app.compactRows ? "list.dash" : "list.bullet")
+        }
+        .buttonStyle(IconButtonStyle(filled: app.compactRows))
+        .help("Compact rows (⌥⌘C)")
+        .accessibilityLabel("Compact rows")
+        .accessibilityValue(app.compactRows ? "On" : "Off")
     }
 }
 
@@ -95,7 +126,9 @@ struct TaskListPane: View {
                             withAnimation(Motion.base) { showCompleted.toggle() }
                         }
                         .buttonStyle(SecondaryPill(height: 32))
+                        .help(showCompleted ? "Hide this list's finished tasks" : "Show this list's finished tasks")
                     }
+                    CompactRowsToggle()
                     Menu {
                         Picker("Sort by", selection: $sortRaw) {
                             ForEach(SortMode.allCases) { Text($0.label).tag($0.rawValue) }
@@ -124,7 +157,7 @@ struct TaskListPane: View {
                 ScrollViewReader { proxy in
                 ScrollView {
                     EnterUpWindow {
-                    LazyVStack(alignment: .leading, spacing: 2) {
+                    LazyVStack(alignment: .leading, spacing: app.compactRows ? 1 : 2) {
                         ForEach(sections) { section in
                             if sections.count > 1 || section.style != .normal {
                                 HStack(alignment: .firstTextBaseline) {
@@ -135,8 +168,8 @@ struct TaskListPane: View {
                                     }
                                 }
                                 .padding(.horizontal, 14)
-                                .padding(.top, Space.xl)
-                                .padding(.bottom, Space.sm)
+                                .padding(.top, app.compactRows ? Space.md : Space.xl)
+                                .padding(.bottom, app.compactRows ? Space.xs : Space.sm)
                             }
                             ForEach(Array(section.tasks.enumerated()), id: \.element.id) { i, task in
                                 TaskRow(task: task, context: app.selection, index: i)
@@ -166,6 +199,7 @@ struct TaskListPane: View {
         case .important: "Important"
         case .all: "All tasks"
         case .completed: "Completed"
+        case .waiting: "Waiting"
         case .list(let id): store.list(id)?.name ?? "List"
         case .tag(let tag): "#\(tag)"
         default: ""
@@ -191,6 +225,9 @@ struct TaskListPane: View {
             EmptyState(icon: "flag", title: "Nothing urgent", message: "Mark a task High (!!!) or Urgent (!!!!) to see it here.")
         case .completed:
             EmptyState(icon: "checkmark", title: "Nothing finished yet", message: "Done tasks are kept here as your log.")
+        case .waiting:
+            EmptyState(icon: "hourglass", title: "Nothing to chase",
+                       message: "When someone else is doing a task, set “Waiting on” in its details and it shows up here.")
         default:
             EmptyState(icon: "checklist", title: "No tasks", message: "Add one with the field above.")
         }

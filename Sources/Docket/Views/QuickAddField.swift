@@ -6,14 +6,23 @@ import SwiftUI
 struct QuickAddField: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var app: AppState
-    /// In the calendar: the day new tasks land on when no date is typed.
+    /// In the calendar: the day new tasks land on when no date is typed or picked.
     var day: Date?
     @State private var text = ""
+    /// The Date, Time, List and More dropdowns. They win over the typed text and reset after each add.
+    @State private var options = AddOptions()
+    @State private var picker: AddPicker?
+    @State private var chipFocused = false
+    @State private var hoveringOptions = false
     @State private var fieldWidth: CGFloat = 0
     @FocusState private var focused: Bool
 
     var body: some View {
         let trimmed = text.trimmingCharacters(in: .whitespaces)
+        let now = Date()
+        // The dropdowns show while you're adding: the field has focus or text, something is picked,
+        // or the pointer or keyboard is on them.
+        let showsOptions = focused || !trimmed.isEmpty || options.hasPicks || picker != nil || chipFocused || hoveringOptions
         VStack(alignment: .leading, spacing: Space.sm) {
             HStack(spacing: 10) {
                 Image(systemName: "plus")
@@ -48,58 +57,67 @@ struct QuickAddField: View {
             )
             .animation(Motion.fast, value: focused)
 
-            if !trimmed.isEmpty {
-                ParsedPreview(parsed: parser.parse(text), lists: store.lists)
-                    .padding(.leading, 4)
+            // What the task will get, as dropdowns (they replace the old parse preview).
+            if showsOptions {
+                AddOptionsBar(options: $options, parsed: parser(now).parse(text), context: context, lists: store.lists, now: now,
+                              picker: $picker, onPick: { focused = true }, onFocusChange: { chipFocused = $0 })
+                    .onHover { hoveringOptions = $0 }
+                    .transition(.opacity.combined(with: .offset(y: -4)))
             }
         }
         .animation(Motion.base, value: trimmed.isEmpty)
+        .animation(Motion.base, value: showsOptions)
         .onChange(of: app.focusQuickAdd) { _ in focused = true }
     }
+
+    /// What this page gives a new task: the Calendar's day, a list, a tag, or High on Important.
+    private var context: AddContext { AddContext(selection: app.selection, day: day) }
 
     /// The longest hint that fits the field, so it never gets cut off mid-word.
     private var placeholder: String {
         let example = day == nil ? "Board prep fri 3pm 90m !!! @alarm15" : "Call investor fri 3pm 30m !! @alarm10"
-        let options = ["Add a task. Try “\(example)”", "Add a task, e.g. “Call Sam fri 3pm 30m”", "Add a task"]
+        let hints = ["Add a task. Try “\(example)”", "Add a task, e.g. “Call Sam fri 3pm 30m”", "Add a task"]
         let font = NSFont.systemFont(ofSize: 15, weight: .medium)
-        return options.first { fieldWidth == 0 || ($0 as NSString).size(withAttributes: [.font: font]).width + 4 <= fieldWidth }
-            ?? options[options.count - 1]
+        return hints.first { fieldWidth == 0 || ($0 as NSString).size(withAttributes: [.font: font]).width + 4 <= fieldWidth }
+            ?? hints[hints.count - 1]
     }
 
-    private var parser: QuickParser {
-        QuickParser(now: Date(), lists: store.lists, workdayEndMinutes: Prefs.workdayEnd)
+    private func parser(_ now: Date) -> QuickParser {
+        QuickParser(now: now, lists: store.lists, workdayEndMinutes: Prefs.workdayEnd)
     }
 
     private func add() {
         guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-        var t = TaskItem(parsed: parser.parse(text), defaultReminder: Prefs.defaultReminder, defaultIsAlarm: Prefs.defaultReminderIsAlarm)
+        let now = Date()
         let cal = Calendar.current
-        let today = cal.startOfDay(for: Date())
-        switch app.selection {
-        case .calendar:
-            if t.dueDate == nil { t.scheduledDate = max(day ?? today, today) }
-        case .list(let id):
-            if t.listID == nil { t.listID = id }
-        case .tag(let tag):
-            if !t.tags.contains(where: { $0.caseInsensitiveCompare(tag) == .orderedSame }) { t.tags.append(tag) }
-        case .important:
-            if t.priority < .high { t.priority = .high }
-        default:
-            break
-        }
-        let added = withAnimation(Motion.gentle) { store.addTask(t) }
+        let today = cal.startOfDay(for: now)
+        // Typed text, then the dropdown picks on top, then this page's defaults: the same merge the chips preview.
+        let task = options.makeTask(parsed: parser(now).parse(text), context: context, lists: store.lists, now: now)
+        let added = withAnimation(Motion.gentle) { store.addTask(task) }
         text = ""
+        // Picks are for one task; the page's own defaults (its list, its day) come back by themselves.
+        options.reset()
         focused = true
 
         // Say where it went when that isn't obvious from the screen.
         if app.selection == .calendar {
-            if let d = store.calendarDay(of: added, today: today), d != cal.startOfDay(for: day ?? today) {
-                app.showToast("Added for \(Fmt.absoluteDay(d))")
-                app.goTo(day: d)
+            if let d = store.calendarDay(of: added, today: today) {
+                if d != cal.startOfDay(for: day ?? today) {
+                    app.showToast("Added for \(Fmt.absoluteDay(d))")
+                    app.goTo(day: d)
+                }
+            } else {
+                // "No date" was picked, so it isn't on the calendar.
+                app.showToast(addedElsewhere(added))
             }
         } else if !store.sections(for: app.selection, keeping: []).contains(where: { $0.tasks.contains { $0.id == added.id } }) {
-            let destination = added.dueDate.map { "due \(Fmt.absoluteDay($0))" } ?? (store.list(added.listID)?.name ?? "Inbox")
-            app.showToast("Added. \(destination.prefix(1).uppercased() + destination.dropFirst()).")
+            app.showToast(addedElsewhere(added))
         }
+    }
+
+    /// "Added. Due Mon 5 Oct." or "Added. Inbox."
+    private func addedElsewhere(_ t: TaskItem) -> String {
+        let destination = t.dueDate.map { "due \(Fmt.absoluteDay($0))" } ?? (store.list(t.listID)?.name ?? "Inbox")
+        return "Added. \(destination.prefix(1).uppercased() + destination.dropFirst())."
     }
 }

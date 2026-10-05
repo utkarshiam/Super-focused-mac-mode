@@ -21,7 +21,8 @@ struct RootView: View {
         .background(Color.paper.ignoresSafeArea())
         .overlay(alignment: .top) { recoveryBanner }
         .overlay(alignment: .bottom) { toast }
-        .overlay { CelebrationOverlay() }
+        // Confetti only: it never takes a click meant for the window underneath.
+        .overlay { CelebrationOverlay().allowsHitTesting(false) }
         .overlay {
             if app.showPalette {
                 CommandPalette()

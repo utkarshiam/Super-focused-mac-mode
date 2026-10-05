@@ -4,14 +4,17 @@ import SwiftUI
 import UserNotifications
 
 struct SettingsView: View {
+    // Six tabs at 94pt fit the 620pt window; labels stay one short word (the longest, "Connections", is ~72pt).
     enum Tab: String, CaseIterable, Identifiable {
-        case general = "General", alerts = "Reminders & Alarms", planner = "Planner", data = "Data"
+        case general = "General", alerts = "Reminders", planner = "Planner", ai = "AI", connections = "Connections", data = "Data"
         var id: String { rawValue }
         var icon: String {
             switch self {
             case .general: "gearshape"
             case .alerts: "alarm"
             case .planner: "calendar"
+            case .ai: "sparkles"
+            case .connections: "link"
             case .data: "externaldrive"
             }
         }
@@ -30,7 +33,7 @@ struct SettingsView: View {
                             Text(t.rawValue).font(.system(size: 11.5, weight: .semibold))
                         }
                         .foregroundStyle(tab == t ? Color.onPrimary : Color.ink2)
-                        .frame(width: 132, height: 56)
+                        .frame(width: 94, height: 56)
                         .background {
                             if tab == t {
                                 RoundedRectangle(cornerRadius: Radius.md, style: .continuous)
@@ -50,6 +53,8 @@ struct SettingsView: View {
                 case .general: GeneralSettings()
                 case .alerts: AlertSettings()
                 case .planner: PlannerSettings()
+                case .ai: AISettingsPage()
+                case .connections: ConnectionsSettingsPage()
                 case .data: DataSettings()
                 }
             }
@@ -61,9 +66,9 @@ struct SettingsView: View {
     }
 }
 
-// MARK: - Building blocks
+// MARK: - Building blocks (shared with the AI and Connections pages)
 
-private struct SettingsPage<Content: View>: View {
+struct SettingsPage<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
@@ -77,7 +82,7 @@ private struct SettingsPage<Content: View>: View {
     }
 }
 
-private struct SettingsSection<Content: View>: View {
+struct SettingsSection<Content: View>: View {
     var title: String
     var footer: String?
     @ViewBuilder var content: Content
@@ -98,7 +103,7 @@ private struct SettingsSection<Content: View>: View {
     }
 }
 
-private struct SettingsRow<Trailing: View>: View {
+struct SettingsRow<Trailing: View>: View {
     var title: String
     var subtitle: String?
     var divider = true
@@ -129,7 +134,7 @@ private struct SettingsRow<Trailing: View>: View {
     }
 }
 
-private struct ToggleRow: View {
+struct ToggleRow: View {
     var title: String
     var subtitle: String?
     @Binding var isOn: Bool
@@ -146,7 +151,7 @@ private struct ToggleRow: View {
 }
 
 /// A value pill that opens a menu of choices.
-private struct ChoiceMenu<Value: Hashable>: View {
+struct ChoiceMenu<Value: Hashable>: View {
     @Binding var selection: Value
     var options: [(Value, String)]
 

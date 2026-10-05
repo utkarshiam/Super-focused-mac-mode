@@ -267,6 +267,8 @@ struct NoteEditorPane: View {
                         NSPasteboard.general.setString(note.body, forType: .string)
                     }
                     Divider()
+                    Button("Find Tasks with AI…") { AIActions.findTasks(inNote: noteID, app: app, store: store) }
+                    Divider()
                     Button("Export as PDF…") { MarkdownExport.exportPDF(note.body, title: note.title) }
                     Button("Export as Markdown…") { export(note) }
                     Divider()

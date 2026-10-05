@@ -57,8 +57,9 @@ enum MainMenu {
 
         // Edit — standard responder-chain actions so text fields get copy/paste/undo.
         let find = NSMenu(title: "Find")
-        for (title, key, tag, mods) in [("Find…", "f", 1, NSEvent.ModifierFlags.command), ("Find Next", "g", 2, .command),
-                                        ("Find Previous", "g", 3, [.command, .shift])] {
+        // ⌘F searches all tasks and notes; inside a note it opens the note's own find bar instead.
+        find.addItem(item("Search…", #selector(AppDelegate.searchAction(_:)), "f"))
+        for (title, key, tag, mods) in [("Find Next", "g", 2, NSEvent.ModifierFlags.command), ("Find Previous", "g", 3, [.command, .shift])] {
             find.addItem(item(title, #selector(NSTextView.performFindPanelAction(_:)), key, mods, tag: tag, toDelegate: false))
         }
         let findHolder = NSMenuItem(title: "Find", action: nil, keyEquivalent: "")
@@ -77,6 +78,14 @@ enum MainMenu {
             findHolder,
         ])
 
+        // View
+        _ = submenu("View", [
+            item("Compact Rows", #selector(AppDelegate.toggleCompactRows(_:)), "c", [.command, .option]),
+            item("Hide Sidebar", #selector(AppDelegate.toggleSidebar(_:)), "s", [.command, .control]),
+            .separator(),
+            item("Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control], toDelegate: false),
+        ])
+
         // Task
         let priority = NSMenu(title: "Priority")
         for p in Priority.allCases.reversed() {
@@ -85,6 +94,8 @@ enum MainMenu {
         let priorityHolder = NSMenuItem(title: "Priority", action: nil, keyEquivalent: "")
         priorityHolder.submenu = priority
         _ = submenu("Task", [
+            item("Plan with AI…", #selector(AppDelegate.planWithAI(_:)), "j"),
+            .separator(),
             item("Mark as Done", #selector(AppDelegate.completeSelected(_:)), "\r"),
             item("Do Today", #selector(AppDelegate.planToday(_:)), "t"),
             item("Move to Tomorrow", #selector(AppDelegate.planTomorrow(_:)), "t", [.command, .option]),
@@ -96,15 +107,12 @@ enum MainMenu {
             item("Delete Task", #selector(AppDelegate.deleteSelected(_:)), "\u{8}"),
         ])
 
-        // Go
-        let places = ["Calendar", "Inbox", "Notes", "Important", "All Tasks", "Completed", "Insights"]
+        // Go (the order matches AppDelegate.go(_:)'s targets)
+        let places = ["Calendar", "Inbox", "Notes", "Important", "All Tasks", "Completed", "Insights", "Waiting", "From Slack & Gmail"]
         var goItems = places.enumerated().map { i, name in item(name, #selector(AppDelegate.go(_:)), "\(i + 1)", tag: i) }
         goItems += [
             .separator(),
             item("Jump to…", #selector(AppDelegate.commandPalette(_:)), "k"),
-            item("Hide Sidebar", #selector(AppDelegate.toggleSidebar(_:)), "s", [.command, .control]),
-            .separator(),
-            item("Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control], toDelegate: false),
         ]
         _ = submenu("Go", goItems)
 

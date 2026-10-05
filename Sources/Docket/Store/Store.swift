@@ -17,6 +17,8 @@ final class Store: ObservableObject {
     private(set) var isFirstLaunch = false
     private var saveWork: DispatchWorkItem?
     private let writeQueue = DispatchQueue(label: "docket.save", qos: .utility)
+    /// Counts each task's pushes to a later day (`postponeCount`).
+    private var slipTracker = SlipTracker()
     var calendar = Calendar.current
 
     init(persistence: Persistence = Persistence(directory: Persistence.defaultDirectory), seedIfEmpty: Bool = true) {
@@ -137,6 +139,7 @@ final class Store: ObservableObject {
         var t = task
         t.updatedAt = Date()
         dropRankIfDayChanged(from: tasks[i], to: &t)
+        countPostponement(from: tasks[i], to: &t)
         tasks[i] = t
         changed()
     }
@@ -148,6 +151,7 @@ final class Store: ObservableObject {
         guard t != tasks[i] else { return }
         t.updatedAt = Date()
         dropRankIfDayChanged(from: tasks[i], to: &t)
+        countPostponement(from: tasks[i], to: &t)
         if let name {
             undoable(name) { tasks[i] = t }
         } else {
@@ -175,6 +179,12 @@ final class Store: ObservableObject {
             || isOverdueByDay(old, today: today) != isOverdueByDay(new, today: today) {
             new.rank = nil
         }
+    }
+
+    /// Every path that changes a date ends here (pickers, menus, "Tomorrow" from a notification, moves),
+    /// so a push to a later day is counted wherever it came from. Reorders never change a date.
+    private func countPostponement(from old: TaskItem, to new: inout TaskItem) {
+        slipTracker.record(from: old, to: &new, now: Date(), calendar: calendar)
     }
 
     func binding(forTask id: UUID) -> Binding<TaskItem> {
@@ -246,6 +256,8 @@ final class Store: ObservableObject {
             t.scheduledDate = nil
             t.trackedSeconds = 0
             t.rank = nil
+            // The next occurrence starts with a clean slate; the logged copy keeps how often this one slipped.
+            t.postponeCount = 0
             t.subtasks = t.subtasks.map { var s = $0; s.done = false; return s }
             t.reminders = t.reminders.filter { !$0.isSnooze }.map { r in
                 guard case .absolute(let d) = r.trigger else { return r }

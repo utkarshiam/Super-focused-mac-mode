@@ -128,13 +128,25 @@ struct CommandPalette: View {
             Item(id: "c-important", icon: "flag", title: "Go to Important", subtitle: "⌘4") { app.selection = .important },
             Item(id: "c-completed", icon: "checkmark.circle", title: "Go to Completed", subtitle: "⌘6") { app.selection = .completed },
             Item(id: "c-insights", icon: "chart.bar", title: "Go to Insights", subtitle: "⌘7") { app.selection = .insights },
+            Item(id: "c-waiting", icon: "hourglass", title: "Go to Waiting", subtitle: "⌘8") { app.selection = .waiting },
+            Item(id: "c-suggestions", icon: "tray.and.arrow.down", title: "Go to From Slack & Gmail", subtitle: "⌘9") { app.selection = .suggestions },
             Item(id: "c-month", icon: "calendar.badge.clock", title: "Show the month", subtitle: "Calendar") {
                 app.selection = .calendar
                 app.calendarMode = .month
             },
+            Item(id: "c-search", icon: "magnifyingglass", title: "Search all tasks", subtitle: "⌘F") { app.beginSearch() },
+            Item(id: "c-plan", icon: "sparkles", title: "Plan with AI…", subtitle: "⌘J") { app.aiPlanner = AIPlannerRequest() },
+            Item(id: "c-compact", icon: "list.dash", title: "Toggle compact rows", subtitle: "⌥⌘C") {
+                withAnimation(Motion.snappy) { app.compactRows.toggle() }
+            },
             Item(id: "c-daily", icon: "sun.max", title: "Open today's daily note", subtitle: "⌘D") { app.reveal(note: store.dailyNote().id) },
             Item(id: "c-note", icon: "square.and.pencil", title: "New note", subtitle: "⇧⌘N") { app.reveal(note: store.addNote(body: "").id) },
             Item(id: "c-clip", icon: "doc.on.clipboard", title: "New note from clipboard", subtitle: "⌥⌘V · shows Markdown formatted") { app.newNoteFromClipboard(store) },
+        ] + (Integrations.shared.isAnyConnected ? [
+            Item(id: "c-refresh", icon: "arrow.clockwise", title: "Refresh Slack & Gmail", subtitle: "Check for new messages to act on") {
+                Integrations.shared.refresh()
+            },
+        ] : []) + [
             Item(id: "c-settings", icon: "gearshape", title: "Settings", subtitle: "⌘,") { app.showSettings() },
         ] + store.lists.map { list in
             Item(id: "l-\(list.id)", icon: list.icon, title: "Go to \(list.name)", subtitle: "List") { app.selection = .list(list.id) }
@@ -165,6 +177,9 @@ struct CommandPalette: View {
                           subtitle: detail.isEmpty ? "Inbox" : detail.joined(separator: " · ")) {
             let t = store.addTask(TaskItem(parsed: parsed, defaultReminder: Prefs.defaultReminder, defaultIsAlarm: Prefs.defaultReminderIsAlarm))
             app.reveal(task: t.id, in: store)
+        })
+        items.append(Item(id: "plan", icon: "sparkles", title: "Plan “\(q)” with AI", subtitle: "Turn it into tasks to review · ⌘J") {
+            app.aiPlanner = AIPlannerRequest(text: q)
         })
         return items
     }

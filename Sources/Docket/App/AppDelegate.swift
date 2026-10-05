@@ -40,6 +40,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         app.showSettings = { [weak self] in self?.showSettings() }
         app.showQuickCapture = { [weak self] in self?.quickCapture.toggle() }
 
+        // Before any window reads a secret: screenshot mode never touches the login keychain or the network.
+        if DebugSnapshot.isActive { Keychain.useInMemoryStore() } else { Integrations.shared.start(store: store, app: app) }
+
+        // Docket doesn't use window tabs (this also keeps tab items out of the View menu).
+        NSWindow.allowsAutomaticWindowTabbing = false
         NSApp.mainMenu = MainMenu.build(target: self)
         makeMainWindow()
         statusItem = StatusItemController(delegate: self)
@@ -104,35 +109,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         store.saveNow()
     }
 
-    /// Arrow keys move through tasks and notes, Esc closes the detail,
-    /// Delete removes the selected task. Never while typing.
+    /// The main window's keys, never while typing. Arrows move through tasks and notes (⇧ grows the
+    /// selection), ⌘A selects every open task in view, Return opens or closes the details, Esc drops a
+    /// multi-selection and then closes the details, Delete removes the selected tasks, and t / m / w / x
+    /// move them to today / tomorrow / next Monday or tick them off.
     private func handleKey(_ event: NSEvent) -> Bool {
         guard event.window === mainWindow, !app.showPalette, !(mainWindow.firstResponder is NSText) else { return false }
         let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        let inTasks = app.selection.isTaskView
+        let isArrow = event.keyCode == 125 || event.keyCode == 126
+        let key = event.charactersIgnoringModifiers?.lowercased() ?? ""
+
+        if mods == .command, key == "a" {
+            return inTasks && app.selectAllVisible(in: store)
+        }
+        if mods == .shift, isArrow {
+            return inTasks && app.extendSelection(by: event.keyCode == 125 ? 1 : -1, in: store)
+        }
         guard mods.isEmpty else { return false }
         switch event.keyCode {
         case 125, 126: // down, up
             let delta = event.keyCode == 125 ? 1 : -1
             if app.selection == .notes {
                 app.moveNoteSelection(by: delta, in: store)
-            } else if app.selection.isTaskView {
-                app.moveSelection(by: delta, in: store)
-            } else {
-                return false
+                return true
             }
-            return true
+            return inTasks && app.moveSelection(by: delta, in: store)
         case 53: // esc
+            if app.collapseSelection() { return true }
             guard app.selectedTaskID != nil else { return false }
             withAnimation(Motion.sheet) { app.selectedTaskID = nil }
             return true
         case 51, 117: // delete, forward delete
-            guard app.selection.isTaskView, let id = app.selectedTaskID else { return false }
-            app.moveSelection(by: 1, in: store)
-            if app.selectedTaskID == id { app.selectedTaskID = nil }
-            withAnimation(Motion.base) { store.deleteTasks([id]) }
-            return true
+            return inTasks && app.deleteSelection(in: store)
+        case 36, 76: // return, enter
+            return inTasks && app.toggleDetail(in: store)
         default:
-            return false
+            guard inTasks else { return false }
+            switch key {
+            case "t": return app.triage(.move(.today), in: store)
+            case "m": return app.triage(.move(.tomorrow), in: store)
+            case "w": return app.triage(.move(.nextWeek), in: store)
+            case "x": return app.triage(.done, in: store)
+            default: return false
+            }
         }
     }
 
@@ -278,7 +298,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc func newTask(_ sender: Any?) {
         showMainWindow()
-        if !app.selection.isTaskView { app.selection = .inbox }
+        // Search results have no quick-add field.
+        if !app.selection.isTaskView || app.selection == .search { app.selection = .inbox }
         app.focusQuickAdd += 1
     }
 
@@ -308,8 +329,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         app.showPalette = true
     }
 
+    /// ⌘F. In a note (editor or reader) it opens that note's find bar; anywhere else it puts the
+    /// cursor in the sidebar search field, which searches every task and note.
+    @objc func searchAction(_ sender: Any?) {
+        if mainWindow.isKeyWindow, let textView = mainWindow.firstResponder as? NSTextView, !textView.isFieldEditor {
+            let find = NSMenuItem(title: "", action: #selector(NSTextView.performFindPanelAction(_:)), keyEquivalent: "")
+            find.tag = NSTextFinder.Action.showFindInterface.rawValue
+            // A text view without a find bar can't search itself; search everything instead.
+            if textView.validateUserInterfaceItem(find) {
+                textView.performFindPanelAction(find)
+                return
+            }
+        }
+        showMainWindow()
+        app.beginSearch()
+    }
+
+    @objc func toggleCompactRows(_ sender: Any?) {
+        withAnimation(Motion.snappy) { app.compactRows.toggle() }
+    }
+
+    @objc func planWithAI(_ sender: Any?) {
+        showMainWindow()
+        // Already open: keep what's been typed there.
+        if app.aiPlanner == nil { app.aiPlanner = AIPlannerRequest() }
+    }
+
     @objc func go(_ sender: NSMenuItem) {
-        let targets: [SidebarItem] = [.calendar, .inbox, .notes, .important, .all, .completed, .insights]
+        // Same order as the Go menu (⌘1…⌘9).
+        let targets: [SidebarItem] = [.calendar, .inbox, .notes, .important, .all, .completed, .insights, .waiting, .suggestions]
         guard targets.indices.contains(sender.tag) else { return }
         showMainWindow()
         app.selection = targets[sender.tag]
@@ -320,31 +368,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         return store.task(app.selectedTaskID)
     }
 
+    /// Several tasks selected in the main window: Task menu commands apply to all of them.
+    private var selectedTasks: [UUID]? {
+        guard app.isMultiSelecting, app.selection.isTaskView, mainWindow.isKeyWindow else { return nil }
+        let ids = app.actionTargets(in: store)
+        return ids.isEmpty ? nil : ids
+    }
+
+    /// The tasks a Task menu item would act on, for validating it (cheap: no list order needed).
+    private var menuTargets: [TaskItem] {
+        guard app.selection.isTaskView, mainWindow.isKeyWindow else { return [] }
+        guard app.isMultiSelecting else { return selectedTask.map { [$0] } ?? [] }
+        return store.tasks.filter { app.selectedTaskIDs.contains($0.id) }
+    }
+
     @objc func completeSelected(_ sender: Any?) {
+        if let ids = selectedTasks {
+            app.toggleDone(ids, in: store)
+            app.deselectAll()
+            return
+        }
         guard let t = selectedTask else { return }
         app.toggle(t.id, in: store)
     }
 
     @objc func planToday(_ sender: Any?) {
+        if let ids = selectedTasks { return app.plan(ids, on: Date(), in: store) }
         guard let t = selectedTask else { return }
         store.setScheduled(t.id, Date())
     }
 
     @objc func planTomorrow(_ sender: Any?) {
+        if let ids = selectedTasks { return app.pushToTomorrow(ids, in: store) }
         guard let t = selectedTask else { return }
         store.pushToTomorrow(t.id)
     }
 
     @objc func focusSelected(_ sender: Any?) {
-        guard let t = selectedTask else { return }
+        guard !app.isMultiSelecting, let t = selectedTask else { return }
         focus.start(taskID: t.id, minutes: t.remainingMinutes > 0 ? t.remainingMinutes : Prefs.focusMinutes)
+    }
+
+    /// Edit ▸ Select All when no text is being edited: every open task in the view.
+    @objc func selectAll(_ sender: Any?) {
+        guard mainWindow.isKeyWindow, app.selectAllVisible(in: store) else { return NSSound.beep() }
     }
 
     @objc func moveSelectedUp(_ sender: Any?) { moveSelected(by: -1) }
     @objc func moveSelectedDown(_ sender: Any?) { moveSelected(by: 1) }
 
     private func moveSelected(by delta: Int) {
-        guard let t = selectedTask else { return }
+        guard !app.isMultiSelecting, let t = selectedTask else { return }
         let moved = withAnimation(Motion.gentle) { store.moveInDay(t.id, by: delta, now: app.clock) }
         if !moved {
             if store.dayList(containing: t.id, now: app.clock) == nil {
@@ -356,11 +430,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     @objc func setPriority(_ sender: NSMenuItem) {
-        guard let t = selectedTask, let p = Priority(rawValue: sender.tag) else { return }
+        guard let p = Priority(rawValue: sender.tag) else { return }
+        if let ids = selectedTasks { return app.setPriority(p, for: ids, in: store) }
+        guard let t = selectedTask else { return }
         store.mutateTask(t.id, undo: "Set Priority") { $0.priority = p }
     }
 
     @objc func deleteSelected(_ sender: Any?) {
+        if let ids = selectedTasks {
+            return app.delete(ids, in: store) { [weak self] in self?.app.deselectAll() }
+        }
         guard let t = selectedTask else { return }
         store.deleteTasks([t.id])
         app.selectedTaskID = nil
@@ -381,20 +460,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             item.title = app.sidebarVisible ? "Hide Sidebar" : "Show Sidebar"
             return true
         }
+        if item.action == #selector(toggleCompactRows(_:)) {
+            item.state = app.compactRows ? .on : .off
+            return true
+        }
         switch item.action {
+        case #selector(selectAll(_:)):
+            return mainWindow.isKeyWindow && app.selection.isTaskView
         case #selector(moveSelectedUp(_:)), #selector(moveSelectedDown(_:)):
-            return app.selection == .calendar && selectedTask.map { !$0.isCompleted } == true
+            return app.selection == .calendar && !app.isMultiSelecting && selectedTask.map { !$0.isCompleted } == true
+        case #selector(focusSelected(_:)):
+            return !app.isMultiSelecting && selectedTask != nil
         case #selector(completeSelected(_:)), #selector(planToday(_:)), #selector(planTomorrow(_:)),
-             #selector(focusSelected(_:)), #selector(setPriority(_:)), #selector(deleteSelected(_:)):
+             #selector(setPriority(_:)), #selector(deleteSelected(_:)):
+            // With several tasks selected these act on all of them.
+            let targets = menuTargets
             if item.action == #selector(completeSelected(_:)) {
-                item.title = selectedTask?.isCompleted == true ? "Mark as Not Done" : "Mark as Done"
+                item.title = !targets.isEmpty && targets.allSatisfy(\.isCompleted) ? "Mark as Not Done" : "Mark as Done"
             }
             if item.action == #selector(setPriority(_:)) {
-                item.state = selectedTask?.priority.rawValue == item.tag ? .on : .off
+                let matching = targets.filter { $0.priority.rawValue == item.tag }.count
+                item.state = targets.isEmpty || matching == 0 ? .off : (matching == targets.count ? .on : .mixed)
             }
-            // ⌘⌫ must keep deleting text while typing, never the task being edited.
-            if item.action == #selector(deleteSelected(_:)), mainWindow.firstResponder is NSText { return false }
-            return selectedTask != nil
+            if item.action == #selector(deleteSelected(_:)) {
+                item.title = targets.count > 1 ? "Delete \(targets.count) Tasks" : "Delete Task"
+                // ⌘⌫ must keep deleting text while typing, never the task being edited.
+                if mainWindow.firstResponder is NSText { return false }
+            }
+            return !targets.isEmpty
         default:
             return true
         }

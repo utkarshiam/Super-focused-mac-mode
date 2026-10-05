@@ -341,3 +341,84 @@ final class TimelineTests: XCTestCase {
         XCTAssertTrue(store.timeline(keeping: [done.id]).contains { $0.item.task?.id == done.id })
     }
 }
+
+@MainActor
+final class DelegationAndSourceTests: XCTestCase {
+    var dir: URL!
+
+    override func setUp() async throws {
+        dir = FileManager.default.temporaryDirectory.appendingPathComponent("docket-tests-\(UUID().uuidString)")
+    }
+
+    override func tearDown() async throws {
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    func makeStore() -> Store { Store(persistence: Persistence(directory: dir), seedIfEmpty: false) }
+
+    func testDelegationSlipCountAndSourceArePersisted() throws {
+        let store = makeStore()
+        var t = TaskItem(title: "Reply to Northwind about pricing")
+        t.waitingOn = "Sam"
+        t.postponeCount = 3
+        t.source = TaskSource(kind: .gmail, externalID: "gmail:18c2f0a1", url: URL(string: "https://mail.google.com/mail/u/0/#all/18c2f0a1"),
+                              label: "Sam Lee · Pricing")
+        store.addTask(t)
+        store.saveNow()
+
+        let reloaded = try XCTUnwrap(makeStore().tasks.first)
+        XCTAssertEqual(reloaded.waitingOn, "Sam")
+        XCTAssertEqual(reloaded.postponeCount, 3)
+        XCTAssertEqual(reloaded.source, t.source)
+
+        // Tasks saved before these fields existed load with the defaults.
+        let legacy = try Persistence.decoder.decode(TaskItem.self, from: Data(#"{"title":"Legacy"}"#.utf8))
+        XCTAssertNil(legacy.waitingOn)
+        XCTAssertEqual(legacy.postponeCount, 0)
+        XCTAssertNil(legacy.source)
+
+        // A source written by a newer version (extra fields, no label) still loads.
+        let newer = #"{"kind":"slack","externalID":"slack:C024BE91L/1712345678.000100","threadTS":"1712345678.000100"}"#
+        let source = try Persistence.decoder.decode(TaskSource.self, from: Data(newer.utf8))
+        XCTAssertEqual(source.kind, .slack)
+        XCTAssertEqual(source.externalID, "slack:C024BE91L/1712345678.000100")
+        XCTAssertEqual(source.label, "")
+        XCTAssertNil(source.url)
+    }
+
+    func testWaitingListsOpenDelegatedTasksByDateThenTitle() {
+        let store = makeStore()
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        func add(_ title: String, waitingOn: String?, due: Int? = nil, planned: Int? = nil, priority: Priority = .none, done: Bool = false) {
+            var t = TaskItem(title: title)
+            t.waitingOn = waitingOn
+            t.dueDate = due.map { cal.date(byAdding: .day, value: $0, to: today)! }
+            t.scheduledDate = planned.map { cal.date(byAdding: .day, value: $0, to: today)! }
+            t.priority = priority
+            if done { t.completedAt = Date() }
+            store.addTask(t)
+        }
+        add("Contract redlines", waitingOn: "Legal", due: 3)
+        add("Budget sign-off", waitingOn: "Sam", planned: 1)
+        add("Agency proposal", waitingOn: "Priya", due: 1)
+        add("Deck feedback", waitingOn: "Board", priority: .urgent)
+        add("Not delegated", waitingOn: "  ")
+        add("Handoff notes", waitingOn: "Sam", done: true)
+        add("Mine", waitingOn: nil, due: 0)
+
+        let sections = store.sections(for: .waiting, keeping: [])
+        XCTAssertEqual(sections.map(\.title), ["Waiting on others"])
+        XCTAssertEqual(sections.first?.tasks.map(\.title), ["Agency proposal", "Budget sign-off", "Contract redlines", "Deck feedback"])
+        XCTAssertEqual(store.count(for: .waiting), 4)
+
+        // Another sort the user picked still applies.
+        let byPriority = store.sections(for: .waiting, keeping: [], sort: .priority).first?.tasks.map(\.title)
+        XCTAssertEqual(byPriority, ["Deck feedback", "Agency proposal", "Contract redlines", "Budget sign-off"])
+
+        // Search and suggestions have their own views; they're not task sections.
+        XCTAssertTrue(store.sections(for: .search, keeping: []).isEmpty)
+        XCTAssertTrue(store.sections(for: .suggestions, keeping: []).isEmpty)
+        XCTAssertEqual(store.count(for: .suggestions), 0)
+    }
+}

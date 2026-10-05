@@ -10,6 +10,10 @@ struct CalendarView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            OverdueRollover()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, Space.gutter)
+                .padding(.bottom, Space.sm)
             if app.calendarMode == .agenda {
                 QuickAddField(day: Date())
                     .padding(.horizontal, Space.gutter)
@@ -39,7 +43,11 @@ struct CalendarView: View {
             let subtitle = [Fmt.longDay(today), Fmt.plural(open.count, "task"), minutes > 0 ? Fmt.duration(minutes: minutes) : nil,
                             overdue > 0 ? "\(overdue) overdue" : nil].compactMap { $0 }.joined(separator: " · ")
             PageHeader(title: "Calendar", subtitle: subtitle) {
-                SegmentedControl(selection: $app.calendarMode, options: [(.agenda, "List"), (.month, "Month")])
+                HStack(spacing: Space.sm) {
+                    OrderMyDayButton()
+                    CompactRowsToggle()
+                    SegmentedControl(selection: $app.calendarMode, options: [(.agenda, "List"), (.month, "Month")])
+                }
             }
         } else {
             let month = DateFormatter()
@@ -110,11 +118,11 @@ struct AgendaList: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     EnterUpWindow {
-                    LazyVStack(alignment: .leading, spacing: 2) {
+                    LazyVStack(alignment: .leading, spacing: app.compactRows ? 1 : 2) {
                         ForEach(Array(entries.enumerated()), id: \.element.id) { i, entry in
                             row(entry, index: i)
                                 // A little air where the date changes, instead of a heading.
-                                .padding(.top, i > 0 && entries[i - 1].day != entry.day ? Space.md : 0)
+                                .padding(.top, i > 0 && entries[i - 1].day != entry.day ? (app.compactRows ? 6 : Space.md) : 0)
                                 .id(entry.id)
                         }
                     }
@@ -145,7 +153,7 @@ struct AgendaList: View {
             TaskRow(task: t, context: .calendar, day: entry.day, index: index,
                     onDropBefore: { reorder($0, above: t) }, canDropBefore: { canReorder($0, above: t) })
         case .event(let e):
-            EventRow(event: e, day: entry.day ?? Calendar.current.startOfDay(for: app.clock), index: index)
+            EventRow(event: e, day: entry.day ?? Calendar.current.startOfDay(for: app.clock), index: index, compact: app.compactRows)
         }
     }
 

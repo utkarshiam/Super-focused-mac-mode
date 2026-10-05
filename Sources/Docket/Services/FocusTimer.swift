@@ -58,6 +58,7 @@ final class FocusTimer: ObservableObject {
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
+        Integrations.shared.focusStarted(until: target.map { Date().addingTimeInterval($0) }, taskTitle: title)
     }
 
     func pause() {
@@ -103,6 +104,7 @@ final class FocusTimer: ObservableObject {
         isPaused = false
         store?.logFocus(taskID: id, start: start, seconds: seconds)
         if markDone, let id { store?.setCompleted(id, true) }
+        Integrations.shared.focusEnded()
     }
 
     private func tick() {

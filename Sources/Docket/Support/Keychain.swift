@@ -16,11 +16,17 @@ enum Keychain {
         static let googleClientSecret = "google-client-secret"
     }
 
-    private static let lock = NSLock()
+    // Recursive: a keychain call can wait on an access prompt, and nothing on that thread may deadlock on it.
+    private static let lock = NSRecursiveLock()
 
     /// Non-nil when secrets live in memory instead of the login keychain. Unit tests and screenshot
     /// mode start that way, so they can never read, overwrite or prompt for the user's real keys.
     private static var memory: [String: String]? = startsInMemory ? [:] : nil
+
+    /// What this launch already read from or wrote to the login keychain (an inner nil = nothing stored).
+    /// Views look secrets up often: this keeps those lookups off the keychain, and macOS asks for access
+    /// (e.g. after an update of an ad-hoc signed build) at most once per launch instead of on every lookup.
+    private static var cache: [String: String?] = [:]
 
     private static var startsInMemory: Bool {
         let snapshotDir = ProcessInfo.processInfo.environment["DOCKET_SNAPSHOT_DIR"] ?? ""
@@ -28,14 +34,12 @@ enum Keychain {
     }
 
     static func string(_ account: String) -> String? {
-        if let memory = memoryStore() { return memory[account] }
-        var query = baseQuery(account)
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        var result: AnyObject?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data,
-              let value = String(data: data, encoding: .utf8), !value.isEmpty else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        if let memory { return memory[account] }
+        if let cached = cache[account] { return cached }
+        let (value, settled) = read(account)
+        if settled { cache.updateValue(value, forKey: account) }
         return value
     }
 
@@ -43,17 +47,56 @@ enum Keychain {
     static func set(_ value: String?, for account: String) {
         let value = value?.isEmpty == false ? value : nil
         lock.lock()
+        defer { lock.unlock() }
         if memory != nil {
             memory?[account] = value
-            lock.unlock()
             return
         }
-        lock.unlock()
+        if write(value, for: account) {
+            cache.updateValue(value, forKey: account)
+        } else {
+            cache.removeValue(forKey: account) // not sure what's stored now: look again next time
+        }
+    }
 
+    /// Tests and screenshot mode keep secrets in memory instead of the login keychain.
+    /// Each call starts from an empty store.
+    static func useInMemoryStore() {
+        lock.lock()
+        defer { lock.unlock() }
+        memory = [:]
+        cache = [:]
+    }
+
+    // MARK: Login keychain
+
+    /// The stored value. `settled` is false when the keychain couldn't answer right now (say it's
+    /// locked), so the next lookup asks again rather than remembering "nothing stored".
+    private static func read(_ account: String) -> (value: String?, settled: Bool) {
+        var query = baseQuery(account)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: AnyObject?
+        switch SecItemCopyMatching(query as CFDictionary, &result) {
+        case errSecSuccess:
+            guard let data = result as? Data, let value = String(data: data, encoding: .utf8), !value.isEmpty else { return (nil, true) }
+            return (value, true)
+        case errSecItemNotFound:
+            return (nil, true)
+        case errSecUserCanceled, errSecAuthFailed:
+            // Access was refused at the keychain prompt: don't ask again until the next launch.
+            return (nil, true)
+        default:
+            return (nil, false)
+        }
+    }
+
+    /// Saves or deletes the item. True when the keychain now holds exactly `value`.
+    private static func write(_ value: String?, for account: String) -> Bool {
         let query = baseQuery(account)
         guard let value else {
-            SecItemDelete(query as CFDictionary)
-            return
+            let status = SecItemDelete(query as CFDictionary)
+            return status == errSecSuccess || status == errSecItemNotFound
         }
         let data = Data(value.utf8)
         var status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
@@ -64,20 +107,7 @@ enum Keychain {
             status = SecItemAdd(item as CFDictionary, nil)
         }
         if status != errSecSuccess { NSLog("Docket: couldn't save %@ to the keychain (OSStatus %d)", account, status) }
-    }
-
-    /// Tests and screenshot mode keep secrets in memory instead of the login keychain.
-    /// Each call starts from an empty store.
-    static func useInMemoryStore() {
-        lock.lock()
-        defer { lock.unlock() }
-        memory = [:]
-    }
-
-    private static func memoryStore() -> [String: String]? {
-        lock.lock()
-        defer { lock.unlock() }
-        return memory
+        return status == errSecSuccess
     }
 
     private static func baseQuery(_ account: String) -> [String: Any] {

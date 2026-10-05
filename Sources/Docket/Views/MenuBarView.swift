@@ -8,12 +8,19 @@ struct MenuBarView: View {
     @EnvironmentObject var focus: FocusTimer
     var close: () -> Void
     @State private var text = ""
+    /// The Date, Time, List and More dropdowns (menus only here: a popover would close the panel).
+    @State private var options = AddOptions()
+    @State private var chipFocused = false
+    @State private var hoveringOptions = false
+    /// "Added for Mon 5 Oct" for a moment, when the new task isn't one of today's below.
+    @State private var confirmation: String?
     @FocusState private var focused: Bool
 
     var body: some View {
         let now = app.clock
         let tasks = store.todayTasks(now: now)
         let minutes = tasks.reduce(0) { $0 + $1.remainingMinutes }
+        let showsOptions = focused || !text.trimmingCharacters(in: .whitespaces).isEmpty || options.hasPicks || chipFocused || hoveringOptions
 
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .center) {
@@ -21,9 +28,20 @@ struct MenuBarView: View {
                     Text(Fmt.absoluteDay(now, now: now))
                         .textStyle(.title1)
                         .foregroundStyle(Color.ink)
-                    Text(Fmt.plural(tasks.count, "task") + (minutes > 0 ? " · \(Fmt.duration(minutes: minutes))" : ""))
-                        .textStyle(.footnote)
-                        .foregroundStyle(Color.ink2)
+                    Group {
+                        if let confirmation {
+                            Label(confirmation, systemImage: "checkmark")
+                                .foregroundStyle(Color.ink)
+                                .transition(.opacity)
+                        } else {
+                            Text(Fmt.plural(tasks.count, "task") + (minutes > 0 ? " · \(Fmt.duration(minutes: minutes))" : ""))
+                                .foregroundStyle(Color.ink2)
+                                .transition(.opacity)
+                        }
+                    }
+                    .textStyle(.footnote)
+                    .lineLimit(1)
+                    .animation(Motion.base, value: confirmation)
                 }
                 Spacer()
                 Button { close(); app.showMainWindow() } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
@@ -33,21 +51,32 @@ struct MenuBarView: View {
             .padding(.horizontal, Space.xl)
             .padding(.top, Space.xl)
 
-            HStack(spacing: 10) {
-                Image(systemName: "plus")
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundStyle(focused ? Color.onPrimary : Color.ink2)
-                    .frame(width: 22, height: 22)
-                    .background(Circle().fill(focused ? Color.primaryFill : Color.fillStrong))
-                TextField("Add to today. “Call Sam 3pm 15m”", text: $text)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 14, weight: .medium))
-                    .focused($focused)
-                    .onSubmit(add)
+            VStack(alignment: .leading, spacing: Space.sm) {
+                HStack(spacing: 10) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(focused ? Color.onPrimary : Color.ink2)
+                        .frame(width: 22, height: 22)
+                        .background(Circle().fill(focused ? Color.primaryFill : Color.fillStrong))
+                    TextField("Add to today. “Call Sam 3pm 15m”", text: $text)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 14, weight: .medium))
+                        .focused($focused)
+                        .onSubmit(add)
+                }
+                .padding(.horizontal, 10)
+                .frame(height: 42)
+                .background(RoundedRectangle(cornerRadius: Radius.md, style: .continuous).fill(Color.fill))
+
+                if showsOptions {
+                    let moment = Date()
+                    AddOptionsBar(options: $options, parsed: parser(moment).parse(text), context: AddContext(day: moment), lists: store.lists,
+                                  now: moment, usesPopovers: false, onPick: { focused = true }, onFocusChange: { chipFocused = $0 })
+                        .onHover { hoveringOptions = $0 }
+                        .transition(.opacity.combined(with: .offset(y: -4)))
+                }
             }
-            .padding(.horizontal, 10)
-            .frame(height: 42)
-            .background(RoundedRectangle(cornerRadius: Radius.md, style: .continuous).fill(Color.fill))
+            .animation(Motion.base, value: showsOptions)
             .padding(.horizontal, Space.lg)
             .padding(.top, Space.lg)
             .padding(.bottom, Space.sm)
@@ -146,14 +175,29 @@ struct MenuBarView: View {
         }
     }
 
+    private func parser(_ now: Date) -> QuickParser {
+        QuickParser(now: now, lists: store.lists, workdayEndMinutes: Prefs.workdayEnd)
+    }
+
     private func add() {
         let raw = text.trimmingCharacters(in: .whitespaces)
         guard !raw.isEmpty else { return }
-        let parser = QuickParser(lists: store.lists, workdayEndMinutes: Prefs.workdayEnd)
-        var t = TaskItem(parsed: parser.parse(raw), defaultReminder: Prefs.defaultReminder, defaultIsAlarm: Prefs.defaultReminderIsAlarm)
-        if t.dueDate == nil { t.scheduledDate = Calendar.current.startOfDay(for: Date()) }
-        withAnimation(Motion.gentle) { _ = store.addTask(t) }
+        let now = Date()
+        // Undated tasks are for today here, as the field says.
+        let task = options.makeTask(parsed: parser(now).parse(raw), context: AddContext(day: now), lists: store.lists, now: now)
+        let added = withAnimation(Motion.gentle) { store.addTask(task) }
         text = ""
+        options.reset()
+        focused = true
+
+        // Today's tasks show up in the list below; say where anything else went.
+        guard !store.todayTasks(now: now).contains(where: { $0.id == added.id }) else { return }
+        let day = store.calendarDay(of: added, today: Calendar.current.startOfDay(for: now))
+        let message = day.map { "Added for \(Fmt.absoluteDay($0))" } ?? "Added to \(store.list(added.listID)?.name ?? "Inbox")"
+        confirmation = message
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) {
+            if confirmation == message { confirmation = nil }
+        }
     }
 }
 
@@ -166,13 +210,15 @@ struct QuickCaptureView: View {
     enum Mode: String, CaseIterable { case task = "Task", note = "Note" }
     @State private var mode: Mode = .task
     @State private var text = ""
+    /// The Date, Time, List and More dropdowns (menus only: a popover would close the panel).
+    @State private var options = AddOptions()
     @State private var confirmation: String?
     @State private var confirmationDetail = ""
     @State private var monitor: Any?
     @FocusState private var focused: Bool
 
     var body: some View {
-        let parser = QuickParser(lists: store.lists, workdayEndMinutes: Prefs.workdayEnd)
+        let now = Date()
         VStack(alignment: .leading, spacing: Space.md) {
             HStack {
                 SegmentedControl(selection: $mode, options: Mode.allCases.map { ($0, $0.rawValue) })
@@ -208,15 +254,21 @@ struct QuickCaptureView: View {
                         .foregroundStyle(Color.ink)
                     }
                     .transition(.opacity.combined(with: .scale(scale: 0.95)))
-                } else if mode == .task, !text.trimmingCharacters(in: .whitespaces).isEmpty {
-                    ParsedPreview(parsed: parser.parse(text), lists: store.lists)
+                } else if mode == .task {
+                    // One line: the panel has a fixed size, so tags and the hint drop out before anything wraps.
+                    AddOptionsBar(options: $options, parsed: parser(now).parse(text), context: AddContext(), lists: store.lists, now: now,
+                                  usesPopovers: false, arrangement: .oneLine,
+                                  hint: text.trimmingCharacters(in: .whitespaces).isEmpty ? "Or just type “fri 10am 30m”" : nil,
+                                  onPick: { focused = true })
+                        .transition(.opacity)
                 } else {
-                    Text(mode == .task ? "Try “Send deck to Sequoia fri 10am 30m !!! @alarm15”" : "Saved to Notes.")
+                    Text("Saved to Notes.")
                         .textStyle(.subhead)
                         .foregroundStyle(Color.ink3)
+                        .transition(.opacity)
                 }
             }
-            .frame(height: 22, alignment: .leading)
+            .frame(height: 26, alignment: .leading)
             .animation(Motion.base, value: confirmation)
         }
         .padding(.horizontal, Space.xxl)
@@ -237,6 +289,10 @@ struct QuickCaptureView: View {
         }
     }
 
+    private func parser(_ now: Date) -> QuickParser {
+        QuickParser(now: now, lists: store.lists, workdayEndMinutes: Prefs.workdayEnd)
+    }
+
     private func save() {
         let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty else {
@@ -245,8 +301,9 @@ struct QuickCaptureView: View {
         }
         switch mode {
         case .task:
-            let parser = QuickParser(lists: store.lists, workdayEndMinutes: Prefs.workdayEnd)
-            let t = store.addTask(TaskItem(parsed: parser.parse(raw), defaultReminder: Prefs.defaultReminder, defaultIsAlarm: Prefs.defaultReminderIsAlarm))
+            let now = Date()
+            let t = store.addTask(options.makeTask(parsed: parser(now).parse(raw), context: AddContext(), lists: store.lists, now: now))
+            options.reset()
             let where_ = t.dueDate.map { "due \(Fmt.due($0, hasTime: t.dueHasTime))" } ?? "in \(store.list(t.listID)?.name ?? "Inbox")"
             confirmationDetail = ", \(where_)"
             confirmation = "Added “\(t.title)”"

@@ -1,0 +1,201 @@
+import CryptoKit
+import Foundation
+
+/// Google sign-in for a desktop app (RFC 8252): the system browser, a loopback redirect to
+/// 127.0.0.1 on a random port, PKCE (S256) and a `state` check. Docket asks for read-only Gmail.
+enum GoogleOAuth {
+    static let authEndpoint = URL(string: "https://accounts.google.com/o/oauth2/v2/auth")!
+    static let tokenEndpoint = URL(string: "https://oauth2.googleapis.com/token")!
+    static let revokeEndpoint = URL(string: "https://oauth2.googleapis.com/revoke")!
+    static let gmailScope = "https://www.googleapis.com/auth/gmail.readonly"
+    static let scopes = ["openid", "email", gmailScope]
+
+    /// The OAuth client ("Desktop app") the user created in Google Cloud.
+    struct Client: Hashable, Sendable {
+        var id: String
+        var secret: String
+    }
+
+    struct Tokens: Sendable {
+        var accessToken: String
+        /// A minute early, so a token is never used right as it runs out.
+        var expiresAt: Date
+        var refreshToken: String?
+        var scopes: Set<String>
+    }
+
+    // MARK: PKCE
+
+    enum PKCE {
+        /// 32 random bytes as base64url: 43 characters, as RFC 7636 recommends.
+        static func makeVerifier() -> String { randomString(bytes: 32) }
+
+        /// BASE64URL(SHA256(verifier)), the S256 method.
+        static func challenge(for verifier: String) -> String {
+            base64URL(Data(SHA256.hash(data: Data(verifier.utf8))))
+        }
+
+        /// Random, URL-safe text (for `state` and the verifier).
+        static func randomString(bytes count: Int) -> String {
+            var generator = SystemRandomNumberGenerator()
+            return base64URL(Data((0..<count).map { _ in UInt8.random(in: .min ... .max, using: &generator) }))
+        }
+
+        static func base64URL(_ data: Data) -> String {
+            data.base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "=", with: "")
+        }
+    }
+
+    // MARK: Steps
+
+    static func authorizationURL(client: Client, redirectURI: String, state: String, challenge: String) -> URL? {
+        var components = URLComponents(url: authEndpoint, resolvingAgainstBaseURL: false)
+        components?.percentEncodedQuery = IntegrationHTTP.encode([
+            ("client_id", client.id),
+            ("redirect_uri", redirectURI),
+            ("response_type", "code"),
+            ("scope", scopes.joined(separator: " ")),
+            ("state", state),
+            ("code_challenge", challenge),
+            ("code_challenge_method", "S256"),
+            ("access_type", "offline"),
+            ("prompt", "consent"),
+        ])
+        return components?.url
+    }
+
+    /// Trades the code from the redirect for tokens.
+    static func exchange(code: String, verifier: String, redirectURI: String, client: Client,
+                         transport: @escaping IntegrationHTTP.Transport, now: Date = Date()) async throws -> Tokens {
+        try await tokenRequest([
+            ("code", code),
+            ("client_id", client.id),
+            ("client_secret", client.secret),
+            ("redirect_uri", redirectURI),
+            ("grant_type", "authorization_code"),
+            ("code_verifier", verifier),
+        ], refreshing: false, transport: transport, now: now)
+    }
+
+    /// A new access token from the refresh token (kept in the keychain).
+    static func refresh(_ refreshToken: String, client: Client, transport: @escaping IntegrationHTTP.Transport, now: Date = Date()) async throws -> Tokens {
+        var tokens = try await tokenRequest([
+            ("client_id", client.id),
+            ("client_secret", client.secret),
+            ("refresh_token", refreshToken),
+            ("grant_type", "refresh_token"),
+        ], refreshing: true, transport: transport, now: now)
+        if tokens.refreshToken == nil { tokens.refreshToken = refreshToken }
+        return tokens
+    }
+
+    /// Tells Google to forget the sign-in. Best effort: Docket forgets it either way.
+    static func revoke(_ token: String, transport: @escaping IntegrationHTTP.Transport) async {
+        _ = try? await transport(IntegrationHTTP.formPost(revokeEndpoint, [("token", token)]))
+    }
+
+    private static func tokenRequest(_ form: [(String, String)], refreshing: Bool, transport: @escaping IntegrationHTTP.Transport,
+                                     now: Date) async throws -> Tokens {
+        let (data, response) = try await IntegrationHTTP.send(IntegrationHTTP.formPost(tokenEndpoint, form), via: transport, service: .google)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        if (200..<300).contains(response.statusCode), let reply = try? decoder.decode(TokenReply.self, from: data),
+           let access = reply.accessToken, !access.isEmpty {
+            let lifetime = TimeInterval(max(120, reply.expiresIn ?? 3600))
+            return Tokens(accessToken: access, expiresAt: now.addingTimeInterval(lifetime - 60),
+                          refreshToken: reply.refreshToken.flatMap { $0.isEmpty ? nil : $0 },
+                          scopes: Set((reply.scope ?? "").split(separator: " ").map(String.init)))
+        }
+        let failure = try? decoder.decode(TokenFailure.self, from: data)
+        switch failure?.error {
+        case "invalid_grant":
+            throw refreshing ? IntegrationError.signedOut(.gmail) : IntegrationError.api(.google, "Google didn't accept the sign-in. Try connecting again.")
+        case "invalid_client", "unauthorized_client":
+            throw IntegrationError.api(.google, "Google didn't accept the OAuth client ID or secret. Check them in Settings → Connections.")
+        case "access_denied":
+            throw IntegrationError.signInDenied
+        default:
+            if response.statusCode == 429 { throw IntegrationError.rateLimited(.google, retryAfter: 60) }
+            throw IntegrationError.unexpected(.google, failure?.error ?? "HTTP \(response.statusCode)")
+        }
+    }
+
+    private struct TokenReply: Decodable {
+        let accessToken: String?
+        let expiresIn: Int?
+        let refreshToken: String?
+        let scope: String?
+    }
+
+    private struct TokenFailure: Decodable {
+        let error: String?
+    }
+
+    // MARK: The whole sign-in
+
+    /// Starts the loopback server, opens Google's consent page in the default browser, waits (up to
+    /// 5 minutes) for the redirect, and trades its code for tokens. Cancelling the task stops it.
+    @MainActor
+    static func signIn(client: Client, transport: @escaping IntegrationHTTP.Transport, open: (URL) -> Void,
+                       timeout: TimeInterval = 300) async throws -> Tokens {
+        let state = PKCE.randomString(bytes: 24)
+        let verifier = PKCE.makeVerifier()
+        let server = LoopbackServer(expectedState: state, timeout: timeout)
+        defer { server.stop() }
+        let port = try await server.start()
+        let redirectURI = "http://127.0.0.1:\(port)"
+        guard let url = authorizationURL(client: client, redirectURI: redirectURI, state: state, challenge: PKCE.challenge(for: verifier)) else {
+            throw IntegrationError.unexpected(.google, "a bad sign-in address")
+        }
+        open(url)
+        let redirect = try await withTaskCancellationHandler {
+            try await server.waitForRedirect()
+        } onCancel: {
+            server.stop()
+        }
+        switch redirect {
+        case .code(let code):
+            return try await exchange(code: code, verifier: verifier, redirectURI: redirectURI, client: client, transport: transport)
+        case .denied:
+            throw IntegrationError.signInDenied
+        }
+    }
+}
+
+/// Hands out a valid Gmail access token, refreshing it from the refresh token when it runs out.
+/// The access token lives only in memory.
+actor GoogleSession {
+    let client: GoogleOAuth.Client
+    private let refreshToken: String
+    private let transport: IntegrationHTTP.Transport
+    private var current: (token: String, expires: Date)?
+    private var pending: Task<GoogleOAuth.Tokens, Error>?
+
+    init(client: GoogleOAuth.Client, refreshToken: String, transport: @escaping IntegrationHTTP.Transport, tokens: GoogleOAuth.Tokens? = nil) {
+        self.client = client
+        self.refreshToken = refreshToken
+        self.transport = transport
+        current = tokens.map { ($0.accessToken, $0.expiresAt) }
+    }
+
+    func accessToken(now: Date = Date()) async throws -> String {
+        if let current, current.expires > now { return current.token }
+        return try await refreshAccessToken()
+    }
+
+    /// A fresh token now (after a 401). Concurrent callers share one refresh.
+    func refreshAccessToken() async throws -> String {
+        if let pending { return try await pending.value.accessToken }
+        let task = Task { [client, refreshToken, transport] in
+            try await GoogleOAuth.refresh(refreshToken, client: client, transport: transport)
+        }
+        pending = task
+        defer { pending = nil }
+        let tokens = try await task.value
+        current = (tokens.accessToken, tokens.expiresAt)
+        return tokens.accessToken
+    }
+}
