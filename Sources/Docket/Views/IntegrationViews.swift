@@ -822,11 +822,11 @@ struct ShareToSlackButton: View {
     @EnvironmentObject var app: AppState
     @ObservedObject private var integrations = Integrations.shared
     let taskIDs: [UUID]
-    /// Matches the pills next to it (the bulk edit panel's are 32 pt).
-    var height: CGFloat = 32
+    /// Matches the pill next to it: the bulk edit panel's "Copy as checklist" is a standard 36 pt SecondaryPill.
+    var height: CGFloat = 36
     @State private var showing = false
 
-    init(taskIDs: [UUID], height: CGFloat = 32) {
+    init(taskIDs: [UUID], height: CGFloat = 36) {
         self.taskIDs = taskIDs
         self.height = height
     }
@@ -944,6 +944,11 @@ private struct ShareToSlackPopover: View {
         .background(Color.raised)
         .tint(Color.ink)
         .task { await load(reload: false) }
+        // Return in the filter field presses Post: a channel filtered out of sight (say the one used last
+        // time) mustn't be where it posts. With nothing selected, Return picks the single match instead.
+        .onChange(of: filter) { _ in
+            if let current = selected, !visible.contains(where: { $0.id == current }) { selected = nil }
+        }
     }
 
     private var visible: [SlackChannel] {

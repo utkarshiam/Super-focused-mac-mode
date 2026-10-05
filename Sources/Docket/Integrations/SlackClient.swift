@@ -150,7 +150,8 @@ struct SlackClient: Sendable {
         case "invalid_auth", "not_authed", "token_revoked", "token_expired", "account_inactive", "user_removed_from_team":
             return .signedOut(.slack)
         case "missing_scope":
-            return .missingPermission(.slack, needed ?? "a")
+            // "…is missing the needed permission" when Slack doesn't say which.
+            return .missingPermission(.slack, needed ?? "needed")
         case "ratelimited":
             return .rateLimited(.slack, retryAfter: 60)
         case "not_in_channel":

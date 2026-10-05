@@ -105,7 +105,8 @@ struct TaskRow: View {
             CheckCircle(done: task.isCompleted, priority: task.priority, size: 16) {
                 app.toggle(task.id, in: store)
             }
-            HStack(spacing: 6) {
+            // The title always keeps room to be read; the glyphs, then source, delegation and tags, get what's left.
+            CompactLineLayout {
                 Text(task.title)
                     .font(.system(size: 13.5, weight: .semibold))
                     .tracking(-0.1)
@@ -113,9 +114,7 @@ struct TaskRow: View {
                     .strikethrough(dimmed, color: .ink3)
                     .lineLimit(1)
                     .truncationMode(.tail)
-                    .layoutPriority(1)
                 compactGlyphs
-                    .fixedSize()
                 // Source, delegation and tags only when the whole title fits beside them.
                 ViewThatFits(in: .horizontal) {
                     compactExtras(tagCount: 2)
@@ -138,42 +137,52 @@ struct TaskRow: View {
         .frame(minHeight: 18)
     }
 
-    /// The compact row's details as tiny icons; each one says what it means on hover.
+    /// The compact row's details as tiny icons; each one says what it means on hover. A narrow row keeps
+    /// as many as fit beside the title, dropping them from the end.
     private var compactGlyphs: some View {
-        let list = store.list(task.listID)
-        let progress = task.subtaskProgress
-        return HStack(spacing: 5) {
-            if let tone = task.priority.tone, !task.isCompleted {
-                Image(systemName: "flag.fill")
-                    .foregroundStyle(tone.fg)
-                    .help("\(task.priority.label) priority")
-            }
-            if let list, !isListContext {
-                Image(systemName: list.icon).help(list.name)
-            }
-            if context == .calendar, let day, let due = task.dueDate, !task.isCompleted,
-               !Calendar.current.isDate(due, inSameDayAs: day) {
-                Image(systemName: "flag").help("Due \(Fmt.absoluteDay(due, now: app.clock))")
-            }
-            if progress.total > 0 {
-                Text("\(progress.done)/\(progress.total)")
-                    .monospacedDigit()
-                    .help("\(progress.done) of \(progress.total) steps done")
-            }
-            if let rule = task.recurrence {
-                Image(systemName: "repeat").help(rule.summary)
-            }
-            if !task.reminders.isEmpty, !task.isCompleted {
-                Image(systemName: task.hasAlarm ? "alarm" : "bell").help(task.hasAlarm ? "Has an alarm" : "Has a reminder")
-            }
-            if task.linkedNoteID != nil {
-                Image(systemName: "doc.text").help("From a note")
-            } else if !task.notes.isEmpty {
-                Image(systemName: "text.alignleft").help("Has notes")
+        let glyphs = compactGlyphItems
+        return ViewThatFits(in: .horizontal) {
+            ForEach(Array((0...glyphs.count).reversed()), id: \.self) { count in
+                HStack(spacing: 5) {
+                    ForEach(glyphs.prefix(count)) { RowGlyphView(glyph: $0) }
+                }
+                .fixedSize()
             }
         }
         .font(.system(size: 10.5, weight: .semibold))
         .foregroundStyle(Color.ink3)
+    }
+
+    private var compactGlyphItems: [RowGlyph] {
+        var glyphs: [RowGlyph] = []
+        if let tone = task.priority.tone, !task.isCompleted {
+            glyphs.append(RowGlyph(id: "priority", symbol: "flag.fill", help: "\(task.priority.label) priority", tint: tone.fg))
+        }
+        if let list = store.list(task.listID), !isListContext {
+            glyphs.append(RowGlyph(id: "list", symbol: list.icon, help: list.name))
+        }
+        if context == .calendar, let day, let due = task.dueDate, !task.isCompleted,
+           !Calendar.current.isDate(due, inSameDayAs: day) {
+            glyphs.append(RowGlyph(id: "due", symbol: "flag", help: "Due \(Fmt.absoluteDay(due, now: app.clock))"))
+        }
+        let progress = task.subtaskProgress
+        if progress.total > 0 {
+            glyphs.append(RowGlyph(id: "steps", text: "\(progress.done)/\(progress.total)",
+                                   help: "\(progress.done) of \(progress.total) steps done"))
+        }
+        if let rule = task.recurrence {
+            glyphs.append(RowGlyph(id: "repeat", symbol: "repeat", help: rule.summary))
+        }
+        if !task.reminders.isEmpty, !task.isCompleted {
+            glyphs.append(RowGlyph(id: "reminder", symbol: task.hasAlarm ? "alarm" : "bell",
+                                   help: task.hasAlarm ? "Has an alarm" : "Has a reminder"))
+        }
+        if task.linkedNoteID != nil {
+            glyphs.append(RowGlyph(id: "note", symbol: "doc.text", help: "From a note"))
+        } else if !task.notes.isEmpty {
+            glyphs.append(RowGlyph(id: "note", symbol: "text.alignleft", help: "Has notes"))
+        }
+        return glyphs
     }
 
     /// Where it came from, who it's waiting on, and the first tags: shown in compact rows only when they fit.
@@ -295,6 +304,80 @@ struct TaskRow: View {
             Image(systemName: icon).font(.system(size: 10, weight: .semibold))
             Text(text)
         }
+    }
+}
+
+/// One of a compact row's detail glyphs: a symbol (or a short count like "1/2") and what it means.
+private struct RowGlyph: Identifiable {
+    let id: String
+    var symbol: String?
+    var text: String?
+    var help: String
+    var tint: Color?
+}
+
+private struct RowGlyphView: View {
+    let glyph: RowGlyph
+
+    var body: some View {
+        Group {
+            if let symbol = glyph.symbol {
+                Image(systemName: symbol)
+            } else {
+                Text(glyph.text ?? "").monospacedDigit()
+            }
+        }
+        .foregroundStyle(glyph.tint ?? Color.ink3)
+        .help(glyph.help)
+    }
+}
+
+/// The middle of a compact row, on one line: the title, its detail glyphs, then the extras (source, waiting
+/// on, tags). The title always keeps `minTitleWidth` (all of it, when shorter); the glyphs get what's left
+/// after that, and the extras whatever remains. Both are ViewThatFits, so each shows the fullest version
+/// that fits its room, and nothing ever pushes the date on the right out of the row.
+private struct CompactLineLayout: Layout {
+    var spacing: CGFloat = 6
+    var minTitleWidth: CGFloat = 100
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let line = arrange(proposal.width, subviews)
+        return CGSize(width: line.width, height: line.height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let line = arrange(bounds.width, subviews)
+        var x = bounds.minX
+        for (view, size) in zip(subviews, line.sizes) {
+            view.place(at: CGPoint(x: x, y: bounds.midY), anchor: .leading, proposal: ProposedViewSize(size))
+            if size.width > 0 { x += size.width + spacing }
+        }
+    }
+
+    /// Each part's size, and the line's. Without a width (or an infinite one) every part is at its fullest.
+    private func arrange(_ proposed: CGFloat?, _ subviews: Subviews) -> (sizes: [CGSize], width: CGFloat, height: CGFloat) {
+        guard subviews.count == 3 else { return (subviews.map { _ in .zero }, 0, 0) }
+        let title = subviews[0], glyphs = subviews[1], extras = subviews[2]
+        let idealTitle = title.sizeThatFits(.unspecified)
+        guard let available = proposed, available.isFinite else {
+            let sizes = [idealTitle, glyphs.sizeThatFits(.unspecified), extras.sizeThatFits(.unspecified)]
+            let shown = sizes.filter { $0.width > 0 }
+            let width = shown.reduce(0) { $0 + $1.width } + spacing * CGFloat(max(0, shown.count - 1))
+            return (sizes, width, sizes.map(\.height).max() ?? 0)
+        }
+        let room = max(0, available)
+        // The glyphs may use whatever the title's minimum leaves.
+        let glyphRoom = max(0, room - min(idealTitle.width, minTitleWidth) - spacing)
+        var glyphSize = glyphs.sizeThatFits(ProposedViewSize(width: glyphRoom, height: nil))
+        if glyphSize.width > glyphRoom { glyphSize.width = 0 }
+        let afterGlyphs = glyphSize.width > 0 ? glyphSize.width + spacing : 0
+        let titleWidth = min(idealTitle.width, max(0, room - afterGlyphs))
+        let titleSize = CGSize(width: titleWidth, height: title.sizeThatFits(ProposedViewSize(width: titleWidth, height: nil)).height)
+        let extrasRoom = max(0, room - titleWidth - afterGlyphs - spacing)
+        var extrasSize = extras.sizeThatFits(ProposedViewSize(width: extrasRoom, height: nil))
+        if extrasSize.width > extrasRoom { extrasSize.width = 0 }
+        let sizes = [titleSize, glyphSize, extrasSize]
+        return (sizes, room, sizes.map(\.height).max() ?? 0)
     }
 }
 

@@ -847,7 +847,9 @@ struct AIBreakdownRow: View {
             .animation(Motion.base, value: phase)
             // A proposal belongs to one task: never offer it on another one shown in the same place.
             .onChange(of: taskID) { _ in stop() }
-            .onDisappear { work?.cancel() }
+            // Hidden mid-request (the task was ticked off, AI switched off): stop, so the row can't
+            // come back stuck on "Thinking" with nothing running.
+            .onDisappear { if phase == .thinking { stop() } else { work?.cancel() } }
         }
     }
 
@@ -1362,6 +1364,8 @@ struct AISettingsPage: View {
             modelSave?.cancel()
             saveModel()
             testWork?.cancel()
+            // The Settings window is reused: a test cut short isn't left "Asking Gemini…" (Test disabled) for next time.
+            if test == .running { test = .idle }
         }
     }
 

@@ -141,7 +141,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             withAnimation(Motion.sheet) { app.selectedTaskID = nil }
             return true
         case 51, 117: // delete, forward delete
-            return inTasks && app.deleteSelection(in: store)
+            // Deleting moves on to the next task, so a held key would run down the list deleting each one.
+            return inTasks && (event.isARepeat || app.deleteSelection(in: store))
         case 36, 76: // return, enter
             guard inTasks else { return false }
             // Holding Return doesn't flap the details open and shut.

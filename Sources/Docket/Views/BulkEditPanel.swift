@@ -103,11 +103,12 @@ struct BulkEditPanel: View {
                         }
                         .foregroundStyle(Color.white)
                         .lineLimit(1)
-                        .minimumScaleFactor(0.6)
+                        .minimumScaleFactor(0.5)
                         Text(statusLine(tasks, open: open.count, undated: days.isEmpty ? 0 : open.count - days.count))
                             .font(.system(size: 13, weight: .medium))
                             .foregroundStyle(Color.onDark58)
                             .lineLimit(1)
+                            .minimumScaleFactor(0.85)
                     }
                     .layoutPriority(1)
                     Spacer(minLength: Space.sm)
@@ -119,7 +120,10 @@ struct BulkEditPanel: View {
                                 .tracking(-0.4)
                                 .monospacedDigit()
                                 .foregroundStyle(Color.white)
+                                .lineLimit(1)
                         }
+                        // Whole, never "14h" over "45m": the dates beside it shrink to make room instead.
+                        .fixedSize()
                     }
                 }
             }
@@ -386,8 +390,11 @@ struct BulkEditPanel: View {
         var firstSeen: [String: Int] = [:]
         var counts: [String: (tag: String, count: Int)] = [:]
         for t in tasks {
-            for key in Set(t.tags.map { $0.lowercased() }) {
-                let tag = t.tags.first { $0.lowercased() == key } ?? key
+            // In the task's own order (a Set's order changes from one draw to the next, and the chips would jump).
+            var counted = Set<String>()
+            for tag in t.tags {
+                let key = tag.lowercased()
+                guard counted.insert(key).inserted else { continue }
                 if firstSeen[key] == nil { firstSeen[key] = firstSeen.count }
                 counts[key, default: (tag: tag, count: 0)].count += 1
             }
