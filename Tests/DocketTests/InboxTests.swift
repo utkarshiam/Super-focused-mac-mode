@@ -23,16 +23,37 @@ private final class FakeSlackInbox: SlackInbox, @unchecked Sendable {
         var myUserID: String
     }
 
+    struct FullThreadCall: Equatable {
+        var channel: String
+        var threadTS: String
+        var myUserID: String
+    }
+
+    struct StarCall: Equatable {
+        var starred: Bool
+        var channel: String
+        var ts: String
+    }
+
     struct State {
         var replies: [Reply] = []
         var threadCalls: [ThreadCall] = []
         /// The names each thread call was handed as already known.
         var threadNames: [[String: String]] = []
+        var fullThreadCalls: [FullThreadCall] = []
+        /// The inbox message and the names each whole-thread call was handed.
+        var fullThreadAround: [String?] = []
+        var fullThreadNames: [[String: String]] = []
+        var starCalls: [StarCall] = []
         var downloads: [URL] = []
         var lookups: [String] = []
         var replyError: Error?
         var threadAnswer: [ThreadMessage] = []
         var threadError: Error?
+        /// The whole thread, in turn for each call (the last one repeats).
+        var fullThreadAnswers: [[ThreadSlackMessage]] = []
+        var fullThreadError: Error?
+        var starError: Error?
         var file = Data()
         var people: [String: String] = [:]
         /// How long each call takes, so a second one can arrive while the first is out.
@@ -52,6 +73,10 @@ private final class FakeSlackInbox: SlackInbox, @unchecked Sendable {
     var replies: [Reply] { with { $0.replies } }
     var threadCalls: [ThreadCall] { with { $0.threadCalls } }
     var threadNames: [[String: String]] { with { $0.threadNames } }
+    var fullThreadCalls: [FullThreadCall] { with { $0.fullThreadCalls } }
+    var fullThreadAround: [String?] { with { $0.fullThreadAround } }
+    var fullThreadNames: [[String: String]] { with { $0.fullThreadNames } }
+    var starCalls: [StarCall] { with { $0.starCalls } }
     var downloads: [URL] { with { $0.downloads } }
     var lookups: [String] { with { $0.lookups } }
 
@@ -76,6 +101,31 @@ private final class FakeSlackInbox: SlackInbox, @unchecked Sendable {
             s.threadNames.append(names)
             if let error = s.threadError { throw error }
             return s.threadAnswer
+        }
+    }
+
+    func fullThread(channel: String, threadTS: String, myUserID: String) async throws -> [ThreadSlackMessage] {
+        try await fullThread(channel: channel, threadTS: threadTS, myUserID: myUserID, names: [:], around: nil)
+    }
+
+    func fullThread(channel: String, threadTS: String, myUserID: String, names: [String: String],
+                    around: String?) async throws -> [ThreadSlackMessage] {
+        try await pause()
+        return try with { s in
+            s.fullThreadCalls.append(FullThreadCall(channel: channel, threadTS: threadTS, myUserID: myUserID))
+            s.fullThreadAround.append(around)
+            s.fullThreadNames.append(names)
+            if let error = s.fullThreadError { throw error }
+            guard !s.fullThreadAnswers.isEmpty else { return [] }
+            return s.fullThreadAnswers.count > 1 ? s.fullThreadAnswers.removeFirst() : s.fullThreadAnswers[0]
+        }
+    }
+
+    func setStarred(_ starred: Bool, channel: String, ts: String) async throws {
+        try await pause()
+        try with { s in
+            s.starCalls.append(StarCall(starred: starred, channel: channel, ts: ts))
+            if let error = s.starError { throw error }
         }
     }
 
@@ -105,11 +155,23 @@ private final class FakeMailInbox: MailInbox, @unchecked Sendable {
         var myAddress: String
     }
 
+    struct StarCall: Equatable {
+        var starred: Bool
+        var messageID: String
+    }
+
     struct State {
         var full: GmailFullMessage
         var fetched: [String] = []
         var conversation: [ThreadMessage] = []
         var conversationCalls: [ConversationCall] = []
+        /// The whole conversation, in turn for each call (the last one repeats).
+        var emails: [[ThreadEmail]] = []
+        /// The conversations asked for in whole (thread ids).
+        var wholeCalls: [String] = []
+        var wholeError: Error?
+        var starCalls: [StarCall] = []
+        var starError: Error?
         var attachment = Data()
         var attachmentCalls: [[String]] = []
         var sent: [MailReply] = []
@@ -134,6 +196,8 @@ private final class FakeMailInbox: MailInbox, @unchecked Sendable {
 
     var fetched: [String] { with { $0.fetched } }
     var conversationCalls: [ConversationCall] { with { $0.conversationCalls } }
+    var wholeCalls: [String] { with { $0.wholeCalls } }
+    var starCalls: [StarCall] { with { $0.starCalls } }
     var attachmentCalls: [[String]] { with { $0.attachmentCalls } }
     var sent: [MailReply] { with { $0.sent } }
     var drafts: [MailReply] { with { $0.drafts } }
@@ -155,6 +219,24 @@ private final class FakeMailInbox: MailInbox, @unchecked Sendable {
         with { s in
             s.conversationCalls.append(ConversationCall(threadID: threadID, excluding: messageID, limit: limit, myAddress: myAddress))
             return s.conversation
+        }
+    }
+
+    func conversationMessages(threadID: String, myAddress: String) async throws -> [ThreadEmail] {
+        try await pause()
+        return try with { s in
+            s.wholeCalls.append(threadID)
+            if let error = s.wholeError { throw error }
+            guard !s.emails.isEmpty else { return [] }
+            return s.emails.count > 1 ? s.emails.removeFirst() : s.emails[0]
+        }
+    }
+
+    func setStarred(_ starred: Bool, messageID: String) async throws {
+        try await pause()
+        try with { s in
+            s.starCalls.append(StarCall(starred: starred, messageID: messageID))
+            if let error = s.starError { throw error }
         }
     }
 
@@ -241,6 +323,46 @@ private enum Sample {
     static let deckURL = URL(string: "https://files.slack.com/files-pri/T0ACME-F0DECK/download/q3-deck.pdf")!
     static let deck = MessageAttachment(id: "F0DECK", name: "Q3 deck.pdf", mimeType: "application/pdf", size: 19,
                                         remote: .slack(url: deckURL, thumbnail: nil))
+
+    // The whole thread and conversation around the samples above.
+
+    static let jordanTS = "1791200600.000300"
+
+    static func post(_ ts: String, _ user: String?, _ from: String, _ text: String, mine: Bool = false,
+                     files: [MessageAttachment] = []) -> ThreadSlackMessage {
+        ThreadSlackMessage(id: ts, from: from, userID: user, date: Date(timeIntervalSince1970: TimeInterval(ts) ?? 0),
+                           markup: text, text: text, files: files, isMine: mine)
+    }
+
+    /// The #leadership thread `threadReplyID` is in, as Slack sends it: Sam's parent, Maya's answer, Priya's
+    /// ask (the item, with the deck) and Jordan's reply after it, whose name Slack didn't send.
+    static let leadership = [
+        post(parentTS, "U0SAM", "Sam Lee", "Board call is Thursday."),
+        post("1791199500.000070", "U0MAYA", "Maya Chen", "Thanks!", mine: true),
+        post(replyTS, "U0PRIYA", "Priya Shah", "Can you send the Q3 numbers?", files: [deck]),
+        post(jordanTS, "U0JORDAN", "Someone", "I can help with the appendix."),
+    ]
+
+    static func mail(_ id: String, from name: String, _ address: String, at seconds: TimeInterval, text: String, mine: Bool = false,
+                     to: [String] = ["Maya Chen <maya@acme.example>"], cc: [String] = []) -> ThreadEmail {
+        ThreadEmail(id: id, from: name, date: Date(timeIntervalSince1970: seconds),
+                    content: MessageContent(text: text, to: to, cc: cc, fetchedAt: Date(timeIntervalSince1970: seconds)),
+                    replyHeaders: MailReplyHeaders(messageID: "<\(id)@mail.example>", references: nil, subject: "Contract redlines",
+                                                   from: "\(name) <\(address)>", to: to, cc: cc),
+                    isMine: mine, isStarred: false, snippet: text)
+    }
+
+    /// The conversation `emailID` (m1) is in, as Gmail sends it: Maya's draft, Sam's redlines (the item) and
+    /// Lena's answer to all, quoting Sam.
+    static let redlines = [
+        mail("m0", from: "Maya Chen", "maya@acme.example", at: 1_791_000_000, text: "Here's our MSA draft.", mine: true,
+             to: ["Sam Lee <sam@northwind.example>"]),
+        ThreadEmail(id: "m1", from: "Sam Lee", date: Date(timeIntervalSince1970: 1_791_100_000), content: fullEmail.content,
+                    replyHeaders: headers, isMine: false, isStarred: false, snippet: "Attached are the redlines."),
+        mail("m2", from: "Lena Park", "lena@acme.example", at: 1_791_150_000,
+             text: "I can join a call Friday.\n\nOn Sat, Sam Lee wrote:\n> Attached are the redlines.",
+             to: ["Sam Lee <sam@northwind.example>", "Maya Chen <maya@acme.example>"]),
+    ]
 }
 
 // MARK: - Tests
@@ -250,6 +372,8 @@ final class InboxTests: XCTestCase {
     var dir: URL!
     /// Integrations holds the store weakly (the app delegate owns it); the test owns it here.
     private var stores: [Store] = []
+    /// The Integrations `make` made, which share the test folder.
+    private var made: [Integrations] = []
 
     override func setUp() async throws {
         dir = FileManager.default.temporaryDirectory.appendingPathComponent("docket-inbox-\(UUID().uuidString)")
@@ -257,6 +381,8 @@ final class InboxTests: XCTestCase {
     }
 
     override func tearDown() async throws {
+        for integrations in made { integrations.flushSaves() }
+        made = []
         stores = []
         Keychain.useInMemoryStore()
         try? FileManager.default.removeItem(at: dir)
@@ -265,6 +391,8 @@ final class InboxTests: XCTestCase {
     /// Integrations reading `file` from the test folder, with stand-in clients and no AI unless a test sets one.
     private func make(_ file: IntegrationsFile = IntegrationsFile(), slack: FakeSlackInbox? = nil, gmail: FakeMailInbox? = nil,
                       app: AppState? = nil, transport: @escaping IntegrationHTTP.Transport = Sample.offline) throws -> (Integrations, Store) {
+        // What an earlier one saves in the background never lands over this one's file.
+        for earlier in made { earlier.flushSaves() }
         let store = Store(persistence: Persistence(directory: dir), seedIfEmpty: false)
         stores.append(store)
         try file.encoded().write(to: dir.appendingPathComponent("integrations.json"))
@@ -278,6 +406,7 @@ final class InboxTests: XCTestCase {
         }
         integrations.fullName = { "Maya Chen" }
         integrations.attach(store: store, app: app, directory: dir)
+        made.append(integrations)
         return (integrations, store)
     }
 
@@ -298,14 +427,16 @@ final class InboxTests: XCTestCase {
         return file
     }
 
-    /// Gmail connected as Maya, signed in with (or without) the permission to send.
-    private func gmailFile(_ items: [Suggestion] = [], canCompose: Bool = true) -> IntegrationsFile {
+    /// Gmail connected as Maya, signed in with (or without) the permission to send, or with gmail.modify (what
+    /// Docket asks for now: reading, starring, drafts and sending).
+    private func gmailFile(_ items: [Suggestion] = [], canCompose: Bool = true, canModify: Bool = false) -> IntegrationsFile {
         Keychain.set("1234-test.apps.googleusercontent.com", for: Keychain.Account.googleClientID)
         Keychain.set("test-client-secret", for: Keychain.Account.googleClientSecret)
         Keychain.set("1//test-refresh", for: Keychain.Account.googleRefreshToken)
         var file = IntegrationsFile()
         file.gmailAddress = Sample.address
-        file.gmailScopes = [GoogleOAuth.gmailScope] + (canCompose ? [GoogleOAuth.composeScope] : [])
+        file.gmailScopes = canModify ? ["openid", "email", GoogleOAuth.modifyScope]
+            : [GoogleOAuth.gmailScope] + (canCompose ? [GoogleOAuth.composeScope] : [])
         file.suggestions = items
         return file
     }
@@ -340,7 +471,8 @@ final class InboxTests: XCTestCase {
 
         let saved = try Data(contentsOf: dir.appendingPathComponent("integrations.json"))
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: saved) as? [String: Any])
-        XCTAssertEqual(json["version"] as? Int, 2)
+        XCTAssertEqual(json["version"] as? Int, 3)
+        XCTAssertEqual(IntegrationsFile.currentVersion, 3)
 
         let again = relaunch(store)
         let slack = try XCTUnwrap(again.suggestion(Sample.threadReplyID))
@@ -354,7 +486,7 @@ final class InboxTests: XCTestCase {
         XCTAssertEqual(again.suggestions.count, 2)
     }
 
-    func testAVersion1FileLoadsAndIsWrittenBackAsVersion2() async throws {
+    func testAVersion1FileLoadsAndIsWrittenBackAsTheCurrentVersion() async throws {
         let v1 = #"""
         {"version": 1, "handled": {"slack:C0GEN/1791100000.000100": "2026-10-01T09:00:00Z"},
          "slack": {"userID": "U0MAYA", "userName": "maya", "teamID": "T0ACME", "teamName": "Acme Test"},
@@ -379,8 +511,9 @@ final class InboxTests: XCTestCase {
         integrations.setNote("Approve if it's under budget", for: id)
         integrations.flushSaves()
         let saved = IntegrationsFile.load(from: dir.appendingPathComponent("integrations.json"))
-        XCTAssertEqual(saved.version, 2)
+        XCTAssertEqual(saved.version, IntegrationsFile.currentVersion)
         XCTAssertEqual(saved.suggestions.first?.note, "Approve if it's under budget")
+        XCTAssertEqual(saved.suggestions.first?.isStarred, false, "a Slack message saved with a reaction isn't starred")
         XCTAssertEqual(Array(saved.handled.keys), ["slack:C0GEN/1791100000.000100"])
         XCTAssertNil(saved.slackScopes)
     }
@@ -844,6 +977,30 @@ final class InboxTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: first.path))
     }
 
+    func testFilesOfAWholeThreadAreKeptAndForgottenWithItsItem() async throws {
+        // A file on another message of the thread: kept under the item's id, like the item's own.
+        let chart = MessageAttachment(id: "F0CHART", name: "Churn chart.png", mimeType: "image/png", size: 3,
+                                      remote: .slack(url: URL(string: "https://files.slack.com/files-pri/T0ACME-F0CHART/download/chart.png")!,
+                                                     thumbnail: nil))
+        var leadership = Sample.leadership
+        leadership[0].files = [chart]
+        let slack = FakeSlackInbox()
+        slack.with {
+            $0.fullThreadAnswers = [leadership]
+            $0.file = Data("png".utf8)
+        }
+        let id = Sample.threadReplyID
+        let (integrations, _) = try make(slackFile([Sample.slack(id, threadTS: Sample.parentTS)], scopes: SlackManifest.userScopes), slack: slack)
+        _ = try await integrations.fullThread(for: id, reload: false)
+        let url = try await integrations.file(for: chart, messageID: id)
+        XCTAssertTrue(integrations.inboxCacheKeys(integrations.suggestions).contains(InboxCache.key(messageID: id, attachmentID: "F0CHART")),
+                      "in use while its thread is open, so tidying up leaves it")
+
+        // Disconnecting forgets them with the message.
+        integrations.disconnectSlack()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
     func testEmailAttachmentsComeFromTheirMessage() async throws {
         let gmail = FakeMailInbox(full: Sample.fullEmail)
         gmail.with { $0.attachment = Data("png".utf8) }
@@ -1018,9 +1175,10 @@ final class InboxTests: XCTestCase {
 
     func testAIWritesTheReplyFromTheWholeMessageItsThreadAndYourNotes() async throws {
         let slack = FakeSlackInbox()
+        // The whole thread: the parent and the message itself (AI gets that one whole, apart).
         slack.with {
-            $0.threadAnswer = [ThreadMessage(id: Sample.parentTS, from: "Sam Lee", date: Date(timeIntervalSince1970: 1_791_199_000),
-                                             text: "Board call is Thursday.", isMine: false)]
+            $0.fullThreadAnswers = [[Sample.post(Sample.parentTS, "U0SAM", "Sam Lee", "Board call is Thursday."),
+                                     Sample.post(Sample.replyTS, "U0PRIYA", "Priya Shah", "Can you send the Q3 numbers before Thursday?")]]
         }
         var item = Sample.slack(Sample.threadReplyID, threadTS: Sample.parentTS)
         item.content = MessageContent(text: "Can you send the Q3 numbers before Thursday?", markup: "Can you send the *Q3 numbers* before Thursday?",
@@ -1042,6 +1200,7 @@ final class InboxTests: XCTestCase {
         XCTAssertEqual(request.message.from, "Priya Shah")
         XCTAssertEqual(request.content, item.content)
         XCTAssertEqual(request.thread.map(\.text), ["Board call is Thursday."])
+        XCTAssertNil(request.replyingTo, "a Slack reply answers the message itself, in its thread")
         XCTAssertEqual(request.notes, "Numbers are final; send Wednesday")
         XCTAssertEqual(request.tone, .friendly)
         XCTAssertEqual(request.instruction, "mention the churn dip")
@@ -1137,6 +1296,710 @@ final class InboxTests: XCTestCase {
         XCTAssertEqual(log.requests.last?.message.from, "Priya Shah")
     }
 
+    func testAIReadsTheWholeConversationAndKnowsWhichEmailItAnswers() async throws {
+        let gmail = FakeMailInbox(full: Sample.fullEmail)
+        gmail.with { $0.emails = [Sample.redlines] }
+        let (integrations, _) = try make(gmailFile([Sample.email()]), gmail: gmail)
+        let log = ReplyLog()
+        integrations.replyWriter = ReplyWriter { request in
+            log.requests.append(request)
+            return "Hi Lena,\n\nFriday works.\n\nBest,\nMaya"
+        }
+
+        // By default a reply answers the newest email that isn't yours: Lena's, after the one in the inbox.
+        _ = try await integrations.draftReply(for: Sample.emailID, tone: .brief, instruction: nil)
+        let request = try XCTUnwrap(log.requests.last)
+        XCTAssertEqual(request.thread.map(\.id), ["m0", "m2"], "the rest of the conversation, oldest first")
+        XCTAssertEqual(request.thread.last?.text, "I can join a call Friday.", "without the history it quotes")
+        XCTAssertEqual(request.thread.first?.isMine, true)
+        XCTAssertEqual(request.replyingTo?.id, "m2")
+        XCTAssertEqual(request.content, Sample.fullEmail.content, "the email itself came with its conversation")
+        XCTAssertTrue(gmail.fetched.isEmpty, "so it wasn't fetched again")
+        XCTAssertEqual(gmail.wholeCalls, ["t1"])
+
+        // Picked in the conversation: that one; the inbox's own email is no other message to point at.
+        _ = try await integrations.draftReply(for: Sample.emailID, tone: .brief, instruction: nil, replyingTo: "m0")
+        XCTAssertEqual(log.requests.last?.replyingTo?.id, "m0")
+        XCTAssertEqual(log.requests.last?.replyingTo?.isMine, true, "a follow-up to the user's own email")
+        _ = try await integrations.draftReply(for: Sample.emailID, tone: .brief, instruction: nil, replyingTo: "gmail:t1/m1")
+        XCTAssertNil(log.requests.last?.replyingTo)
+        XCTAssertEqual(gmail.wholeCalls, ["t1"], "the conversation is kept for the session")
+
+        // The conversation can't be loaded: the earlier messages still can.
+        let offline = FakeMailInbox(full: Sample.fullEmail)
+        offline.with {
+            $0.wholeError = IntegrationError.offline(.gmail, "You seem to be offline.")
+            $0.conversation = [ThreadMessage(id: "m0", from: "Maya Chen", date: Date(timeIntervalSince1970: 1_791_000_000),
+                                             text: "Here's our MSA draft.", isMine: true)]
+        }
+        let (other, _) = try make(gmailFile([Sample.email("gmail:t2/m2")]), gmail: offline)
+        other.replyWriter = integrations.replyWriter
+        _ = try await other.draftReply(for: "gmail:t2/m2", tone: .brief, instruction: nil)
+        XCTAssertEqual(log.requests.last?.thread.map(\.text), ["Here's our MSA draft."])
+        XCTAssertNil(log.requests.last?.replyingTo)
+    }
+
+    // MARK: Whole threads
+
+    func testAWholeSlackThreadLoadsOnceWithItsMessageHighlightedAndNamed() async throws {
+        let slack = FakeSlackInbox()
+        slack.with {
+            $0.fullThreadAnswers = [Sample.leadership]
+            $0.people = ["U0JORDAN": "Jordan Rivera"]
+            $0.delay = 0.05
+        }
+        let id = Sample.threadReplyID
+        let (integrations, _) = try make(slackFile([Sample.slack(id, threadTS: Sample.parentTS)]), slack: slack)
+
+        async let a = integrations.fullThread(for: id, reload: false)
+        async let b = integrations.fullThread(for: id, reload: false)
+        let (first, second) = try await (a, b)
+        XCTAssertEqual(first, second)
+        guard case .slack(let messages, let highlighted) = first else { return XCTFail("a Slack thread") }
+        XCTAssertEqual(messages.map(\.id), [Sample.parentTS, "1791199500.000070", Sample.replyTS, Sample.jordanTS], "oldest first")
+        XCTAssertEqual(highlighted, 2, "the message in the inbox")
+        XCTAssertEqual(messages[highlighted].files, [Sample.deck], "each message with its own files")
+        XCTAssertEqual(messages.map(\.from), ["Sam Lee", "Maya Chen", "Priya Shah", "Jordan Rivera"], "a writer Slack didn't name is looked up")
+        XCTAssertEqual(slack.fullThreadCalls, [.init(channel: "C0LEAD", threadTS: Sample.parentTS, myUserID: "U0MAYA")], "by its parent")
+        XCTAssertEqual(slack.fullThreadAround, [Sample.replyTS], "around the inbox message, which a very long thread keeps")
+        XCTAssertEqual(slack.lookups, ["U0JORDAN"])
+        XCTAssertEqual(integrations.slackNames["U0SAM"], "Sam Lee", "names the thread came with are remembered")
+        XCTAssertEqual(integrations.slackNames["U0JORDAN"], "Jordan Rivera")
+
+        // Kept for the session, as the views see it; reload asks again.
+        XCTAssertEqual(integrations.wholeThreads[id], first)
+        _ = try await integrations.fullThread(for: id, reload: false)
+        XCTAssertEqual(slack.fullThreadCalls.count, 1)
+        _ = try await integrations.fullThread(for: id, reload: true)
+        XCTAssertEqual(slack.fullThreadCalls.count, 2)
+        XCTAssertEqual(slack.lookups, ["U0JORDAN"], "people are looked up once")
+        XCTAssertEqual(slack.fullThreadNames.last?["U0JORDAN"], "Jordan Rivera", "Slack is handed the names known by then")
+
+        // A message that's gone says so.
+        do {
+            _ = try await integrations.fullThread(for: "slack:C0LEAD/1791209999.000100", reload: false)
+            XCTFail("not in the inbox")
+        } catch {
+            XCTAssertNotNil(error as? IntegrationError)
+        }
+    }
+
+    func testAnOlderSlackItemLearnsItsThreadAndAMessageOnItsOwnIsAConversationOfOne() async throws {
+        let slack = FakeSlackInbox()
+        slack.with { $0.fullThreadAnswers = [Sample.leadership] }
+        // Saved before Docket kept whole messages: not known to be in a thread.
+        let (integrations, _) = try make(slackFile([Sample.slack(Sample.threadReplyID), Sample.slack(Sample.topID)]), slack: slack)
+
+        let thread = try await integrations.fullThread(for: Sample.threadReplyID, reload: false)
+        XCTAssertEqual(slack.fullThreadCalls.first?.threadTS, Sample.replyTS, "asked by its own ts, which Slack answers with its thread")
+        XCTAssertEqual(thread.highlightedIndex, 2)
+        let item = try XCTUnwrap(integrations.suggestion(Sample.threadReplyID))
+        XCTAssertEqual(item.threadTS, Sample.parentTS, "now it's known to be a reply in that thread")
+        XCTAssertEqual(item.content?.text, "Can you send the Q3 numbers?")
+        XCTAssertEqual(item.content?.attachments, [Sample.deck])
+
+        // A message nobody answered: Slack sends it alone.
+        slack.with { $0.fullThreadAnswers = [[Sample.post(Sample.topTS, "U0PRIYA", "Priya Shah", "Can you send the Q3 numbers?")]] }
+        let alone = try await integrations.fullThread(for: Sample.topID, reload: false)
+        guard case .slack(let messages, let highlighted) = alone else { return XCTFail("a Slack thread") }
+        XCTAssertEqual(messages.map(\.id), [Sample.topTS])
+        XCTAssertEqual(highlighted, 0)
+        XCTAssertNil(integrations.suggestion(Sample.topID)?.threadTS, "not a reply")
+    }
+
+    func testWithoutTheHistoryPermissionASlackMessageShowsAloneAndIsAskedAgainLater() async throws {
+        let slack = FakeSlackInbox()
+        slack.with { $0.fullThreadError = IntegrationError.missingPermission(.slack, "channels:history") }
+        var item = Sample.slack(Sample.threadReplyID, threadTS: Sample.parentTS)
+        item.content = MessageContent(text: "Can you send the Q3 numbers?", markup: "Can you send the *Q3 numbers*?", attachments: [Sample.deck],
+                                      fetchedAt: Date())
+        let (integrations, _) = try make(slackFile([item, Sample.slack(Sample.topID)]), slack: slack)
+
+        let alone = try await integrations.fullThread(for: item.id, reload: false)
+        guard case .slack(let messages, let highlighted) = alone else { return XCTFail("a Slack thread") }
+        XCTAssertEqual(messages.map(\.id), [Sample.replyTS], "the message itself, as Docket kept it")
+        XCTAssertEqual(messages.first?.markup, "Can you send the *Q3 numbers*?")
+        XCTAssertEqual(messages.first?.files, [Sample.deck])
+        XCTAssertEqual(highlighted, 0)
+        XCTAssertEqual(integrations.missingSlackScopes, ["channels:history"], "the views offer to update the app")
+        XCTAssertNil(integrations.wholeThreads[item.id], "not kept: once the app is updated, it's asked again")
+
+        // Updated: the thread comes.
+        slack.with {
+            $0.fullThreadError = nil
+            $0.fullThreadAnswers = [Sample.leadership]
+        }
+        let whole = try await integrations.fullThread(for: item.id, reload: false)
+        XCTAssertEqual(whole.allMessageIDs.count, 4)
+        XCTAssertEqual(slack.fullThreadCalls.count, 2)
+
+        // When Slack listed the token's permissions and there's no history among them, it isn't asked at all.
+        integrations.grantedSlackScopes = Set(Sample.olderScopes)
+        let other = try await integrations.fullThread(for: Sample.topID, reload: false)
+        XCTAssertEqual(other.allMessageIDs, [Sample.topTS])
+        XCTAssertEqual(slack.fullThreadCalls.count, 2)
+
+        // Anything else is an error, in plain words.
+        integrations.grantedSlackScopes = nil
+        slack.with { $0.fullThreadError = IntegrationError.api(.slack, "That message isn't in Slack any more.") }
+        do {
+            _ = try await integrations.fullThread(for: Sample.topID, reload: true)
+            XCTFail("gone")
+        } catch {
+            XCTAssertEqual(error as? IntegrationError, .api(.slack, "That message isn't in Slack any more."))
+        }
+    }
+
+    func testAWholeEmailConversationBringsTheEmailWithIt() async throws {
+        let gmail = FakeMailInbox(full: Sample.fullEmail)
+        gmail.with { $0.emails = [Sample.redlines] }
+        var item = Sample.email()
+        item.receivedAt = Sample.redlines[1].date
+        let (integrations, store) = try make(gmailFile([item]), gmail: gmail)
+
+        let thread = try await integrations.fullThread(for: Sample.emailID, reload: false)
+        guard case .email(let emails, let highlighted) = thread else { return XCTFail("an email conversation") }
+        XCTAssertEqual(emails.map(\.id), ["m0", "m1", "m2"])
+        XCTAssertEqual(highlighted, 1)
+        XCTAssertEqual(gmail.wholeCalls, ["t1"])
+
+        // What opening the email and replying to it need came along: nothing more is fetched, now or next launch.
+        XCTAssertEqual(integrations.suggestion(Sample.emailID)?.replyHeaders, Sample.headers)
+        let content = try await integrations.content(for: Sample.emailID)
+        XCTAssertEqual(content, Sample.fullEmail.content)
+        XCTAssertTrue(gmail.fetched.isEmpty)
+        integrations.flushSaves()
+        XCTAssertEqual(relaunch(store).suggestion(Sample.emailID)?.replyHeaders, Sample.headers)
+        XCTAssertNil(relaunch(store).wholeThreads[Sample.emailID], "threads aren't saved")
+
+        // An email no longer in its conversation (deleted since) still shows, in its place.
+        gmail.with { $0.emails = [[Sample.redlines[0], Sample.redlines[2]]] }
+        let without = try await integrations.fullThread(for: Sample.emailID, reload: true)
+        XCTAssertEqual(without.allMessageIDs, ["m0", "m1", "m2"])
+        XCTAssertEqual(without.highlightedIndex, 1)
+
+        // Offline: an error in plain words, and what was loaded stays.
+        gmail.with { $0.wholeError = IntegrationError.offline(.gmail, "You seem to be offline.") }
+        do {
+            _ = try await integrations.fullThread(for: Sample.emailID, reload: true)
+            XCTFail("offline")
+        } catch {
+            XCTAssertEqual(error as? IntegrationError, .offline(.gmail, "You seem to be offline."))
+        }
+        XCTAssertEqual(integrations.wholeThreads[Sample.emailID]?.allMessageIDs, ["m0", "m1", "m2"])
+    }
+
+    func testTheItemsOwnMessageIsPlacedByTimeWhenTheThreadLeavesItOut() {
+        let own = Sample.post(Sample.replyTS, nil, "Priya Shah", "Can you send the Q3 numbers?")
+        let others = Sample.leadership.filter { $0.id != Sample.replyTS }
+        let (slack, slackHasOwn) = Integrations.slackThread(others, own: own)
+        XCTAssertFalse(slackHasOwn)
+        XCTAssertEqual(slack.allMessageIDs, [Sample.parentTS, "1791199500.000070", Sample.replyTS, Sample.jordanTS])
+        XCTAssertEqual(slack.highlightedIndex, 2)
+        // The same ts written another way is the same message.
+        let (same, sameHasOwn) = Integrations.slackThread([Sample.post("1791200000.0001", "U0PRIYA", "Priya Shah", "Can you…")], own: own)
+        XCTAssertTrue(sameHasOwn)
+        XCTAssertEqual(same.highlightedIndex, 0)
+        XCTAssertTrue(InboxThread.sameSlackMessage("slack:C0LEAD/\(Sample.replyTS)", "1791200000.0001"))
+        XCTAssertFalse(InboxThread.sameSlackMessage(Sample.replyTS, Sample.parentTS))
+
+        let (email, emailHasOwn) = Integrations.emailThread([Sample.redlines[2]], own: Sample.redlines[1])
+        XCTAssertFalse(emailHasOwn)
+        XCTAssertEqual(email.allMessageIDs, ["m1", "m2"])
+        XCTAssertEqual(email.highlightedIndex, 0)
+    }
+
+    // MARK: Replying to one message
+
+    func testAnEmailReplyAnswersThePickedEmailOrTheNewestNotFromYou() async throws {
+        let gmail = FakeMailInbox(full: Sample.fullEmail)
+        gmail.with { $0.emails = [Sample.redlines] }
+        let app = AppState()
+        let (integrations, _) = try make(gmailFile([Sample.email()], canModify: true), gmail: gmail, app: app)
+        let id = Sample.emailID
+        XCTAssertNil(integrations.defaultReplyTarget(for: id), "not before the conversation is in")
+        XCTAssertEqual(integrations.replyHeaders(for: id, replyingTo: nil), nil, "nor the item's own headers, until it's opened")
+
+        _ = try await integrations.fullThread(for: id, reload: false)
+        let lena = Sample.redlines[2].replyHeaders
+        XCTAssertEqual(integrations.defaultReplyTarget(for: id), "m2", "the newest that isn't yours")
+        XCTAssertEqual(integrations.replyHeaders(for: id, replyingTo: nil), lena, "what the confirmation shows")
+        XCTAssertEqual(integrations.replyHeaders(for: id, replyingTo: "m0")?.messageID, "<m0@mail.example>")
+
+        // The default one: Lena's email, its Message-ID and its people.
+        try await integrations.sendReply("Friday works for both of us.", for: id, replyingTo: nil, replyAll: true)
+        XCTAssertEqual(gmail.sent.last, MailReply(threadID: "t1", headers: lena, fromAddress: Sample.address,
+                                                  body: "Friday works for both of us.", replyAll: true))
+        XCTAssertEqual(app.toast, "Reply sent")
+
+        // One picked in the conversation (by its id, or as the views name it).
+        try await integrations.sendReply("Thanks, Sam.", for: id, replyingTo: "m1", replyAll: false)
+        XCTAssertEqual(gmail.sent.last?.headers, Sample.headers)
+        try await integrations.saveReplyAsDraft("Following up on the draft.", for: id, replyingTo: "gmail:t1/m0", replyAll: false)
+        XCTAssertEqual(gmail.drafts.last?.headers.messageID, "<m0@mail.example>")
+        XCTAssertEqual(gmail.drafts.last?.threadID, "t1")
+
+        // One that isn't in the conversation never goes anywhere.
+        do {
+            try await integrations.sendReply("Hello?", for: id, replyingTo: "m9", replyAll: false)
+            XCTFail("no such email")
+        } catch {
+            XCTAssertEqual(error as? IntegrationError, .api(.gmail, "That email isn't in the conversation any more. Reply to another one."))
+        }
+        XCTAssertEqual(gmail.sent.count, 2)
+        await integrations.waitForThreadRechecks()
+    }
+
+    func testASlackReplyToAnyMessageGoesInTheThreadAndShowsThereAtOnce() async throws {
+        let slack = FakeSlackInbox()
+        let app = AppState()
+        let sentTS = String(format: "%.6f", Date().timeIntervalSince1970)
+        // Before the reply, then the same thread with the reply as Slack has it.
+        slack.with {
+            $0.fullThreadAnswers = [Sample.leadership, Sample.leadership + [Sample.post(sentTS, "U0MAYA", "Maya Chen", "On it", mine: true)]]
+        }
+        // Saved before Docket knew it's a reply in a thread: the thread says which.
+        let (integrations, _) = try make(slackFile([Sample.slack(Sample.threadReplyID)]), slack: slack, app: app)
+        let id = Sample.threadReplyID
+        _ = try await integrations.fullThread(for: id, reload: false)
+
+        try await integrations.sendReply("On it", for: id, replyingTo: Sample.jordanTS, replyAll: false)
+        XCTAssertEqual(slack.replies, [.init(channel: "C0LEAD", threadTS: Sample.parentTS, text: "On it")],
+                       "in the thread, whichever of its messages it answers")
+        XCTAssertEqual(app.toast, "Replied in #leadership")
+
+        // In the thread at once, as yours.
+        guard case .slack(let shown, _)? = integrations.wholeThreads[id] else { return XCTFail("a Slack thread") }
+        let mine = try XCTUnwrap(shown.last)
+        XCTAssertEqual(mine.text, "On it")
+        XCTAssertTrue(mine.isMine)
+        XCTAssertTrue(InboxThread.isSentFromDocket(mine.id))
+        XCTAssertEqual(shown.count, 5)
+
+        // Then as Slack has it, once it's fetched again.
+        await integrations.waitForThreadRechecks()
+        guard case .slack(let confirmed, _)? = integrations.wholeThreads[id] else { return XCTFail("a Slack thread") }
+        XCTAssertEqual(confirmed.map(\.id), Sample.leadership.map(\.id) + [sentTS])
+        XCTAssertEqual(slack.fullThreadCalls.count, 2)
+
+        // A sent reply Slack doesn't list yet stays at the end until it does.
+        try await integrations.sendReply("Also, the deck is attached above.", for: id, replyingTo: nil, replyAll: false)
+        await integrations.waitForThreadRechecks()
+        guard case .slack(let waiting, _)? = integrations.wholeThreads[id] else { return XCTFail("a Slack thread") }
+        XCTAssertEqual(waiting.count, 6)
+        XCTAssertEqual(waiting.last?.text, "Also, the deck is attached above.")
+        XCTAssertEqual(slack.replies.last?.threadTS, Sample.parentTS)
+    }
+
+    func testASentReplyWaitsInTheThreadUntilSlackOrGmailListsIt() {
+        func mine(_ ts: String, _ text: String) -> ThreadSlackMessage { Sample.post(ts, "U0MAYA", "Maya Chen", text, mine: true) }
+        let shown = Set(Sample.leadership.map(\.id))
+        let first = SentFromDocket(message: .slack(mine(InboxThread.newSentFromDocketID(), "On it")), before: shown)
+        let second = SentFromDocket(message: .slack(mine(InboxThread.newSentFromDocketID(), "Also, the *deck* is attached.")), before: shown)
+        let onIt = mine("1791201000.000100", "On it")
+
+        // Not listed yet: both wait.
+        XCTAssertEqual(SentFromDocket.unlisted([first, second], in: .slack(Sample.leadership, highlighted: 2)).count, 2)
+        // The first is listed: only the second waits, however soon after it went.
+        XCTAssertEqual(SentFromDocket.unlisted([first, second], in: .slack(Sample.leadership + [onIt], highlighted: 2)).map(\.words),
+                       [second.words])
+        // Listed the way Slack keeps it (formatting gone): the same words. Out of order too.
+        let deck = mine("1791201100.000100", "Also, the deck is attached.")
+        XCTAssertTrue(SentFromDocket.unlisted([first, second], in: .slack(Sample.leadership + [deck, onIt], highlighted: 2)).isEmpty)
+
+        // A message that was already there when a reply went is never that reply.
+        let later = SentFromDocket(message: .slack(mine(InboxThread.newSentFromDocketID(), "Thanks")), before: shown.union([onIt.id]))
+        XCTAssertEqual(SentFromDocket.unlisted([later], in: .slack(Sample.leadership + [onIt], highlighted: 2)).count, 1)
+        // Listed in other words (an email with its quoted history, say): a new message of yours is still that reply.
+        let quoted = mine("1791201200.000100", "Thanks!\n> On it")
+        XCTAssertTrue(SentFromDocket.unlisted([later], in: .slack(Sample.leadership + [onIt, quoted], highlighted: 2)).isEmpty)
+        XCTAssertEqual(SentFromDocket.words("Re: *Q3* numbers — 10:42!"), "req3numbers1042")
+    }
+
+    func testAnEmailReplyShowsInItsConversationAtOnceUntilGmailListsIt() async throws {
+        let gmail = FakeMailInbox(full: Sample.fullEmail)
+        let sent = Sample.mail("m3", from: "Maya Chen", "maya@acme.example", at: Date().timeIntervalSince1970, text: "Friday works.", mine: true,
+                               to: ["Lena Park <lena@acme.example>"])
+        gmail.with { $0.emails = [Sample.redlines, Sample.redlines + [sent]] }
+        let (integrations, _) = try make(gmailFile([Sample.email()], canModify: true), gmail: gmail)
+        _ = try await integrations.fullThread(for: Sample.emailID, reload: false)
+
+        try await integrations.sendReply("Friday works.", for: Sample.emailID, replyingTo: "m2", replyAll: false)
+        guard case .email(let shown, let highlighted)? = integrations.wholeThreads[Sample.emailID] else { return XCTFail("an email conversation") }
+        XCTAssertEqual(highlighted, 1)
+        let reply = try XCTUnwrap(shown.last)
+        XCTAssertTrue(reply.isMine)
+        XCTAssertEqual(reply.content.text, "Friday works.")
+        XCTAssertEqual(reply.content.to, ["Lena Park <lena@acme.example>"], "to whom it went")
+        XCTAssertEqual(reply.replyHeaders.subject, "Re: Contract redlines")
+        XCTAssertEqual(integrations.defaultReplyTarget(for: Sample.emailID), "m2", "a reply of yours is never the one to answer")
+
+        await integrations.waitForThreadRechecks()
+        XCTAssertEqual(integrations.wholeThreads[Sample.emailID]?.allMessageIDs, ["m0", "m1", "m2", "m3"])
+    }
+
+    // MARK: Stars
+
+    func testStarredItemsComeFirstAndTheStarredFilterShowsOnlyThem() throws {
+        let (integrations, _) = try make()
+        var pinned = Sample.slack("slack:C0LEAD/2", minutesAgo: 50)
+        pinned.isStarred = true
+        var older = Sample.slack("slack:C0LEAD/3", minutesAgo: 90)
+        older.isStarred = true
+        var mail = Sample.email("gmail:t1/m1", minutesAgo: 30)
+        mail.isStarred = true
+        integrations.suggestions = [Sample.slack("slack:C0LEAD/1", minutesAgo: 5), pinned, mail, older, Sample.slack("slack:D0DM/4", minutesAgo: 1),
+                                    Sample.email("gmail:t2/m2", minutesAgo: 2)]
+        XCTAssertEqual(integrations.items(.slack).map(\.id), ["slack:C0LEAD/2", "slack:C0LEAD/3", "slack:D0DM/4", "slack:C0LEAD/1"],
+                       "starred first, each part newest first")
+        XCTAssertEqual(integrations.items(.slack, starredOnly: true).map(\.id), ["slack:C0LEAD/2", "slack:C0LEAD/3"])
+        XCTAssertEqual(integrations.items(.gmail).map(\.id), ["gmail:t1/m1", "gmail:t2/m2"])
+        XCTAssertEqual(integrations.items(.gmail, starredOnly: true).map(\.id), ["gmail:t1/m1"])
+        XCTAssertTrue(integrations.items(.ai, starredOnly: true).isEmpty)
+    }
+
+    func testAStarShowsAtOnceReachesGmailAndIsSaved() async throws {
+        let gmail = FakeMailInbox(full: Sample.fullEmail)
+        gmail.with {
+            $0.emails = [Sample.redlines]
+            $0.delay = 0.2
+        }
+        let (integrations, store) = try make(gmailFile([Sample.email(), Sample.email("gmail:t2/m2", minutesAgo: 5)], canModify: true), gmail: gmail)
+        _ = try await integrations.fullThread(for: Sample.emailID, reload: false)
+        XCTAssertEqual(integrations.items(.gmail).map(\.id), ["gmail:t2/m2", Sample.emailID])
+
+        let starring = Task { await integrations.setStarred(true, for: Sample.emailID) }
+        try await Task.sleep(nanoseconds: 60_000_000)
+        XCTAssertEqual(integrations.suggestion(Sample.emailID)?.isStarred, true, "at once, before Gmail answers")
+        XCTAssertEqual(integrations.items(.gmail).first?.id, Sample.emailID, "and first in its tab")
+        guard case .email(let shown, _)? = integrations.wholeThreads[Sample.emailID] else { return XCTFail("an email conversation") }
+        XCTAssertEqual(shown[1].isStarred, true, "the conversation shows it too")
+        XCTAssertTrue(gmail.starCalls.isEmpty, "Gmail hasn't answered yet")
+        await starring.value
+        XCTAssertEqual(gmail.starCalls, [.init(starred: true, messageID: "m1")], "the STARRED label on its own message")
+        XCTAssertNil(integrations.starProblem(for: Sample.emailID))
+        XCTAssertTrue(integrations.isStarred(message: nil, in: Sample.emailID))
+
+        // Saved: still starred next launch.
+        integrations.flushSaves()
+        XCTAssertEqual(relaunch(store).suggestion(Sample.emailID)?.isStarred, true)
+
+        // Unstarred: Gmail too, and it stays in the inbox.
+        gmail.with { $0.delay = 0 }
+        await integrations.setStarred(false, for: Sample.emailID)
+        XCTAssertEqual(gmail.starCalls.last, .init(starred: false, messageID: "m1"))
+        XCTAssertEqual(integrations.suggestion(Sample.emailID)?.isStarred, false)
+
+        // Asking for what it is already does nothing.
+        await integrations.setStarred(false, for: Sample.emailID)
+        XCTAssertEqual(gmail.starCalls.count, 2)
+    }
+
+    func testAStarThatDoesntTakeGoesBackAndSaysWhy() async throws {
+        let gmail = FakeMailInbox(full: Sample.fullEmail)
+        gmail.with { $0.starError = IntegrationError.offline(.gmail, "You seem to be offline.") }
+        let (integrations, store) = try make(gmailFile([Sample.email()], canModify: true), gmail: gmail)
+
+        await integrations.setStarred(true, for: Sample.emailID)
+        XCTAssertEqual(integrations.suggestion(Sample.emailID)?.isStarred, false, "put back")
+        XCTAssertEqual(integrations.starProblem(for: Sample.emailID), "Couldn't reach Gmail. You seem to be offline.")
+        integrations.flushSaves()
+        XCTAssertEqual(relaunch(store).suggestion(Sample.emailID)?.isStarred, false)
+
+        // The next try clears it.
+        gmail.with { $0.starError = nil }
+        await integrations.setStarred(true, for: Sample.emailID)
+        XCTAssertNil(integrations.starProblem(for: Sample.emailID))
+        XCTAssertEqual(integrations.suggestion(Sample.emailID)?.isStarred, true)
+
+        // Slack too: a message deleted there can't be saved for later.
+        let slack = FakeSlackInbox()
+        slack.with { $0.starError = IntegrationError.api(.slack, "That message isn't in Slack any more.") }
+        let (other, _) = try make(slackFile([Sample.slack(Sample.topID)], scopes: SlackManifest.userScopes), slack: slack)
+        await other.setStarred(true, for: Sample.topID)
+        XCTAssertEqual(slack.starCalls, [.init(starred: true, channel: "C0LEAD", ts: Sample.topTS)])
+        XCTAssertEqual(other.suggestion(Sample.topID)?.isStarred, false)
+        XCTAssertEqual(other.starProblem(for: Sample.topID), "Couldn't star it in Slack. That message isn't in Slack any more.")
+        XCTAssertFalse(other.slackStarsStayInDocket)
+    }
+
+    func testQuickChangesReachGmailInOrderAndEndAsTheUserLeftThem() async throws {
+        let gmail = FakeMailInbox(full: Sample.fullEmail)
+        gmail.with { $0.delay = 0.1 }
+        let (integrations, _) = try make(gmailFile([Sample.email()], canModify: true), gmail: gmail)
+
+        let first = Task { await integrations.setStarred(true, for: Sample.emailID) }
+        try await Task.sleep(nanoseconds: 30_000_000)
+        // Unstarred while the star is on its way, then starred and unstarred again: Gmail ends unstarred too.
+        await integrations.setStarred(false, for: Sample.emailID)
+        await first.value
+        XCTAssertEqual(gmail.starCalls, [.init(starred: true, messageID: "m1"), .init(starred: false, messageID: "m1")])
+        XCTAssertEqual(integrations.suggestion(Sample.emailID)?.isStarred, false)
+
+        let again = Task { await integrations.setStarred(true, for: Sample.emailID) }
+        try await Task.sleep(nanoseconds: 30_000_000)
+        let off = Task { await integrations.setStarred(false, for: Sample.emailID) }
+        try await Task.sleep(nanoseconds: 10_000_000)
+        let on = Task { await integrations.setStarred(true, for: Sample.emailID) }
+        _ = await (again.value, off.value, on.value)
+        XCTAssertEqual(integrations.suggestion(Sample.emailID)?.isStarred, true)
+        XCTAssertEqual(gmail.starCalls.last, .init(starred: true, messageID: "m1"), "what Gmail heard last is what Docket shows")
+    }
+
+    func testSlackThatWontSaveForLaterKeepsTheStarInDocketAndSaysSoOnce() async throws {
+        let slack = FakeSlackInbox()
+        // What SlackClient throws when Slack retired stars for the app (method_deprecated) or doesn't allow them.
+        slack.with { $0.starError = IntegrationError.api(.slack, "Saved in Docket only (Slack didn't allow saving it there)") }
+        let app = AppState()
+        let other = "slack:C0LEAD/1791203700.000300"
+        let (integrations, store) = try make(slackFile([Sample.slack(Sample.topID), Sample.slack(other)], scopes: SlackManifest.userScopes),
+                                             slack: slack, app: app)
+
+        await integrations.setStarred(true, for: Sample.topID)
+        XCTAssertEqual(integrations.suggestion(Sample.topID)?.isStarred, true, "kept in Docket")
+        XCTAssertNil(integrations.starProblem(for: Sample.topID))
+        XCTAssertEqual(app.toast, "Saved in Docket only (Slack didn't allow saving it there)")
+        XCTAssertTrue(integrations.slackStarsStayInDocket)
+
+        // From then on Slack isn't asked, and it isn't said again, also after a relaunch.
+        app.toast = nil
+        await integrations.setStarred(true, for: other)
+        XCTAssertEqual(integrations.suggestion(other)?.isStarred, true)
+        XCTAssertEqual(slack.starCalls.count, 1)
+        XCTAssertNil(app.toast)
+        integrations.flushSaves()
+        XCTAssertTrue(relaunch(store).slackStarsStayInDocket)
+
+        // Slack's own words for it count the same way; connecting Slack again asks again.
+        XCTAssertTrue(InboxStarRules.slackDeclined(.api(.slack, "Slack said “method_deprecated”.")))
+        XCTAssertTrue(InboxStarRules.slackDeclined(.api(.slack, "Slack said “not_allowed”.")))
+        XCTAssertTrue(InboxStarRules.slackDeclined(.missingPermission(.slack, "stars:write")))
+        XCTAssertFalse(InboxStarRules.slackDeclined(.api(.slack, "That message isn't in Slack any more.")))
+        XCTAssertFalse(InboxStarRules.slackDeclined(.offline(.slack, "You seem to be offline.")))
+        integrations.disconnectSlack(problem: "Slack no longer accepts Docket's token.")
+        XCTAssertFalse(integrations.slackStarsStayInDocket)
+
+        // An app made before stars (no stars:write): Slack isn't asked, and Docket says so once.
+        let older = FakeSlackInbox()
+        let olderApp = AppState()
+        let (before, _) = try make(slackFile([Sample.slack(Sample.topID)], scopes: Sample.olderScopes), slack: older, app: olderApp)
+        await before.setStarred(true, for: Sample.topID)
+        XCTAssertEqual(before.suggestion(Sample.topID)?.isStarred, true)
+        XCTAssertTrue(older.starCalls.isEmpty)
+        XCTAssertEqual(olderApp.toast, InboxStarRules.slackNote)
+        XCTAssertEqual(IntegrationError.missingPermission(.slack, "stars:write").errorDescription,
+                       "Docket needs one more Slack permission to save messages for later in Slack. Update the Docket app in Settings → Connections.")
+    }
+
+    func testASlackAppGivenThePermissionToSaveForLaterIsAskedAgain() async throws {
+        let server = FakeIntegrationServer()
+        server.on({ $0.url?.host == "slack.com" && $0.url?.path == "/api/auth.test" },
+                  [.init(body: Sample.authTest, headers: ["x-oauth-scopes": SlackManifest.userScopes.joined(separator: ",")])])
+        let slack = FakeSlackInbox()
+        let (integrations, _) = try make(slackFile([Sample.slack(Sample.topID)], scopes: Sample.olderScopes), slack: slack,
+                                         transport: server.transport)
+        await integrations.setStarred(true, for: Sample.topID)
+        XCTAssertTrue(integrations.slackStarsStayInDocket, "an app made before stars")
+        XCTAssertTrue(slack.starCalls.isEmpty)
+
+        // The app in Slack was given stars:write: the next star goes to Slack.
+        await integrations.checkSlackPermissions()
+        XCTAssertFalse(integrations.slackStarsStayInDocket)
+        await integrations.setStarred(false, for: Sample.topID)
+        XCTAssertEqual(slack.starCalls, [.init(starred: false, channel: "C0LEAD", ts: Sample.topTS)])
+    }
+
+    func testWithoutTheGmailStarPermissionAStarStaysInDocket() async throws {
+        let gmail = FakeMailInbox(full: Sample.fullEmail)
+        let app = AppState()
+        // Signed in before Docket asked for gmail.modify.
+        let (integrations, _) = try make(gmailFile([Sample.email(), Sample.email("gmail:t2/m2")]), gmail: gmail, app: app)
+        XCTAssertFalse(integrations.gmailCanModify)
+
+        await integrations.setStarred(true, for: Sample.emailID)
+        XCTAssertEqual(integrations.suggestion(Sample.emailID)?.isStarred, true)
+        XCTAssertTrue(gmail.starCalls.isEmpty)
+        XCTAssertEqual(app.toast, "Starred in Docket only (reconnect Gmail to star it there too)")
+        app.toast = nil
+        await integrations.setStarred(true, for: "gmail:t2/m2")
+        XCTAssertNil(app.toast, "said once")
+        // Taken off in Docket only: said in those words (once too).
+        await integrations.setStarred(false, for: "gmail:t2/m2")
+        XCTAssertEqual(integrations.suggestion("gmail:t2/m2")?.isStarred, false)
+        XCTAssertEqual(app.toast, "Unstarred in Docket only (reconnect Gmail to change it there too)")
+
+        // Signed in with it, but Google turns it down after all: kept here, and Docket stops asking.
+        integrations.grantedGmailScopes = ["openid", "email", GoogleOAuth.modifyScope]
+        gmail.with { $0.starError = IntegrationError.missingPermission(.gmail, "star emails") }
+        await integrations.setStarred(false, for: Sample.emailID)
+        XCTAssertEqual(integrations.suggestion(Sample.emailID)?.isStarred, false)
+        XCTAssertEqual(gmail.starCalls, [.init(starred: false, messageID: "m1")])
+        XCTAssertFalse(integrations.gmailCanModify)
+        XCTAssertNil(integrations.starProblem(for: Sample.emailID))
+    }
+
+    func testMessagesOfAThreadHaveTheirOwnStars() async throws {
+        let slack = FakeSlackInbox()
+        slack.with { $0.fullThreadAnswers = [Sample.leadership] }
+        let jordan = "slack:C0LEAD/\(Sample.jordanTS)"
+        let id = Sample.threadReplyID
+        let (integrations, store) = try make(slackFile([Sample.slack(id, threadTS: Sample.parentTS), Sample.slack(jordan, threadTS: Sample.parentTS)],
+                                                       scopes: SlackManifest.userScopes), slack: slack)
+        _ = try await integrations.fullThread(for: id, reload: false)
+
+        // Slack: saved for later there, and kept in Docket (Slack doesn't say which messages are saved).
+        await integrations.setStarred(true, message: Sample.parentTS, in: id)
+        XCTAssertTrue(integrations.isStarred(message: Sample.parentTS, in: id))
+        XCTAssertEqual(slack.starCalls, [.init(starred: true, channel: "C0LEAD", ts: Sample.parentTS)])
+        XCTAssertEqual(integrations.suggestion(id)?.starredInThread, [Sample.parentTS])
+        XCTAssertFalse(integrations.suggestion(id)?.isStarred ?? true, "the item's own star is its own")
+        XCTAssertTrue(integrations.isStarred(message: Sample.parentTS, in: jordan), "the same message seen from another item of the thread")
+        integrations.flushSaves()
+        XCTAssertTrue(relaunch(store).isStarred(message: Sample.parentTS, in: id), "kept across launches")
+
+        // As the views name it ("slack:<channel>/<ts>"): the same star.
+        await integrations.setStarred(false, for: "slack:C0LEAD/\(Sample.parentTS)")
+        XCTAssertFalse(integrations.isStarred(message: Sample.parentTS, in: id))
+        XCTAssertEqual(slack.starCalls.last, .init(starred: false, channel: "C0LEAD", ts: Sample.parentTS))
+
+        // A message that's an inbox item itself is that item's star; the item's own message is the item's.
+        await integrations.setStarred(true, message: Sample.jordanTS, in: id)
+        XCTAssertEqual(integrations.suggestion(jordan)?.isStarred, true)
+        XCTAssertTrue(integrations.isStarred(message: "slack:C0LEAD/\(Sample.jordanTS)", in: id))
+        await integrations.setStarred(true, message: Sample.replyTS, in: id)
+        XCTAssertEqual(integrations.suggestion(id)?.isStarred, true)
+
+        // Email: Gmail's label on that email, shown in the conversation at once; put back when it doesn't take.
+        let gmail = FakeMailInbox(full: Sample.fullEmail)
+        gmail.with { $0.emails = [Sample.redlines] }
+        let (mail, _) = try make(gmailFile([Sample.email()], canModify: true), gmail: gmail)
+        _ = try await mail.fullThread(for: Sample.emailID, reload: false)
+        await mail.setStarred(true, message: "m2", in: Sample.emailID)
+        XCTAssertEqual(gmail.starCalls, [.init(starred: true, messageID: "m2")])
+        XCTAssertTrue(mail.isStarred(message: "m2", in: Sample.emailID))
+        guard case .email(let emails, _)? = mail.wholeThreads[Sample.emailID] else { return XCTFail("an email conversation") }
+        XCTAssertEqual(emails.map(\.isStarred), [false, false, true])
+        XCTAssertFalse(mail.suggestion(Sample.emailID)?.isStarred ?? true)
+
+        gmail.with { $0.starError = IntegrationError.offline(.gmail, "You seem to be offline.") }
+        await mail.setStarred(false, message: "gmail:t1/m2", in: Sample.emailID)
+        XCTAssertTrue(mail.isStarred(message: "m2", in: Sample.emailID), "put back")
+        XCTAssertEqual(mail.starProblem(for: Sample.emailID, message: "m2"), "Couldn't reach Gmail. You seem to be offline.")
+        XCTAssertNil(mail.starProblem(for: Sample.emailID))
+
+        // A star on its way survives the conversation being fetched again meanwhile.
+        gmail.with {
+            $0.starError = nil
+            $0.delay = 0.1
+        }
+        let unstarring = Task { await mail.setStarred(false, message: "m2", in: Sample.emailID) }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        gmail.with { $0.delay = 0 }
+        _ = try await mail.fullThread(for: Sample.emailID, reload: true)
+        XCTAssertFalse(mail.isStarred(message: "m2", in: Sample.emailID))
+        await unstarring.value
+        guard case .email(let after, _)? = mail.wholeThreads[Sample.emailID] else { return XCTFail("an email conversation") }
+        XCTAssertEqual(after.map(\.isStarred), [false, false, false])
+    }
+
+    func testGmailMessagesArriveStarredWhenGmailHasThemStarred() async throws {
+        let server = FakeIntegrationServer()
+        let now = Date()
+        func list(_ refs: [(String, String)]) -> String {
+            #"{"messages":["# + refs.map { #"{"id":"\#($0.0)","threadId":"\#($0.1)"}"# }.joined(separator: ",") + "]}"
+        }
+        func email(_ id: String, thread: String, labels: [String], minutesAgo: Double) -> String {
+            let labels = labels.map { "\"\($0)\"" }.joined(separator: ",")
+            return """
+            {"id":"\(id)","threadId":"\(thread)","labelIds":[\(labels)],"snippet":"Can you review this?",
+             "internalDate":"\(Int64(now.addingTimeInterval(-minutesAgo * 60).timeIntervalSince1970 * 1000))",
+             "payload":{"headers":[{"name":"From","value":"Sam Lee <sam@northwind.example>"},{"name":"Subject","value":"Q3 numbers \(id)"}]}}
+            """
+        }
+        server.google("/token", .init(body: #"{"access_token":"ya29.test-access","expires_in":3599,"scope":"openid email https://www.googleapis.com/auth/gmail.modify","token_type":"Bearer"}"#))
+        server.gmail("messages", query: GmailClient.starredQuery, list([("m1", "t1")]))
+        server.gmail("messages", query: GmailClient.needsReplyQuery, list([("m2", "t2"), ("m3", "t3")]))
+        server.gmail("messages/m1", email("m1", thread: "t1", labels: ["INBOX", "STARRED"], minutesAgo: 30))
+        server.gmail("messages/m2", email("m2", thread: "t2", labels: ["INBOX", "UNREAD", "IMPORTANT", "STARRED"], minutesAgo: 20))
+        server.gmail("messages/m3", email("m3", thread: "t3", labels: ["INBOX", "UNREAD", "IMPORTANT"], minutesAgo: 10))
+        let (integrations, _) = try make(gmailFile(), transport: server.transport)
+
+        await integrations.refreshNow(now: now)
+        XCTAssertNil(integrations.gmailProblem)
+        XCTAssertEqual(integrations.items(.gmail).map(\.id), ["gmail:t2/m2", "gmail:t1/m1", "gmail:t3/m3"])
+        XCTAssertEqual(integrations.items(.gmail, starredOnly: true).map(\.id), ["gmail:t2/m2", "gmail:t1/m1"])
+        XCTAssertEqual(integrations.suggestion("gmail:t2/m2")?.trigger, .needsReply, "waiting for a reply, and starred in Gmail")
+        XCTAssertTrue(integrations.gmailCanModify, "Google said the sign-in allows starring")
+    }
+
+    func testSavedFilesKeepStarsAndOlderOnesLoadStarredEmailsAsStarred() throws {
+        // Saved before stars: an email that came in because it was starred in Gmail is starred.
+        let before = #"""
+        {"version": 2, "suggestions": [
+          {"source": {"kind": "gmail", "externalID": "gmail:t1/m1", "label": "Sam Lee · Contract redlines"},
+           "from": "Sam Lee", "snippet": "Attached are the redlines.", "receivedAt": "2026-10-05T09:12:00Z", "trigger": "starred"},
+          {"source": {"kind": "gmail", "externalID": "gmail:t2/m2", "label": "Dana Whitfield · Intro"},
+           "from": "Dana Whitfield", "snippet": "Are you free?", "receivedAt": "2026-10-05T08:00:00Z", "trigger": "needsReply"},
+          {"source": {"kind": "slack", "externalID": "slack:C0LEAD/1791200000.000100", "label": "#leadership · Priya Shah"},
+           "from": "Priya Shah", "snippet": "Can you approve the Q4 budget?", "receivedAt": "2026-10-05T09:12:00Z", "trigger": "reaction"}]}
+        """#
+        let file = try Persistence.decoder.decode(IntegrationsFile.self, from: Data(before.utf8))
+        XCTAssertEqual(file.suggestions.map(\.isStarred), [true, false, false])
+        XCTAssertTrue(file.suggestions.allSatisfy { $0.starredInThread.isEmpty })
+        XCTAssertFalse(file.slackStarsStayInDocket)
+
+        // Stars come back as they were saved, unstarred ones too.
+        var saved = file
+        saved.suggestions[0].isStarred = false
+        saved.suggestions[2].isStarred = true
+        saved.suggestions[2].starredInThread = ["1791199000.000050"]
+        saved.slackStarsStayInDocket = true
+        let again = try Persistence.decoder.decode(IntegrationsFile.self, from: saved.encoded())
+        XCTAssertEqual(again.suggestions, saved.suggestions)
+        XCTAssertEqual(again.suggestions.map(\.isStarred), [false, false, true])
+        XCTAssertTrue(again.slackStarsStayInDocket)
+    }
+
+    // MARK: Gmail permissions
+
+    func testReplyingAndStarringFollowTheGmailPermissions() async throws {
+        let (integrations, _) = try make(gmailFile(canModify: true))
+        XCTAssertTrue(integrations.gmailCanCompose, "gmail.modify covers sending and drafts")
+        XCTAssertTrue(integrations.gmailCanModify)
+        integrations.grantedGmailScopes = [GoogleOAuth.gmailScope, GoogleOAuth.composeScope]
+        XCTAssertTrue(integrations.gmailCanCompose)
+        XCTAssertFalse(integrations.gmailCanModify, "a sign-in from before stars")
+        integrations.grantedGmailScopes = [GoogleOAuth.gmailScope]
+        XCTAssertFalse(integrations.gmailCanCompose)
+
+        XCTAssertTrue(Integrations.canReadMail(granted: ["openid", "email", GoogleOAuth.modifyScope]), "what Docket asks for now")
+        XCTAssertTrue(Integrations.canReadMail(granted: [GoogleOAuth.gmailScope]))
+        XCTAssertTrue(Integrations.canReadMail(granted: []), "Google didn't list them: what Docket asked for")
+        XCTAssertFalse(Integrations.canReadMail(granted: ["openid", "email", GoogleOAuth.composeScope]))
+
+        // A sign-in that turns out to allow more: Docket notes it.
+        let session = GoogleSession(client: GoogleOAuth.Client(id: "1234-test.apps.googleusercontent.com", secret: "test-client-secret"),
+                                    refreshToken: "1//test-refresh", transport: Sample.offline,
+                                    tokens: GoogleOAuth.Tokens(accessToken: "ya29.test", expiresAt: Date().addingTimeInterval(3600),
+                                                               refreshToken: nil, scopes: ["openid", GoogleOAuth.modifyScope]))
+        await integrations.noteGmailGrants(session)
+        XCTAssertTrue(integrations.gmailCanModify)
+        XCTAssertEqual(integrations.grantedGmailScopes, [GoogleOAuth.gmailScope, GoogleOAuth.modifyScope])
+
+        // Google turning a send down takes both away, so the views ask to reconnect.
+        let gmail = FakeMailInbox(full: Sample.fullEmail)
+        gmail.with { $0.sendError = IntegrationError.missingPermission(.gmail, "send replies and save drafts") }
+        let (other, _) = try make(gmailFile([Sample.email()], canModify: true), gmail: gmail)
+        do {
+            try await other.sendReply("Thanks", for: Sample.emailID, replyAll: false)
+            XCTFail("Google said no")
+        } catch {
+            XCTAssertEqual(error as? IntegrationError, Integrations.cantCompose)
+        }
+        XCTAssertFalse(other.gmailCanCompose)
+        XCTAssertFalse(other.gmailCanModify)
+    }
+
     // MARK: Words and ids
 
     func testIDsNamesAndToasts() {
@@ -1210,6 +2073,37 @@ final class InboxTests: XCTestCase {
         XCTAssertFalse(earlier.isEmpty)
         XCTAssertTrue(earlier.contains { $0.isMine })
         XCTAssertEqual(integrations.slackNames["U0DEMOSAM"], "Sam Lee", "people in the markup have names")
+
+        // Whole threads: a 6-message Slack thread with files in 2 messages, its item highlighted.
+        guard case .slack(let posts, let highlighted) = try await integrations.fullThread(for: threaded.id, reload: false) else {
+            return XCTFail("a Slack thread")
+        }
+        XCTAssertEqual(posts.count, 6)
+        XCTAssertEqual(posts.filter { !$0.files.isEmpty }.count, 2)
+        XCTAssertEqual(posts[highlighted].id, InboxIDs.slack(threaded.id)?.ts)
+        XCTAssertEqual(posts.first?.id, threaded.threadTS, "the thread's parent first")
+        XCTAssertTrue(posts.contains { $0.isMine })
+        XCTAssertTrue(integrations.isStarred(message: posts[0].id, in: threaded.id), "a message of the thread starred in Docket")
+        let deck = try XCTUnwrap(posts[0].files.first)
+        let deckFile = try await integrations.file(for: deck, messageID: threaded.id)
+        XCTAssertEqual(deckFile, document)
+
+        // A 4-message email conversation: one email from you, one with attachments, one starred.
+        var conversations: [InboxThread] = []
+        for s in email { conversations.append(try await integrations.fullThread(for: s.id, reload: false)) }
+        let emails = try XCTUnwrap(conversations.compactMap { thread -> [ThreadEmail]? in
+            guard case .email(let emails, _) = thread, emails.count == 4 else { return nil }
+            return emails
+        }.first)
+        XCTAssertTrue(emails.contains { $0.isMine })
+        XCTAssertTrue(emails.contains { !$0.content.attachments.isEmpty })
+        XCTAssertTrue(emails.contains { $0.isStarred })
+        XCTAssertTrue(slack.contains { $0.isStarred }, "a starred Slack item")
+        XCTAssertFalse(integrations.items(.gmail, starredOnly: true).isEmpty)
+        for s in all {
+            let thread = try await integrations.fullThread(for: s.id, reload: false)
+            XCTAssertEqual(thread.ownMessageID, InboxThread.bareMessageID(s.id), "every item's thread, its own message highlighted")
+        }
 
         // Without sample files, there are no attachments to show.
         let bare = Integrations(transport: Sample.offline, triage: .none, sleep: { _ in })

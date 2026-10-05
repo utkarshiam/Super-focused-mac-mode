@@ -40,9 +40,48 @@ enum MailHTML {
         """
 
     /// The page to load: the email with its inline images in place and its `<link>`s inert, after Docket's
-    /// own head. `inlineImages` maps Content-IDs (see `normalizedContentID`) to data: URLs.
-    static func document(_ html: String, inlineImages: [String: String] = [:]) -> String {
-        head + replacingContentIDs(in: inertLinks(html), with: inlineImages)
+    /// own head. `inlineImages` maps Content-IDs (see `normalizedContentID`) to data: URLs. `hidingQuotes`
+    /// leaves out the quoted history of earlier emails (shown again with the "…" toggle).
+    static func document(_ html: String, inlineImages: [String: String] = [:], hidingQuotes: Bool = false) -> String {
+        head + (hidingQuotes ? "<style>\(quoteHidingStyle)</style>" : "") + replacingContentIDs(in: inertLinks(html), with: inlineImages)
+    }
+
+    // MARK: Quoted history
+
+    /// Where mail apps put the earlier emails a reply quotes: Gmail, Yahoo, Thunderbird, Proton and Apple
+    /// Mail mark them; Outlook starts them after a marker, so everything after it goes.
+    static let quoteHidingStyle = ".gmail_quote, .gmail_quote_container, .x_gmail_quote, .yahoo_quoted, .moz-cite-prefix, "
+        + ".protonmail_quote, blockquote[type=\"cite\" i], #divRplyFwdMsg, #divRplyFwdMsg ~ *, #x_divRplyFwdMsg, "
+        + "#x_divRplyFwdMsg ~ *, #appendonsend ~ *, #x_appendonsend ~ * { display: none !important; }"
+
+    private static let quoteMarker = try! NSRegularExpression(
+        pattern: #"\bclass\s*+=\s*+["']?+[^"'>]{0,300}?\b(?:x_)?(?:gmail_quote|gmail_quote_container|yahoo_quoted|moz-cite-prefix|protonmail_quote)\b|<blockquote\b[^>]{0,500}?\btype\s*+=\s*+["']?+cite\b|\bid\s*+=\s*+["']?+(?:x_)?(?:divRplyFwdMsg|appendonsend)\b"#,
+        options: [.caseInsensitive])
+
+    /// Whether the email quotes earlier ones in a way `quoteHidingStyle` can hide, with words of its own
+    /// before the quote to read meanwhile (never an empty card). A forward isn't trimmed: what it forwards is
+    /// the point of it.
+    static func hasQuotedHistory(_ html: String) -> Bool {
+        guard !mentions(html, "forwarded message") else { return false }
+        let ns = html as NSString
+        guard let marker = quoteMarker.firstMatch(in: html, range: NSRange(location: 0, length: ns.length)) else { return false }
+        // The email up to the tag the quote starts in.
+        let before = ns.substring(to: marker.range.location)
+        let own = before.range(of: "<", options: .backwards).map { String(before[..<$0.lowerBound]) } ?? before
+        return !MailText.plainText(fromHTML: own).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// A plain-text email without the history it quotes ("On … wrote:", "> " lines), when it quotes any and
+    /// has words of its own; nil otherwise.
+    static func trimmedText(_ text: String) -> String? {
+        let trimmed = MailQuote.trimmed(text).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, words(trimmed) != words(text) else { return nil }
+        return trimmed
+    }
+
+    /// Letters and digits only: trimming tidies spacing and blank lines too, which isn't quoted history.
+    private static func words(_ text: String) -> String {
+        String(text.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) })
     }
 
     /// Whether there's anything in it but white space.
@@ -141,6 +180,8 @@ enum MailHTML {
 @MainActor
 final class MailHTMLFacts: ObservableObject {
     private var inline: (html: String, ids: Set<String>)?
+    private var quoted: (html: String, quotes: Bool)?
+    private var trimmed: (text: String, trimmed: String?)?
 
     /// The Content-IDs the HTML shows inline (`MailHTML.referencedContentIDs`).
     func inlineContentIDs(_ html: String) -> Set<String> {
@@ -148,6 +189,22 @@ final class MailHTMLFacts: ObservableObject {
         let ids = MailHTML.referencedContentIDs(in: html)
         inline = (html, ids)
         return ids
+    }
+
+    /// Whether the HTML quotes earlier emails that can be hidden (`MailHTML.hasQuotedHistory`).
+    func hasQuotedHistory(_ html: String) -> Bool {
+        if let quoted, quoted.html == html { return quoted.quotes }
+        let quotes = MailHTML.hasQuotedHistory(html)
+        quoted = (html, quotes)
+        return quotes
+    }
+
+    /// The text without the history it quotes, when it quotes any (`MailHTML.trimmedText`).
+    func trimmedText(_ text: String) -> String? {
+        if let trimmed, trimmed.text == text { return trimmed.trimmed }
+        let result = MailHTML.trimmedText(text)
+        trimmed = (text, result)
+        return result
     }
 }
 
@@ -203,6 +260,8 @@ struct MailBodyView: View {
     let paneHeight: CGFloat
     /// Shown instead of the card if WebKit can't block remote loads (it always can, but never risk it).
     let plainText: String
+    /// Leaves out the quoted history of earlier emails (`MailHTML.quoteHidingStyle`).
+    var hidesQuotes = false
 
     @State private var rules: WKContentRuleList?
     @State private var document: String?
@@ -211,6 +270,9 @@ struct MailBodyView: View {
     @State private var unavailable = false
     @State private var height: CGFloat?
     @State private var unmeasurable = false
+    /// The email the page on screen was made from: showing or hiding its quoted history keeps that page
+    /// (and its height) up until the new one is ready.
+    @State private var preparedHTML: String?
 
     /// Taller than this and the page scrolls inside the card instead.
     private static let tallest: CGFloat = 30_000
@@ -220,6 +282,7 @@ struct MailBodyView: View {
     private struct Key: Hashable {
         var html: String
         var parts: [String]
+        var hidesQuotes: Bool
     }
 
     var body: some View {
@@ -239,7 +302,7 @@ struct MailBodyView: View {
                 }
             }
         }
-        .task(id: Key(html: html, parts: inlineParts.map(\.id))) { await prepare() }
+        .task(id: Key(html: html, parts: inlineParts.map(\.id), hidesQuotes: hidesQuotes)) { await prepare() }
     }
 
     private var fallbackHeight: CGFloat { max(240, paneHeight * 0.7) }
@@ -283,10 +346,12 @@ struct MailBodyView: View {
     }
 
     private func prepare() async {
-        height = nil
-        unmeasurable = false
-        unavailable = false
-        document = nil
+        if preparedHTML != html {
+            height = nil
+            unmeasurable = false
+            unavailable = false
+            document = nil
+        }
         let html = html
         // A big email takes a moment to look through: off the main thread.
         let (referenced, remote) = await Task.detached(priority: .userInitiated) {
@@ -315,16 +380,18 @@ struct MailBodyView: View {
             if Task.isCancelled { return }
         }
         // Then in as data: URLs, the page put together off the main thread as well.
+        let hidesQuotes = hidesQuotes
         let page = await Task.detached(priority: .userInitiated) { [files] () -> String in
             var images: [String: String] = [:]
             for file in files {
                 guard let data = try? Data(contentsOf: file.url), data.count <= MailHTML.maxInlineBytes else { continue }
                 images[file.id] = MailHTML.dataURL(data, mimeType: file.mimeType)
             }
-            return MailHTML.document(html, inlineImages: images)
+            return MailHTML.document(html, inlineImages: images, hidingQuotes: hidesQuotes)
         }.value
         if Task.isCancelled { return }
         document = page
+        preparedHTML = html
     }
 }
 

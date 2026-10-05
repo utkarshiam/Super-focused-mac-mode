@@ -5,9 +5,9 @@ import Quartz
 import SwiftUI
 import UniformTypeIdentifiers
 
-// The Slack and Email tabs of "From Slack & Gmail": the message list and the message detail (header,
-// earlier messages, the complete message, attachments, notes, the suggested task and the reply).
-// `SuggestionsView` in IntegrationViews.swift stays the entry point.
+// The Slack and Email tabs of "From Slack & Gmail": the message list (All · Starred, ☆ and S) and the message
+// detail (header, the whole thread or conversation from ConversationViews.swift with each message's files,
+// notes, the suggested task and the reply). `SuggestionsView` in IntegrationViews.swift stays the entry point.
 
 // MARK: - Layout and words (pure, so they're easy to test)
 
@@ -41,6 +41,8 @@ enum InboxLayout {
 enum InboxItemText {
     static let filesScope = InboxScopes.slackFiles
     static var historyScopes: Set<String> { InboxScopes.slackHistory }
+    /// Saving starred messages for later in Slack (in `SlackManifest.contentScopes`).
+    static let starScopes: Set<String> = ["stars:read", "stars:write"]
 
     /// AI proposed a real task for it, not just the plain "Slack: …" / "Reply to Sam" stand-in.
     static func hasSuggestedTask(_ s: Suggestion) -> Bool {
@@ -90,44 +92,47 @@ enum InboxItemText {
         (s.content?.attachments ?? []).filter { !($0.contentID != nil && $0.isImage) }.count
     }
 
-    /// The banner when the Docket app in Slack was made before Docket showed files and threads.
+    /// What the Docket app in Slack can't do yet, for want of permissions it was made without: show files,
+    /// show threads, star messages in Slack. In that order.
+    private static func missingFeatures(_ missing: Set<String>) -> [String] {
+        var features: [String] = []
+        if missing.contains(filesScope) { features.append("files") }
+        if !missing.isDisjoint(with: historyScopes) { features.append("threads") }
+        if !missing.isDisjoint(with: starScopes) { features.append("stars") }
+        return features
+    }
+
+    /// The banner when the Docket app in Slack was made before Docket showed files and threads, or starred
+    /// messages in Slack: "Docket needs two more Slack permissions to show files and threads."
     static func slackPermissionBanner(missing: Set<String>) -> String? {
-        let files = missing.contains(filesScope)
-        let threads = !missing.isDisjoint(with: historyScopes)
-        switch (files, threads) {
-        case (true, true): return "Docket needs two more Slack permissions to show files and threads."
-        case (true, false): return "Docket needs one more Slack permission to show files."
-        case (false, true): return "Docket needs one more Slack permission to show threads."
-        case (false, false): return nil
-        }
+        let features = missingFeatures(missing)
+        guard !features.isEmpty else { return nil }
+        let count = ["one more Slack permission", "two more Slack permissions", "three more Slack permissions"][features.count - 1]
+        let shows = features.filter { $0 != "stars" }
+        var purposes: [String] = []
+        if !shows.isEmpty { purposes.append("show " + shows.joined(separator: " and ")) }
+        if features.contains("stars") { purposes.append("star messages in Slack") }
+        return "Docket needs \(count) to \(purposes.joined(separator: shows.count > 1 ? ", and to " : " and to "))."
     }
 
     /// What works differently until then (Connections).
     static func slackPermissionEffect(missing: Set<String>) -> String {
-        let files = missing.contains(filesScope)
-        let threads = !missing.isDisjoint(with: historyScopes)
-        switch (files, threads) {
-        case (true, false): return "Until then, files open in Slack. Everything else works."
-        case (false, true): return "Until then, threads stay hidden. Everything else works."
-        default: return "Until then, files open in Slack and threads stay hidden. Everything else works."
+        let effects = missingFeatures(missing).map { feature in
+            switch feature {
+            case "files": "files open in Slack"
+            case "threads": "threads stay hidden"
+            default: "stars stay in Docket"
+            }
         }
+        guard !effects.isEmpty else { return "Everything works." }
+        let list = effects.count > 2 ? effects.dropLast().joined(separator: ", ") + ", and " + (effects.last ?? "")
+            : effects.joined(separator: " and ")
+        return "Until then, \(list). Everything else works."
     }
 
     /// "Maya Chen, alex@acme.example": names where the address has one.
     static func people(_ entries: [String]) -> String {
         entries.map { MailSender(header: $0).displayName }.joined(separator: ", ")
-    }
-
-    /// "3 earlier messages".
-    static func earlierTitle(_ count: Int) -> String {
-        count == 1 ? "1 earlier message" : "\(count) earlier messages"
-    }
-
-    /// Who wrote the earlier messages, newest first, each once ("You" for your own), at most three.
-    static func earlierPeople(_ messages: [ThreadMessage]) -> String {
-        var seen = Set<String>()
-        let names = messages.reversed().map { $0.isMine ? "You" : $0.from }.filter { seen.insert($0).inserted }
-        return names.count > 3 ? names.prefix(3).joined(separator: ", ") + "…" : names.joined(separator: ", ")
     }
 }
 
@@ -199,27 +204,53 @@ enum AttachmentInfo {
 
 // MARK: - Selection and keys
 
-/// The open message in each tab, the narrow window's list-or-detail, and the arrow keys.
+/// The open message in each tab, the narrow window's list-or-detail, the Starred filter, and the keys.
 @MainActor
 final class InboxModel: ObservableObject {
     @Published var selected: [TaskSource.Kind: String] = [:]
     /// Narrow window: the open message shows in place of the list.
     @Published var showsDetail = false
+    /// The tabs showing only starred messages (remembered across launches, per tab).
+    @Published private(set) var starredOnly: Set<TaskSource.Kind>
     /// The tab on screen and whether the window is narrow, kept up to date by the panes.
     var kind: TaskSource.Kind = .slack
     var isNarrow = false
     private var monitor: Any?
+    private let defaults: UserDefaults
 
     /// Posted before acting on several messages at once (Add all), so notes still being typed are saved first.
     static let saveEditsNow = Notification.Name("DocketInboxSaveEditsNow")
+
+    /// "inboxStarredOnly.slack", "inboxStarredOnly.gmail".
+    static func starredOnlyKey(_ kind: TaskSource.Kind) -> String { "inboxStarredOnly." + kind.rawValue }
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        starredOnly = Set([TaskSource.Kind.slack, .gmail].filter { defaults.bool(forKey: Self.starredOnlyKey($0)) })
+    }
 
     func select(_ id: String?, in kind: TaskSource.Kind) {
         guard selected[kind] != id else { return }
         selected[kind] = id
     }
 
-    /// ↑/↓ move through the list, Return opens the message and Esc goes back (narrow window). Only when the
-    /// keyboard isn't in a text field, and only on this screen.
+    func isStarredOnly(_ kind: TaskSource.Kind) -> Bool { starredOnly.contains(kind) }
+
+    /// All · Starred for one tab.
+    func setStarredOnly(_ on: Bool, for kind: TaskSource.Kind) {
+        guard on != starredOnly.contains(kind) else { return }
+        if on { starredOnly.insert(kind) } else { starredOnly.remove(kind) }
+        defaults.set(on, forKey: Self.starredOnlyKey(kind))
+    }
+
+    /// The tab's messages as the list shows them: starred first, newest first; with the filter on, only
+    /// the starred ones. From `Integrations.shared` unless given others.
+    func items(_ kind: TaskSource.Kind, in integrations: Integrations? = nil) -> [Suggestion] {
+        (integrations ?? .shared).items(kind, starredOnly: isStarredOnly(kind))
+    }
+
+    /// ↑/↓ move through the list, Return opens the message, Esc goes back (narrow window) and S stars or
+    /// unstars it. Only when the keyboard isn't in a text field, and only on this screen.
     func startWatchingKeys(app: AppState) {
         guard monitor == nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self, weak app] event in
@@ -237,7 +268,13 @@ final class InboxModel: ObservableObject {
         guard let window = event.window, window === NSApp.docketMainWindow, window.attachedSheet == nil,
               !(window.firstResponder is NSText), !app.showPalette, app.selection == .suggestions,
               event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty else { return false }
-        let ids = Integrations.shared.items(kind).map(\.id)
+        let ids = items(kind).map(\.id)
+        if event.charactersIgnoringModifiers?.lowercased() == "s" {
+            // S: star or unstar the open message (once per press, however long it's held).
+            guard let id = selected[kind], ids.contains(id) else { return false }
+            if !event.isARepeat { InboxStarring.toggle(item: id) }
+            return true
+        }
         switch event.keyCode {
         case 125, 126: // down, up
             guard let next = InboxLayout.step(from: selected[kind], by: event.keyCode == 125 ? 1 : -1, in: ids) else { return false }
@@ -275,13 +312,20 @@ struct InboxPanes: View {
     @State private var shownIDs: [String] = []
 
     var body: some View {
-        let items = integrations.items(kind)
+        let items = model.items(kind, in: integrations)
         let ids = items.map(\.id)
+        let tabIsEmpty = items.isEmpty && !integrations.suggestions.contains { $0.source.kind == kind }
         GeometryReader { geo in
             let narrow = InboxLayout.isNarrow(geo.size.width)
             Group {
-                if items.isEmpty {
+                if tabIsEmpty {
                     emptyState
+                } else if items.isEmpty {
+                    // Starred only, and nothing starred.
+                    VStack(spacing: 0) {
+                        filterBar
+                        noStarred
+                    }
                 } else if narrow {
                     if model.showsDetail, let item = selectedItem(in: items) {
                         detail(item, paneHeight: geo.size.height, narrow: true)
@@ -346,10 +390,34 @@ struct InboxPanes: View {
     }
 
     private func list(_ items: [Suggestion]) -> some View {
-        InboxList(items: items, selectedID: model.selected[kind]) { id in
-            model.select(id, in: kind)
-            if model.isNarrow { withAnimation(Motion.snappy) { model.showsDetail = true } }
+        VStack(spacing: 0) {
+            filterBar
+            InboxList(items: items, selectedID: model.selected[kind]) { id in
+                model.select(id, in: kind)
+                if model.isNarrow { withAnimation(Motion.snappy) { model.showsDetail = true } }
+            }
         }
+        .background(Color.paper)
+    }
+
+    /// All · Starred, over the list.
+    private var filterBar: some View {
+        let starred = integrations.suggestions.lazy.filter { $0.source.kind == kind && $0.isStarred }.count
+        return InboxFilterBar(starredOnly: Binding(get: { model.isStarredOnly(kind) },
+                                                   set: { on in withAnimation(Motion.snappy) { model.setStarredOnly(on, for: kind) } }),
+                              starredCount: starred)
+    }
+
+    private var noStarred: some View {
+        VStack(spacing: Space.md) {
+            EmptyState(icon: "star", title: kind == .slack ? "No starred Slack messages" : "No starred emails",
+                       message: "Star a message with ☆, or press S, and it shows up here.")
+                .frame(maxHeight: 260)
+            Button("Show all") { withAnimation(Motion.snappy) { model.setStarredOnly(false, for: kind) } }
+                .buttonStyle(SecondaryPill(height: 32))
+                .help("Show every message in this tab")
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func detail(_ item: Suggestion, paneHeight: CGFloat, narrow: Bool) -> some View {
@@ -381,8 +449,10 @@ struct InboxPanes: View {
     }
 }
 
-/// A tab whose service isn't connected: what it's for, and the way in.
+/// A tab whose service isn't connected: what it's for, and the way in. For Gmail, what to do when Google
+/// says "Access blocked" (the sign-in page never comes back to Docket then).
 private struct InboxPitch: View {
+    @ObservedObject private var integrations = Integrations.shared
     let kind: TaskSource.Kind
     let saveEmoji: String
     let connect: () -> Void
@@ -399,19 +469,92 @@ private struct InboxPitch: View {
                 .foregroundStyle(Color.ink)
             Text(kind == .slack
                  ? "Messages you react to with \(SlackSaveEmoji.glyph(saveEmoji)), and the ones that @mention you, show up here with their files and threads, ready to answer or turn into tasks."
-                 : "Emails you star, and the ones waiting on your reply, show up here with their attachments, ready to answer or turn into tasks.")
+                 : "Emails you star, and the ones waiting on your reply, show up here with their whole conversation and attachments, ready to answer or turn into tasks.")
                 .textStyle(.callout)
                 .foregroundStyle(Color.ink2)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 380)
-            Button(kind == .slack ? "Connect Slack" : "Connect Gmail", action: connect)
-                .buttonStyle(PrimaryPill())
-                .help(kind == .slack ? "Set up Slack in Connections" : "Set up Gmail in Connections")
+            if kind == .gmail, integrations.isSigningInToGmail {
+                HStack(spacing: Space.sm) {
+                    ProgressView().controlSize(.small)
+                    Text("Waiting for you in the browser…")
+                        .textStyle(.callout)
+                        .foregroundStyle(Color.ink)
+                    Button("Cancel") { integrations.cancelGmailSignIn() }
+                        .buttonStyle(SecondaryPill(height: 30))
+                        .help("Stop waiting for the browser")
+                }
                 .padding(.top, Space.xs)
+            } else {
+                Button(kind == .slack ? "Connect Slack" : "Connect Gmail", action: connect)
+                    .buttonStyle(PrimaryPill())
+                    .help(kind == .slack ? "Set up Slack in Connections" : "Set up Gmail in Connections")
+                    .padding(.top, Space.xs)
+            }
+            if kind == .gmail {
+                GmailSignInHint(style: .centered)
+                    .frame(maxWidth: 380)
+                    .padding(.top, Space.sm)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(Space.x4)
         .enterUp()
+        .animation(Motion.base, value: integrations.isSigningInToGmail)
+    }
+}
+
+/// All · Starred over the list: two chips, the one in use filled.
+private struct InboxFilterBar: View {
+    @Binding var starredOnly: Bool
+    let starredCount: Int
+
+    var body: some View {
+        HStack(spacing: 6) {
+            FilterChip(title: "All", icon: nil, isOn: !starredOnly, help: "Show every message") { starredOnly = false }
+            FilterChip(title: starredCount > 0 ? "Starred (\(starredCount))" : "Starred", icon: "star", isOn: starredOnly,
+                       help: "Show only starred messages (star one with ☆ or S)") { starredOnly = true }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, Space.md)
+        .padding(.top, Space.md)
+        .padding(.bottom, Space.xxs)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct FilterChip: View {
+    let title: String
+    let icon: String?
+    let isOn: Bool
+    let help: String
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                if let icon {
+                    Image(systemName: isOn ? icon + ".fill" : icon)
+                        .font(.system(size: 10, weight: .bold))
+                }
+                Text(title)
+                    .lineLimit(1)
+            }
+            .font(.system(size: 12.5, weight: .semibold))
+            .monospacedDigit()
+            .foregroundStyle(isOn ? Color.ink : Color.ink2)
+            .padding(.horizontal, 11)
+            .frame(height: 26)
+            .background(Capsule().fill(isOn ? Color.fillStrong : (hovering ? Color.pressedTint : Color.clear)))
+            .overlay(Capsule().strokeBorder(isOn ? Color.clear : Color.hair, lineWidth: 1))
+            .contentShape(Capsule())
+            .fixedSize()
+        }
+        .buttonStyle(PressScale(scale: 0.95))
+        .onHover { h in withAnimation(Motion.fast) { hovering = h } }
+        .help(help)
+        .accessibilityAddTraits(isOn ? [.isButton, .isSelected] : .isButton)
     }
 }
 
@@ -430,7 +573,8 @@ private struct InboxList: View {
                 EnterUpWindow {
                     LazyVStack(alignment: .leading, spacing: 2) {
                         ForEach(Array(items.enumerated()), id: \.element.id) { i, item in
-                            InboxRow(item: item, isSelected: item.id == selectedID)
+                            InboxRow(item: item, isSelected: item.id == selectedID, starProblem: integrations.starProblem(for: item.id),
+                                     toggleStar: { InboxStarring.toggle(item: item.id) })
                                 .id(item.id)
                                 .onTapGesture {
                                     // Clicking a message puts the keyboard on the list (↑ / ↓), out of the notes or reply.
@@ -451,6 +595,10 @@ private struct InboxList: View {
             .onChange(of: selectedID) { id in
                 if let id { withAnimation(Motion.snappy) { proxy.scrollTo(id) } }
             }
+            .onChange(of: items.map(\.id)) { _ in
+                // Starring moves a message to the top: the open one stays in view.
+                if let selectedID { withAnimation(Motion.snappy) { proxy.scrollTo(selectedID) } }
+            }
             .onAppear {
                 if let selectedID { proxy.scrollTo(selectedID) }
             }
@@ -460,6 +608,8 @@ private struct InboxList: View {
 
     @ViewBuilder
     private func menu(for item: Suggestion) -> some View {
+        Button(item.isStarred ? "Unstar" : "Star") { InboxStarring.toggle(item: item.id) }
+        Divider()
         Button("Add Task") {
             NotificationCenter.default.post(name: InboxModel.saveEditsNow, object: nil)
             // As it is now, with the notes just saved (this row's copy can be a keystroke behind).
@@ -474,11 +624,20 @@ private struct InboxList: View {
     }
 }
 
-/// One message in the list: who, where (or the subject), two lines of it, when, and small chips.
+/// One message in the list: who, where (or the subject), two lines of it, when, its star, and small chips.
 private struct InboxRow: View {
     let item: Suggestion
     let isSelected: Bool
+    /// Why its star didn't take, if it didn't.
+    let starProblem: String?
+    let toggleStar: () -> Void
     @State private var hovering = false
+
+    /// Slack previews show their formatting and emoji the way the message does, not raw *markup*.
+    private var snippetText: Text {
+        guard item.source.kind == .slack else { return Text(item.snippet) }
+        return Text(SlackText.attributed(item.snippet, names: Integrations.shared.slackNames))
+    }
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: Radius.md, style: .continuous)
@@ -496,13 +655,14 @@ private struct InboxRow: View {
                     .foregroundStyle(Color.ink3)
                     .lineLimit(1)
                     .fixedSize()
+                star
             }
             Text(InboxItemText.context(of: item))
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(Color.ink)
                 .lineLimit(1)
             if !item.snippet.isEmpty {
-                Text(item.snippet)
+                snippetText
                     .font(.system(size: 12.5))
                     .foregroundStyle(Color.ink2)
                     .lineLimit(2)
@@ -519,6 +679,27 @@ private struct InboxRow: View {
         .onHover { h in withAnimation(Motion.fast) { hovering = h } }
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+        .accessibilityValue(item.isStarred ? "Starred" : "")
+        .accessibilityAction(named: item.isStarred ? "Unstar" : "Star", toggleStar)
+    }
+
+    /// ★ when starred; ☆ while the pointer is over the row or it's open. A warning next to it when the last
+    /// change didn't take (the tooltip says why; clicking the star tries again).
+    private var star: some View {
+        let shown = item.isStarred || hovering || isSelected || starProblem != nil
+        return HStack(spacing: 2) {
+            if let starProblem {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(Color.warning)
+                    .help(starProblem)
+                    .accessibilityLabel(starProblem)
+            }
+            StarButton(isOn: item.isStarred, size: 20, iconSize: 11, help: item.isStarred ? "Unstar (S)" : "Star (S)", action: toggleStar)
+                .frame(height: 16)
+                .opacity(shown ? 1 : 0)
+                .allowsHitTesting(shown)
+        }
     }
 
     @ViewBuilder
@@ -547,16 +728,18 @@ private struct InboxRow: View {
 
 // MARK: - The message
 
-/// The open message: who and when, earlier messages, the whole message and its files, then your notes,
-/// the suggested task and your reply. Notes and the reply are saved as you type (once typing pauses).
+/// The open message: who and when, its whole thread or conversation (the message highlighted in it, every
+/// message with its files), then your notes, the suggested task and your reply. Notes and the reply are saved
+/// as you type (once typing pauses).
 struct InboxDetail: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var app: AppState
     @ObservedObject private var integrations = Integrations.shared
-    @AppStorage(InboxDetail.plainTextKey) private var plainText = false
     @AppStorage(Prefs.Key.slackSaveEmoji) private var saveEmoji = SlackSaveEmoji.standard
 
     static let plainTextKey = "inboxMailPlainText"
+    /// The reply composer's scroll id: a message's Reply brings it into view.
+    private static let composerID = "inbox-reply-composer"
 
     let item: Suggestion
     let paneHeight: CGFloat
@@ -576,7 +759,7 @@ struct InboxDetail: View {
     @State private var noteSave: Task<Void, Never>?
     @State private var replySave: Task<Void, Never>?
     @StateObject private var quickLook = QuickLookController()
-    @StateObject private var htmlFacts = MailHTMLFacts()
+    @StateObject private var conversation: ConversationModel
     @FocusState private var noteFocused: Bool
 
     /// How long typing has to pause before notes or the reply are saved.
@@ -592,33 +775,41 @@ struct InboxDetail: View {
         _savedNote = State(initialValue: item.note)
         _reply = State(initialValue: item.replyDraft)
         _savedReply = State(initialValue: item.replyDraft)
+        // One per open message (the panes give each message its own detail).
+        _conversation = StateObject(wrappedValue: ConversationModel(itemID: item.id))
     }
 
     private var content: MessageContent? { item.content ?? loaded }
     private var isEmail: Bool { item.source.kind == .gmail }
-    private var hasHTML: Bool { content?.html.map(MailHTML.hasContent) ?? false }
-    private var showsHTML: Bool { isEmail && !plainText && hasHTML }
-    /// Gmail needs the compose permission; Slack only needs to be connected.
+    /// Gmail needs a sign-in that allows sending; Slack only needs to be connected.
     private var canSend: Bool { isEmail ? integrations.gmailCanCompose : integrations.isSlackConnected }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: Space.xl) {
-                header
-                ThreadSection(item: item, updateSlack: updateSlack)
-                message
-                attachments
-                Rectangle().fill(Color.hair).frame(height: 1)
-                notes
-                SuggestedTaskSection(item: item, leads: !ReplyText.sendLeads(reply, canSend: canSend), saveEdits: flush)
-                ReplyComposer(item: item, text: $reply, content: content, canSend: canSend, flush: flush,
-                              reconnectGmail: { integrations.connectGmail() })
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: Space.xl) {
+                    header
+                    ConversationSection(conversation: conversation, item: item, content: content, contentLoading: loading,
+                                        contentProblem: loadProblem, retryContent: { Task { await load() } },
+                                        quickLook: quickLook, paneHeight: paneHeight, updateSlack: updateSlack,
+                                        reveal: { id in withAnimation(Motion.gentle) { proxy.scrollTo(id, anchor: .top) } })
+                    Rectangle().fill(Color.hair).frame(height: 1)
+                    notes
+                    SuggestedTaskSection(item: item, leads: !ReplyText.sendLeads(reply, canSend: canSend), saveEdits: flush)
+                    ReplyComposer(item: item, text: $reply, content: content, canSend: canSend, conversation: conversation,
+                                  flush: flush, reconnectGmail: { integrations.connectGmail() })
+                        .id(Self.composerID)
+                }
+                .frame(maxWidth: InboxLayout.readingWidth, alignment: .leading)
+                .padding(.horizontal, Space.xl)
+                .padding(.top, Space.lg)
+                .padding(.bottom, Space.x6)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxWidth: InboxLayout.readingWidth, alignment: .leading)
-            .padding(.horizontal, Space.xl)
-            .padding(.top, Space.lg)
-            .padding(.bottom, Space.x6)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .onChange(of: conversation.composerRequests) { _ in
+                // A message's Reply: the composer comes into view, pointed at that message.
+                withAnimation(Motion.gentle) { proxy.scrollTo(Self.composerID, anchor: .bottom) }
+            }
         }
         .background(Color.paper)
         .background(QuickLookAnchor(controller: quickLook).frame(width: 0, height: 0))
@@ -659,21 +850,41 @@ struct InboxDetail: View {
                 }
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                if item.source.url?.scheme == "https" {
-                    Button { integrations.open(item) } label: {
-                        Label(SourceStyle.openTitle(item.source.kind), systemImage: "arrow.up.right")
+                HStack(spacing: Space.sm) {
+                    StarButton(isOn: item.isStarred, size: 30, iconSize: 13, filled: true,
+                               help: item.isStarred ? "Unstar (S)" : "Star (S)") { InboxStarring.toggle(item: item.id) }
+                    if item.source.url?.scheme == "https" {
+                        Button { integrations.open(item) } label: {
+                            Label(SourceStyle.openTitle(item.source.kind), systemImage: "arrow.up.right")
+                        }
+                        .buttonStyle(SecondaryPill(height: 30))
+                        .help(isEmail ? "See the conversation in Gmail" : "See the message in Slack")
                     }
-                    .buttonStyle(SecondaryPill(height: 30))
-                    .help(isEmail ? "See the conversation in Gmail" : "See the message in Slack")
                 }
             }
-            if isEmail, let content, !(content.to.isEmpty && content.cc.isEmpty) {
-                VStack(alignment: .leading, spacing: 2) {
-                    if !content.to.isEmpty { recipients("To", content.to) }
-                    if !content.cc.isEmpty { recipients("Cc", content.cc) }
-                }
+            if let problem = integrations.starProblem(for: item.id) {
+                starProblem(problem)
             }
         }
+        .animation(Motion.base, value: integrations.starProblem(for: item.id))
+    }
+
+    /// The star didn't take in Gmail or Slack (it went back): why, and the way to try again.
+    private func starProblem(_ text: String) -> some View {
+        HStack(alignment: .center, spacing: Space.sm) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.warning)
+            Text(text)
+                .textStyle(.footnote)
+                .foregroundStyle(Color.ink2)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: Space.sm)
+            Button("Try again") { InboxStarring.toggle(item: item.id) }
+                .buttonStyle(SecondaryPill(height: 26))
+                .help(item.isStarred ? "Unstar it again" : "Star it again")
+        }
+        .transition(.opacity)
     }
 
     /// The date and time stay whole: in a narrow pane, why it's here goes on a line of its own.
@@ -705,97 +916,6 @@ struct InboxDetail: View {
         case .starred?: "Starred"
         case .needsReply?: "Waiting on your reply"
         case nil: nil
-        }
-    }
-
-    private func recipients(_ label: String, _ entries: [String]) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
-            Text(label)
-                .font(.system(size: 11.5, weight: .semibold))
-                .foregroundStyle(Color.ink3)
-                .frame(width: 20, alignment: .leading)
-            Text(InboxItemText.people(entries))
-                .textStyle(.caption)
-                .foregroundStyle(Color.ink2)
-                .lineLimit(1)
-                .truncationMode(.tail)
-        }
-        .help(entries.joined(separator: ", "))
-    }
-
-    // MARK: The complete message
-
-    @ViewBuilder
-    private var message: some View {
-        if let content {
-            VStack(alignment: .leading, spacing: Space.sm) {
-                if isEmail, hasHTML {
-                    HStack {
-                        Spacer()
-                        Button { withAnimation(Motion.base) { plainText.toggle() } } label: {
-                            Label("Plain text", systemImage: plainText ? "checkmark" : "text.alignleft")
-                        }
-                        .buttonStyle(SecondaryPill(height: 26))
-                        .help(plainText ? "Show emails formatted again" : "Show emails as plain text")
-                    }
-                }
-                messageBody(content)
-            }
-        } else {
-            VStack(alignment: .leading, spacing: Space.md) {
-                LinkedTextView(text: item.snippet, color: .ink2)
-                if loading {
-                    HStack(spacing: Space.sm) {
-                        ProgressView().controlSize(.small)
-                        Text("Loading the whole message…").textStyle(.footnote).foregroundStyle(Color.ink2)
-                    }
-                } else if let loadProblem, !DebugSnapshot.isActive {
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(Color.warning)
-                        Text("Showing the preview. \(loadProblem)")
-                            .textStyle(.footnote)
-                            .foregroundStyle(Color.ink2)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Spacer(minLength: Space.sm)
-                        Button("Retry") { Task { await load() } }
-                            .buttonStyle(SecondaryPill(height: 26))
-                            .help("Try loading the whole message again")
-                    }
-                }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func messageBody(_ content: MessageContent) -> some View {
-        let text = content.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? item.snippet : content.text
-        // The text views are `.equatable()`: typing in the notes or the reply redraws this detail, and a long
-        // message shouldn't be laid out again for every keystroke.
-        if item.source.kind == .slack, let markup = content.markup, !markup.isEmpty {
-            SlackMessageText(markup: markup, names: integrations.slackNames)
-                .equatable()
-        } else if showsHTML, let html = content.html {
-            MailBodyView(html: html, inlineParts: content.attachments.filter { $0.contentID != nil },
-                         fetch: { part in try await integrations.file(for: part, messageID: item.id) },
-                         paneHeight: paneHeight, plainText: text)
-        } else {
-            LinkedTextView(text: text)
-                .equatable()
-        }
-    }
-
-    @ViewBuilder
-    private var attachments: some View {
-        if let content {
-            let inline = showsHTML ? content.html.map(htmlFacts.inlineContentIDs) : nil
-            let files = InboxItemText.listedAttachments(content, showsHTML: showsHTML, inline: inline)
-            if !files.isEmpty {
-                AttachmentsSection(item: item, attachments: files, quickLook: quickLook,
-                                   filesBlocked: item.source.kind == .slack && integrations.missingSlackScopes.contains(InboxItemText.filesScope),
-                                   updateSlack: updateSlack)
-            }
         }
     }
 
@@ -870,13 +990,14 @@ struct InboxDetail: View {
 }
 
 /// A Slack message as Slack shows it: bold, italics, code, links, people and channels by name.
-private struct SlackMessageText: View, Equatable {
+struct SlackMessageText: View, Equatable {
     let markup: String
     let names: [String: String]
+    var size: CGFloat = 15
 
     var body: some View {
         Text(SlackText.attributed(markup, names: names))
-            .font(.system(size: 15))
+            .font(.system(size: size))
             .foregroundStyle(Color.bodyText)
             .lineSpacing(3)
             .tint(Color.ink)
@@ -887,193 +1008,23 @@ private struct SlackMessageText: View, Equatable {
     }
 }
 
-// MARK: - Earlier messages
-
-/// "3 earlier messages", collapsed until clicked. Loaded once the message has been open a moment, so
-/// arrowing past messages doesn't fetch each one's thread.
-private struct ThreadSection: View {
-    @ObservedObject private var integrations = Integrations.shared
-    let item: Suggestion
-    let updateSlack: () -> Void
-
-    private enum LoadState: Equatable {
-        case waiting
-        case loading
-        case loaded([ThreadMessage])
-        case failed(String)
-    }
-
-    @State private var state: LoadState = .waiting
-    @State private var expanded = false
-
-    private var isSlackReply: Bool { InboxItemText.isThreadReply(item) }
-    /// A Slack reply whose thread Docket isn't allowed to read yet.
-    private var needsPermission: Bool {
-        isSlackReply && !integrations.missingSlackScopes.isDisjoint(with: InboxItemText.historyScopes)
-    }
-
-    var body: some View {
-        Group {
-            switch state {
-            case .loaded(let messages) where !messages.isEmpty:
-                disclosure(messages)
-            case .loaded:
-                if needsPermission { permissionRow }
-            case .waiting, .loading:
-                if isSlackReply { loadingRow }
-            case .failed(let message):
-                failureRow(message)
-            }
-        }
-        .animation(Motion.base, value: state)
-        .task(id: item.id) { await load(after: 250_000_000) }
-    }
-
-    private func disclosure(_ messages: [ThreadMessage]) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Button { withAnimation(Motion.snappy) { expanded.toggle() } } label: {
-                HStack(spacing: Space.sm) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(Color.ink2)
-                        .rotationEffect(.degrees(expanded ? 90 : 0))
-                        .frame(width: 12)
-                    Text(InboxItemText.earlierTitle(messages.count))
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(Color.ink)
-                    Text(InboxItemText.earlierPeople(messages))
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(Color.ink3)
-                        .lineLimit(1)
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, Space.md)
-                .frame(height: 38)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help(expanded ? "Hide the earlier messages" : "Show the earlier messages in this \(item.source.kind == .gmail ? "conversation" : "thread")")
-            if expanded {
-                VStack(alignment: .leading, spacing: Space.md) {
-                    ForEach(messages) { m in ThreadMessageRow(message: m) }
-                }
-                .padding(.horizontal, Space.md)
-                .padding(.top, Space.xs)
-                .padding(.bottom, Space.md)
-                .transition(.opacity)
-            }
-        }
-        .hairlineCard(radius: Radius.md)
-    }
-
-    private var loadingRow: some View {
-        HStack(spacing: Space.sm) {
-            ProgressView().controlSize(.small)
-            Text("Earlier in this thread…")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(Color.ink2)
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, Space.md)
-        .frame(height: 38)
-        .hairlineCard(radius: Radius.md)
-    }
-
-    private var permissionRow: some View {
-        HStack(alignment: .center, spacing: Space.sm) {
-            Image(systemName: "lock")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Color.ink3)
-            Text("This is a reply in a thread. Showing the thread needs one more Slack permission.")
-                .textStyle(.footnote)
-                .foregroundStyle(Color.ink2)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: Space.sm)
-            Button("Update the app", action: updateSlack)
-                .buttonStyle(SecondaryPill(height: 26))
-                .help("Create the Docket app in Slack again with the new permissions")
-        }
-        .padding(.horizontal, Space.md)
-        .padding(.vertical, 8)
-        .hairlineCard(radius: Radius.md)
-    }
-
-    private func failureRow(_ message: String) -> some View {
-        HStack(alignment: .center, spacing: Space.sm) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Color.warning)
-            Text("Couldn't load the earlier messages. \(message)")
-                .textStyle(.footnote)
-                .foregroundStyle(Color.ink2)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: Space.sm)
-            Button("Retry") { Task { await load(after: 0) } }
-                .buttonStyle(SecondaryPill(height: 26))
-                .help("Try loading them again")
-        }
-        .padding(.horizontal, Space.md)
-        .padding(.vertical, 8)
-        .hairlineCard(radius: Radius.md)
-    }
-
-    private func load(after delay: UInt64) async {
-        if delay > 0 {
-            try? await Task.sleep(nanoseconds: delay)
-            guard !Task.isCancelled else { return }
-        }
-        state = .loading
-        do {
-            let messages = try await integrations.thread(for: item.id)
-            guard !Task.isCancelled else { return }
-            state = .loaded(messages)
-        } catch is CancellationError {
-            // Closed before it arrived.
-        } catch {
-            guard !Task.isCancelled else { return }
-            state = .failed(IntegrationError.wrap(error, item.source.kind == .gmail ? .gmail : .slack).errorDescription ?? "")
-        }
-    }
-}
-
-private struct ThreadMessageRow: View {
-    let message: ThreadMessage
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(message.isMine ? "You" : message.from)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Color.ink)
-                    .lineLimit(1)
-                Text(Fmt.dateTime(message.date))
-                    .font(.system(size: 11.5, weight: .medium))
-                    .monospacedDigit()
-                    .foregroundStyle(Color.ink3)
-                    .lineLimit(1)
-            }
-            LinkedTextView(text: message.text, size: 13.5)
-        }
-        .padding(.leading, Space.md)
-        .overlay(alignment: .leading) {
-            Capsule().fill(message.isMine ? Color.ink3 : Color.hairStrong).frame(width: 2)
-        }
-    }
-}
-
 // MARK: - Attachments
 
 /// Images as a grid of thumbnails, other files as chips. A click downloads the file once (it's kept in
-/// IntegrationCache/) and shows it in Quick Look; files are never run.
-private struct AttachmentsSection: View {
+/// IntegrationCache/, under the inbox item's id) and shows it in Quick Look; files are never run. Used for
+/// each message of a thread.
+struct AttachmentsSection: View {
     @EnvironmentObject var app: AppState
     @ObservedObject private var integrations = Integrations.shared
+    /// The inbox item the message belongs to: its files are kept under its id, and it's what opens in
+    /// Slack or Gmail when a file can't be downloaded here.
     let item: Suggestion
     let attachments: [MessageAttachment]
     let quickLook: QuickLookController
-    /// Slack without files:read: the names only; they open in Slack.
+    /// Slack without files:read: the names only; they open in Slack (the conversation says why, once).
     let filesBlocked: Bool
-    let updateSlack: () -> Void
+    /// "Attachments 2" over them (an email); a Slack message shows its files right under its text.
+    var showsTitle = true
     @StateObject private var files = AttachmentFiles()
 
     var body: some View {
@@ -1081,12 +1032,14 @@ private struct AttachmentsSection: View {
         let imageIDs = Set(images.map(\.id))
         let others = attachments.filter { !imageIDs.contains($0.id) }
         VStack(alignment: .leading, spacing: Space.sm) {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Eyebrow(text: "Attachments")
-                Text("\(attachments.count)")
-                    .font(.system(size: 11, weight: .semibold))
-                    .monospacedDigit()
-                    .foregroundStyle(Color.ink3)
+            if showsTitle {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Eyebrow(text: "Attachments")
+                    Text("\(attachments.count)")
+                        .font(.system(size: 11, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(Color.ink3)
+                }
             }
             if !images.isEmpty {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 104, maximum: 180), spacing: Space.sm)], alignment: .leading, spacing: Space.sm) {
@@ -1104,18 +1057,6 @@ private struct AttachmentsSection: View {
                                  service: item.source.kind == .gmail ? "Gmail" : "Slack") { preview(a, among: []) }
                             .contextMenu { menu(for: a) }
                     }
-                }
-            }
-            if filesBlocked {
-                HStack(alignment: .center, spacing: Space.sm) {
-                    Text("Files open in Slack until the Docket app there has one more permission.")
-                        .textStyle(.footnote)
-                        .foregroundStyle(Color.ink3)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: Space.sm)
-                    Button("Update the app", action: updateSlack)
-                        .buttonStyle(SecondaryPill(height: 26))
-                        .help("Create the Docket app in Slack again with the new permissions")
                 }
             }
         }

@@ -270,6 +270,53 @@ final class AIReplyTests: XCTestCase {
         """))
     }
 
+    func testTheMessageBeingAnsweredIsNamedAtTheEnd() async throws {
+        let thread = [
+            ThreadMessage(id: "a", from: "Sam Lee", date: at(day: 4, hour: 8), text: "Board prep is on Wednesday right now.", isMine: false),
+            ThreadMessage(id: "b", from: "Dana Fox", date: at(day: 4, hour: 10), text: "Thursday works for me.\nAttached: agenda.pdf", isMine: false),
+            ThreadMessage(id: "c", from: "Alex Kim", date: at(day: 4, hour: 11), text: "I'll book the room.", isMine: true),
+        ]
+        fake.answer(#"{"reply": "Thursday it is, Dana."}"#)
+        let reply = try await makeService().draftReply(to: slackMessage, content: nil, thread: thread, notes: "thu ok", tone: .brief,
+                                                       instruction: nil, myName: "Alex Kim", replyingTo: thread[1], now: now)
+        XCTAssertEqual(reply, "Thursday it is, Dana.")
+
+        // The whole thread for context, the message the user opened in its place, and the one to answer at the end.
+        let input = try userText(of: XCTUnwrap(fake.requests.first))
+        XCTAssertTrue(input.contains("The Slack message the user opened (#leadership · Priya):\nFrom: Priya Raman"), input)
+        XCTAssertFalse(input.contains("The Slack message to reply to"))
+        XCTAssertTrue(input.contains("Later in the thread, after the message:\n\nDana Fox · Sun 2026-10-04 10:00:"))
+        XCTAssertTrue(input.hasSuffix("""
+        The message to reply to:
+
+        Dana Fox · Sun 2026-10-04 10:00:
+        Thursday works for me.
+        Attached: agenda.pdf
+
+        Write the user's reply to that message, in the Slack thread.
+        """), input)
+        let system = try systemText(of: XCTUnwrap(fake.requests.first))
+        XCTAssertTrue(system.contains("The reply answers one particular message of the thread, shown again at the end of the conversation under \"The message to reply to\". Answer that message, written to the person who sent it"))
+
+        // An email of the user's own: marked as theirs, so the reply follows it up.
+        fake.answer(#"{"reply": "Hi Sam,\n\nJust following up.\n\nBest,\nAlex"}"#)
+        let own = ThreadMessage(id: "m0", from: "Alex Kim", date: at(day: 2, hour: 9), text: "Here are the Q3 numbers.", isMine: true)
+        _ = try await makeService().draftReply(to: email, content: nil, thread: [own], notes: "", tone: .friendly, instruction: nil,
+                                               myName: "Alex Kim", replyingTo: own, now: now)
+        let mail = try userText(of: XCTUnwrap(fake.requests.last))
+        XCTAssertTrue(mail.contains("The email the user opened:\nFrom: Sam Lee <sam@northwind.example>"), mail)
+        XCTAssertTrue(mail.hasSuffix("The message to reply to:\n\nAlex Kim (you) · Fri 2026-10-02 09:00:\nHere are the Q3 numbers.\n\nWrite the user's reply to that email."), mail)
+
+        // Without one, the message opened is the one to answer, as always.
+        fake.answer(#"{"reply": "Works for me."}"#)
+        _ = try await draft(slackMessage, thread: thread)
+        let plain = try userText(of: XCTUnwrap(fake.requests.last))
+        XCTAssertTrue(plain.contains("The Slack message to reply to (#leadership · Priya):"))
+        XCTAssertFalse(plain.contains("The message to reply to:"))
+        XCTAssertTrue(plain.hasSuffix("Write the user's reply to the Slack message."))
+        XCTAssertFalse(try systemText(of: XCTUnwrap(fake.requests.last)).contains("one particular message"))
+    }
+
     func testLongMessagesNotesAndThreadsAreCutToSize() async throws {
         // 40 messages of 1,000 characters a minute apart, one far too long, and one after the message.
         var thread = (0..<40).map { i in

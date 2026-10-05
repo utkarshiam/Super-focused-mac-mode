@@ -131,11 +131,11 @@ struct GmailClient: Sendable {
 
     /// One call as the user: a GET, or a POST with a JSON body. Retries once with a fresh access token on
     /// 401 (Gmail did nothing then); anything else that isn't 2xx becomes an `IntegrationError`.
-    /// `permission` and `action` word the errors for what the call was for. `repeatable`: doing it twice
-    /// does no harm (a star), so a connection lost on the way is only a network problem.
+    /// `permission` and `action` word the errors for what the call was for; `refusal` words those of Gmail's
+    /// answers it has words of its own for (nil: as `error(status:…)` does).
     private func perform(_ path: String, query: [(String, String)] = [], json: Data? = nil,
                          permission: String = GmailClient.readPermission, action: String? = nil,
-                         repeatable: Bool = false) async throws -> Data {
+                         refusal: (_ status: Int, _ data: Data) -> IntegrationError? = { _, _ in nil }) async throws -> Data {
         guard var components = URLComponents(url: Self.api.appendingPathComponent(path), resolvingAgainstBaseURL: false) else {
             throw IntegrationError.unexpected(.gmail, "a bad address")
         }
@@ -159,7 +159,7 @@ struct GmailClient: Sendable {
             } catch {
                 // A send that timed out or lost its connection may have gone through all the same: say so,
                 // rather than invite a second copy.
-                if let action, !repeatable, IntegrationHTTP.mayHaveArrived(error) {
+                if let action, IntegrationHTTP.mayHaveArrived(error) {
                     throw IntegrationError.api(.gmail, "Gmail didn't answer in time, so Docket can't tell if it managed to \(action). Check Gmail before trying again.")
                 }
                 throw IntegrationError.wrap(error, .gmail)
@@ -169,7 +169,8 @@ struct GmailClient: Sendable {
                 continue
             }
             guard (200..<300).contains(response.statusCode) else {
-                throw Self.error(status: response.statusCode, data: data, permission: permission, action: action)
+                throw refusal(response.statusCode, data)
+                    ?? Self.error(status: response.statusCode, data: data, permission: permission, action: action)
             }
             return data
         }
@@ -344,7 +345,8 @@ extension GmailClient {
         let binned = { (m: FullMessageReply) in !Set(m.labelIds ?? []).isDisjoint(with: ["TRASH", "SPAM"]) }
         let shown = written.allSatisfy(binned) ? written : written.filter { !binned($0) }
         // Gmail lists a conversation oldest first; sorted by date to be sure, keeping its order for ties. A
-        // message without a date keeps its place, with the date of the one before it.
+        // message without a date keeps its place: it takes the date of the one before it (or, first in the
+        // conversation, of the first one that has a date).
         let known = shown.map(date(of:))
         var previous = known.lazy.compactMap { $0 }.first ?? now
         let dated = zip(shown, known).map { message, date -> (message: FullMessageReply, date: Date) in
@@ -498,21 +500,23 @@ extension GmailClient {
 
 extension GmailClient {
     /// The whole conversation (threads/<id>?format=full): every message, oldest first, each with its own body,
-    /// attachments and reply headers, as `fullMessage` reads them. The user's own are `isMine`, starred ones
-    /// `isStarred`. Drafts aren't part of it, and neither are messages in Trash or Spam unless the whole
-    /// conversation is there. Empty when nothing in it is left to show.
+    /// attachments and reply headers, as `fullMessage` reads them. `from` is the sender as a From header
+    /// ("Sam Lee <sam@northwind.example>", read back with `MailSender(header:)`); the user's own messages are
+    /// `isMine`, starred ones `isStarred`. Drafts aren't part of it, and neither are messages in Trash or Spam
+    /// unless the whole conversation is there. Empty when nothing in it is left to show.
     func conversationMessages(threadID: String, myAddress: String) async throws -> [ThreadEmail] {
         guard Self.isGmailID(threadID) else { throw IntegrationError.unexpected(.gmail, "a bad conversation id") }
         let reply = try await get("threads/\(threadID)", query: [("format", "full")], as: ThreadReply.self)
-        var messages = Self.readable(reply.messages ?? []).compactMap { entry -> ConversationEntry? in
-            guard let id = entry.message.id, let payload = entry.message.payload else { return nil }
-            return ConversationEntry(id: id, reply: entry.message, root: MIMEPart(gmail: payload), date: entry.date)
+        var entries = Self.readable(reply.messages ?? []).compactMap { m, date -> ConversationEntry? in
+            guard let id = m.id, let payload = m.payload else { return nil }
+            return ConversationEntry(id: id, labels: m.labelIds ?? [], snippet: m.snippet ?? "", root: MIMEPart(gmail: payload), date: date)
         }
-        // Bodies too long to come with the conversation are fetched like attachments, a few at a time.
-        let detached = Array(messages.indices.flatMap { index in
-            Self.detachedBodies(in: messages[index].root).prefix(Self.detachedBodiesPerMessage).compactMap { path in
-                messages[index].root[path: path].attachmentID.map {
-                    DetachedBody(entry: index, messageID: messages[index].id, path: path, attachmentID: $0)
+        // Bodies too long to come with the conversation are fetched like attachments, a few at a time; the
+        // newest messages' first, as those are the ones shown open.
+        let detached = Array(entries.indices.reversed().flatMap { index in
+            Self.detachedBodies(in: entries[index].root).prefix(Self.detachedBodiesPerMessage).compactMap { path in
+                entries[index].root[path: path].attachmentID.map {
+                    DetachedBody(entry: index, messageID: entries[index].id, path: path, attachmentID: $0)
                 }
             }
         }.prefix(Self.detachedBodiesPerConversation))
@@ -525,14 +529,14 @@ extension GmailClient {
         }
         for (body, result) in zip(detached, bodies) {
             switch result {
-            case .success(let data): messages[body.entry].root[path: body.path].body = data
+            case .success(let data): entries[body.entry].root[path: body.path].body = data
             // Gone since it was listed: the message shows what came with it.
             case .failure(.unexpected): continue
             case .failure(let error): throw error
             }
         }
         let fetchedAt = Date()
-        return messages.map { Self.threadEmail($0, myAddress: myAddress, fetchedAt: fetchedAt) }
+        return entries.map { Self.threadEmail($0, myAddress: myAddress, fetchedAt: fetchedAt) }
     }
 
     /// At most this many bodies Gmail sent apart are fetched for a whole conversation.
@@ -544,38 +548,61 @@ extension GmailClient {
     private static func threadEmail(_ entry: ConversationEntry, myAddress: String, fetchedAt: Date) -> ThreadEmail {
         let body = MailBody(entry.root)
         let sender = MailSender(header: entry.root.header("From") ?? "")
-        let labels = entry.reply.labelIds ?? []
-        let gmailSnippet = MailText.snippet(entry.reply.snippet ?? "")
+        let gmailSnippet = MailText.snippet(entry.snippet)
         var content = messageContent(entry.root, body: body, messageID: entry.id, fetchedAt: fetchedAt)
         // Nothing readable came (its body is gone): Gmail's snippet stands in.
         if content.html == nil, content.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { content.text = gmailSnippet }
-        // Collapsed, a message reads as the start of what it adds: no quoted history.
-        let words = SlackText.collapsed(newText(of: body))
-        let line = !words.isEmpty ? SlackText.firstLine(words, limit: longestSnippet) : !gmailSnippet.isEmpty ? gmailSnippet : attachedLine(body)
-        return ThreadEmail(id: entry.id, from: sender.displayName, date: entry.date, content: content,
+        // Collapsed, a message reads as the start of what it adds, without quoted history; else as Gmail's
+        // snippet, or what was attached.
+        let words = SlackText.firstLine(SlackText.collapsed(newText(of: body)), limit: longestSnippet)
+        let line = [words, gmailSnippet, attachedLine(body)].first { !$0.isEmpty } ?? ""
+        return ThreadEmail(id: entry.id, from: sender.headerForm, date: entry.date, content: content,
                            replyHeaders: MailReplyHeaders(original: entry.root.headers),
-                           isMine: isMine(labels: labels, sender: sender, myAddress: myAddress),
-                           isStarred: labels.contains(starredLabel), snippet: line)
+                           isMine: isMine(labels: entry.labels, sender: sender, myAddress: myAddress),
+                           isStarred: entry.labels.contains(starredLabel), snippet: line)
     }
 
     /// Gmail's label for a starred message.
     static let starredLabel = "STARRED"
 
     /// Stars or unstars a message: Gmail's STARRED label (messages/<id>/modify; needs gmail.modify). No other
-    /// label changes. Doing it twice does no harm, so it's safe to try again whatever happened.
+    /// label changes. Unstarring an email deleted for good counts as done (nothing in Gmail is starred);
+    /// starring one throws `emailGone`. Doing it twice does no harm, so a connection lost on the way is only
+    /// a network problem, never "check whether it went through".
     func setStarred(_ starred: Bool, messageID: String) async throws {
         guard Self.isGmailID(messageID) else { throw IntegrationError.unexpected(.gmail, "a bad message id") }
         let change = starred ? LabelChange(addLabelIds: [Self.starredLabel]) : LabelChange(removeLabelIds: [Self.starredLabel])
-        _ = try await perform("messages/\(messageID)/modify", json: JSONEncoder().encode(change), permission: Self.starPermission,
-                              action: starred ? "star the email" : "unstar the email", repeatable: true)
+        do {
+            _ = try await perform("messages/\(messageID)/modify", json: JSONEncoder().encode(change), permission: Self.starPermission,
+                                  refusal: Self.starRefusal)
+        } catch let error as IntegrationError where error == Self.emailGone && !starred {
+            // Nothing left in Gmail to unstar.
+        }
+    }
+
+    /// The email was deleted for good: Gmail doesn't know its id any more.
+    static let emailGone = IntegrationError.api(.gmail, "That email isn't in Gmail any more.")
+
+    /// Gmail turning a star down, in words that follow the inbox's own "Couldn't star it in Gmail."
+    /// (`InboxStarRules.problem`): the email gone, Gmail asking Docket to slow down, or what Gmail said about
+    /// the request. Nil for the rest, which read as for any call (a missing permission names `starPermission`).
+    static func starRefusal(status: Int, data: Data) -> IntegrationError? {
+        let usual = error(status: status, data: data, permission: starPermission)
+        if case .rateLimited = usual { return .api(.gmail, "Gmail asked Docket to slow down. Try again in a minute.") }
+        if status == 404 { return emailGone }
+        guard case .unexpected = usual, (400..<500).contains(status),
+              let detail = (try? JSONDecoder().decode(ErrorReply.self, from: data))?.error?.message?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !detail.isEmpty else { return nil }
+        return .api(.gmail, "Gmail said “\(detail.prefix(160))”.")
     }
 }
 
-/// A message of a conversation being read: its parts (with the bodies Gmail sent apart, once fetched) and
-/// when it was sent.
+/// A message of a conversation being read: its labels and Gmail's snippet, its parts (with the bodies Gmail
+/// sent apart, once fetched), and when it was sent.
 private struct ConversationEntry {
     var id: String
-    var reply: FullMessageReply
+    var labels: [String]
+    var snippet: String
     var root: MIMEPart
     var date: Date
 }

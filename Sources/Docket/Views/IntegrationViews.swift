@@ -102,7 +102,8 @@ struct SuggestionsView: View {
                 .help("Check Slack and Gmail now")
             }
             Menu {
-                let items = integrations.items(tab)
+                // What the list shows: with Starred on, the starred ones.
+                let items = inbox.items(tab, in: integrations)
                 Button(items.count >= 2 ? "Add All \(items.count) as Tasks" : "Add All as Tasks") { addAll(items) }
                     .disabled(items.count < 2)
                 Divider()
@@ -128,7 +129,8 @@ private struct InboxBanners: View {
     var body: some View {
         let problems = self.problems
         let permissions = kind == .slack ? InboxItemText.slackPermissionBanner(missing: integrations.missingSlackScopes) : nil
-        let reconnect = kind == .gmail && integrations.isGmailConnected && !integrations.gmailCanCompose
+        // Starring needs gmail.modify (it covers replying too): sign-ins from before Docket asked for it don't have it.
+        let reconnect = kind == .gmail && integrations.isGmailConnected && !integrations.gmailCanModify
         VStack(alignment: .leading, spacing: Space.sm) {
             ForEach(problems, id: \.self) { ProblemLine(text: $0) }
             if let permissions {
@@ -139,8 +141,8 @@ private struct InboxBanners: View {
                 }
             }
             if reconnect {
-                BannerLine(icon: "paperplane",
-                           text: integrations.isSigningInToGmail ? "Finish signing in to Google in your browser." : "Reconnect Gmail to reply from Docket.") {
+                BannerLine(icon: "star",
+                           text: integrations.isSigningInToGmail ? "Finish signing in to Google in your browser." : "Reconnect Gmail to star and reply from Docket.") {
                     if integrations.isSigningInToGmail {
                         ProgressView().controlSize(.small)
                         Button("Cancel") { integrations.cancelGmailSignIn() }
@@ -149,15 +151,17 @@ private struct InboxBanners: View {
                     } else {
                         Button("Reconnect") { integrations.connectGmail() }
                             .buttonStyle(SecondaryPill(height: 28))
-                            .help("Sign in to Google again and allow Docket to send your replies and save drafts")
+                            .help("Sign in to Google again and allow Docket to star emails, send your replies and save drafts")
                     }
                 }
+                if integrations.isSigningInToGmail { GmailSignInHint() }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, Space.gutter)
         .padding(.bottom, problems.isEmpty && permissions == nil && !reconnect ? 0 : Space.md)
         .animation(Motion.base, value: problems)
+        .animation(Motion.base, value: integrations.isSigningInToGmail)
     }
 
     /// This tab's service, then AI; each once (they're also the ForEach ids).
@@ -166,6 +170,55 @@ private struct InboxBanners: View {
             : [integrations.gmailProblem, integrations.aiProblem]
         var seen = Set<String>()
         return list.compactMap { $0 }.filter { seen.insert($0).inserted }
+    }
+}
+
+/// While Docket waits for the Google sign-in in the browser. When the address isn't a test user of the OAuth
+/// app (External, in testing), Google says "Access blocked" on its own page and never comes back to Docket:
+/// what to do about it, and the way to Google Cloud's Audience page.
+struct GmailSignInHint: View {
+    static let question = "Seeing “Access blocked”?"
+    static let answer = "Add your Google address under Test users in Google Cloud (Google Auth Platform → Audience), then try again."
+    static var text: String { question + " " + answer }
+    static let audienceURL = URL(string: "https://console.cloud.google.com/auth/audience")!
+
+    /// A line under a banner; centred under a pitch; a row of a settings card.
+    enum Style { case line, centered, settingsRow }
+    var style: Style = .line
+
+    var body: some View {
+        switch style {
+        case .line:
+            HStack(alignment: .center, spacing: Space.sm) {
+                Image(systemName: "questionmark.circle")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.ink2)
+                Text(Self.text)
+                    .textStyle(.footnote)
+                    .foregroundStyle(Color.ink2)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: Space.sm)
+                link(height: 28)
+            }
+            .transition(.opacity)
+        case .centered:
+            VStack(spacing: Space.sm) {
+                Text(Self.text)
+                    .textStyle(.footnote)
+                    .foregroundStyle(Color.ink3)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                link(height: 28)
+            }
+        case .settingsRow:
+            SettingsRow(title: Self.question, subtitle: Self.answer) { link(height: 30) }
+        }
+    }
+
+    private func link(height: CGFloat) -> some View {
+        Button { NSWorkspace.shared.open(Self.audienceURL) } label: { Label("Open Audience", systemImage: "arrow.up.right") }
+            .buttonStyle(SecondaryPill(height: height))
+            .help("Opens Google Auth Platform → Audience in Google Cloud, where you add test users")
     }
 }
 
@@ -449,22 +502,29 @@ private struct GmailConnection: View {
     @State private var changingClient = false
 
     /// What Docket does with Gmail, in so many words.
-    static let promise = "Docket reads your mail and only sends or saves a draft when you click Send or Save draft. It never deletes or archives anything."
+    static let promise = "Docket reads your mail, stars what you star, and sends or saves a draft only when you click Send or Save draft. It never deletes or archives anything."
+
+    /// What the sign-in allows: everything (the promise), or what reconnecting adds. Sign-ins from before
+    /// Docket starred emails can't star; ones from before it replied can't send either.
+    private var connectedSubtitle: String {
+        if integrations.gmailCanModify { return Self.promise }
+        if integrations.gmailCanCompose { return "Docket can read your mail and send your replies. Reconnect to star emails from Docket too." }
+        return "Docket can read your mail. Reconnect to star and reply from Docket too."
+    }
 
     var body: some View {
         let client = integrations.googleClient
         SettingsSection(title: "Gmail", footer: footer(configured: client != nil)) {
             if let issue = integrations.gmailProblem { IssueRow(text: issue) }
             if let email = integrations.gmailAddress, integrations.isGmailConnected {
-                SettingsRow(title: "Connected as \(email)",
-                            subtitle: integrations.gmailCanCompose ? Self.promise : "Docket can read your mail. Reconnect to reply from Docket too.") {
+                SettingsRow(title: "Connected as \(email)", subtitle: connectedSubtitle) {
                     Button("Disconnect") { withAnimation(Motion.base) { integrations.disconnectGmail() } }
                         .buttonStyle(SecondaryPill(height: 30))
                         .help("Sign Docket out of Gmail")
                 }
-                if !integrations.gmailCanCompose {
+                if !integrations.gmailCanModify {
                     if integrations.isSigningInToGmail {
-                        SettingsRow(title: "Waiting for you in the browser…", subtitle: "Sign in with Google and allow Docket to send your replies.") {
+                        SettingsRow(title: "Waiting for you in the browser…", subtitle: "Sign in with Google and allow Docket to star emails and send your replies.") {
                             HStack(spacing: Space.sm) {
                                 ProgressView().controlSize(.small)
                                 Button("Cancel") { integrations.cancelGmailSignIn() }
@@ -472,15 +532,17 @@ private struct GmailConnection: View {
                                     .help("Stop waiting for the browser")
                             }
                         }
+                        GmailSignInHint(style: .settingsRow)
                     } else {
-                        SettingsRow(title: "Reconnect Gmail to reply from Docket", subtitle: Self.promise) {
+                        SettingsRow(title: "Reconnect Gmail to star and reply from Docket", subtitle: Self.promise) {
                             Button("Reconnect") { integrations.connectGmail() }
                                 .buttonStyle(SecondaryPill(height: 30))
-                                .help("Sign in to Google again and allow Docket to send your replies and save drafts")
+                                .help("Sign in to Google again and allow Docket to star emails, send your replies and save drafts")
                         }
                     }
                 }
-                SettingsRow(title: "Starred emails", subtitle: "Emails you star (last 30 days) show up in From Slack & Gmail.") {
+                SettingsRow(title: "Starred emails",
+                            subtitle: "Emails you star (last 30 days) show up in From Slack & Gmail. Starring one in Docket stars it in Gmail too.") {
                     Badge(text: "On", tone: .neutral, icon: "star")
                 }
                 ToggleRow(title: "Needs a reply",
@@ -490,7 +552,8 @@ private struct GmailConnection: View {
                     .help("Suggest tasks from unread, important email")
             } else if let client, !changingClient {
                 if integrations.isSigningInToGmail {
-                    SettingsRow(title: "Waiting for you in the browser…", subtitle: "Sign in with Google and allow Docket to read your mail and send your replies.") {
+                    SettingsRow(title: "Waiting for you in the browser…",
+                                subtitle: "Sign in with Google and allow Docket to read your mail, star emails and send your replies.") {
                         HStack(spacing: Space.sm) {
                             ProgressView().controlSize(.small)
                             Button("Cancel") { integrations.cancelGmailSignIn() }
@@ -498,6 +561,7 @@ private struct GmailConnection: View {
                                 .help("Stop waiting for the browser")
                         }
                     }
+                    GmailSignInHint(style: .settingsRow)
                 } else {
                     SettingsRow(title: "Connect Gmail", subtitle: "Sign in with Google in your browser. " + Self.promise) {
                         if isNextStep {

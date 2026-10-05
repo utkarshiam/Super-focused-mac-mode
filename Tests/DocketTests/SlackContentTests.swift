@@ -2,9 +2,9 @@ import SwiftUI
 import XCTest
 @testable import Docket
 
-// The complete Slack message without the network: files, the rest of a thread, replying in it, downloads,
-// and Slack's mrkdwn as rich text. A fake server answers from canned JSON (made-up workspace Acme Test;
-// people Maya Chen, Priya Shah, Sam Lee).
+// The complete Slack message without the network: files, the rest of a thread and the whole of it, replying
+// in it, saving messages for later (stars), downloads, and Slack's mrkdwn as rich text. A fake server answers
+// from canned JSON (made-up workspace Acme Test; people Maya Chen, Priya Shah, Sam Lee, Dana Whitfield).
 
 private enum SlackFixture {
     static let token = "xoxp-1111-2222-3333-test"
@@ -663,6 +663,100 @@ final class SlackWholeThreadTests: XCTestCase {
         XCTAssertTrue(server.calls("users.info").isEmpty)
     }
 
+    func testReplyingToAnyMessageOfTheThreadStaysInTheThread() async throws {
+        let server = FakeIntegrationServer()
+        server.slack("conversations.replies", T.replies)
+        server.slack("chat.postMessage", #"{"ok":true,"channel":"C0LEAD","ts":"1791200700.000800"}"#)
+        let client = slack(server)
+        let names = ["U0PRIYA": "Priya Shah", "U0MAYA": "Maya Chen", "U0SAM": "Sam Lee", "U0DANA": "Dana Whitfield"]
+        let thread = try await client.fullThread(channel: T.channel, threadTS: T.parent, myUserID: SlackFixture.me, names: names, around: T.open)
+        // Answering Sam's reply (not the parent): the reply goes under the thread's parent, never under a reply.
+        let sams = try XCTUnwrap(thread.first { $0.id == "1791200600.000700" })
+        XCTAssertEqual(sams.from, "Sam Lee")
+        try await client.reply(channel: T.channel, threadTS: try XCTUnwrap(thread.first?.id), text: "Thanks, Sam")
+        let form = FakeIntegrationServer.form(try XCTUnwrap(server.calls("chat.postMessage").first))
+        XCTAssertEqual(form["thread_ts"], T.parent)
+        XCTAssertEqual(form["channel"], T.channel)
+        XCTAssertEqual(form["text"], "Thanks, Sam")
+    }
+
+    func testTheParentLeadsItsThreadEvenDeletedOrEmpty() async throws {
+        let server = FakeIntegrationServer()
+        server.slack("conversations.replies", #"""
+        {"ok":true,"messages":[
+          {"type":"message","subtype":"tombstone","ts":"1791200000.000100","user":"USLACKBOT","text":"This message was deleted.","hidden":true,
+           "thread_ts":"1791200000.000100","reply_count":2},
+          {"type":"message","ts":"1791200100.000200","user":"U0SAM","text":"Thursday works","thread_ts":"1791200000.000100","user_profile":{"real_name":"Sam Lee"}},
+          {"type":"message","ts":"1791200200.000300","user":"U0PRIYA","text":"","thread_ts":"1791200000.000100","user_profile":{"real_name":"Priya Shah"}}
+        ],"has_more":false}
+        """#, #"""
+        {"ok":true,"messages":[
+          {"type":"message","subtype":"huddle_thread","ts":"1791200000.000100","user":"U0PRIYA","text":"","thread_ts":"1791200000.000100",
+           "user_profile":{"real_name":"Priya Shah"}},
+          {"type":"message","ts":"1791200100.000200","user":"U0SAM","text":"Notes from the call are in the doc","thread_ts":"1791200000.000100",
+           "user_profile":{"real_name":"Sam Lee"}}
+        ],"has_more":false}
+        """#)
+        server.slack("users.info", where: ("user", "USLACKBOT"), SlackFixture.user("USLACKBOT", "Slackbot"))
+        let deleted = try await slack(server).fullThread(channel: T.channel, threadTS: T.parent, myUserID: SlackFixture.me)
+        XCTAssertEqual(deleted.map(\.id), [T.parent, "1791200100.000200"], "the parent first, as in Slack; an empty reply left out")
+        XCTAssertEqual(deleted.map(\.text), ["This message was deleted.", "Thursday works"])
+        XCTAssertEqual(deleted.first?.from, "Slackbot")
+
+        let empty = try await slack(server).fullThread(channel: T.channel, threadTS: T.parent, myUserID: SlackFixture.me)
+        XCTAssertEqual(empty.map(\.id), [T.parent, "1791200100.000200"])
+        XCTAssertEqual(empty.map(\.text), ["", "Notes from the call are in the doc"])
+        XCTAssertEqual(empty.first?.from, "Priya Shah")
+    }
+
+    func testAskedForAReplyItReadsTheParentsThread() async throws {
+        let server = FakeIntegrationServer()
+        // Asked with a reply's ts, Slack sends just that reply.
+        server.slack("conversations.replies", where: ("ts", T.open), #"""
+        {"ok":true,"messages":[{"type":"message","ts":"1791200500.000600","user":"U0PRIYA","text":"<@U0MAYA> can you check Sam's numbers?","thread_ts":"1791200000.000100"}],
+         "has_more":false}
+        """#)
+        server.slack("conversations.replies", where: ("ts", T.parent), T.replies)
+        let names = ["U0PRIYA": "Priya Shah", "U0MAYA": "Maya Chen", "U0SAM": "Sam Lee", "U0DANA": "Dana Whitfield"]
+        let thread = try await slack(server).fullThread(channel: T.channel, threadTS: T.open, myUserID: SlackFixture.me, names: names, around: nil)
+        XCTAssertEqual(thread.count, 8)
+        XCTAssertEqual(thread.first?.id, T.parent)
+        XCTAssertEqual(SlackClient.index(of: T.open, in: thread), 6)
+        XCTAssertEqual(server.calls("conversations.replies").map { FakeIntegrationServer.form($0)["ts"] }, [T.open, T.parent])
+
+        // The parent, or a message that's alone, is read once.
+        _ = try await slack(server).fullThread(channel: T.channel, threadTS: T.parent, myUserID: SlackFixture.me, names: names, around: T.open)
+        XCTAssertEqual(server.calls("conversations.replies").count, 3)
+        let alone = FakeIntegrationServer()
+        alone.slack("conversations.replies", #"{"ok":true,"messages":[{"ts":"1791200500.000600","user":"U0PRIYA","text":"Lunch?"}],"has_more":false}"#)
+        let one = try await slack(alone).fullThread(channel: "D0PRIYA", threadTS: T.open, myUserID: SlackFixture.me, names: names, around: T.open)
+        XCTAssertEqual(one.map(\.text), ["Lunch?"])
+        XCTAssertEqual(alone.calls("conversations.replies").count, 1)
+    }
+
+    func testAReplyAskedForStaysInTheWholeThreadSlackSends() async throws {
+        // Asked with a reply's ts, Slack may send the whole thread at once. The reply is the one being looked
+        // at: it stays in with nothing to show of it, as the message to keep when there's no `around`.
+        let server = FakeIntegrationServer()
+        server.slack("conversations.replies", T.replies)
+        let empty = "1791200450.000550"
+        let names = ["U0PRIYA": "Priya Shah", "U0MAYA": "Maya Chen", "U0SAM": "Sam Lee", "U0DANA": "Dana Whitfield"]
+        let thread = try await slack(server).fullThread(channel: T.channel, threadTS: empty, myUserID: SlackFixture.me, names: names, around: nil)
+        XCTAssertEqual(thread.count, 9)
+        XCTAssertEqual(thread.first?.id, T.parent)
+        let i = try XCTUnwrap(SlackClient.index(of: empty, in: thread))
+        XCTAssertEqual(thread[i].from, "Sam Lee")
+        XCTAssertEqual(server.calls("conversations.replies").count, 1, "the whole thread came at once")
+
+        // A very long one is shown around that reply, not just its newest messages.
+        let long = FakeIntegrationServer()
+        long.slack("conversations.replies", T.page(0..<200, next: "p2"), T.page(200..<400, next: "p3"), T.page(400..<600, next: "p4"),
+                   T.page(600..<700, next: nil))
+        let around = try await slack(long).fullThread(channel: T.channel, threadTS: T.ts(300), myUserID: SlackFixture.me)
+        XCTAssertEqual(around.map(\.id), [T.ts(0)] + (51...549).map(T.ts))
+        XCTAssertEqual(SlackClient.index(of: T.ts(300), in: around), 250)
+    }
+
     func testTheWholeThreadIsReadPageByPageEachMessageOnce() async throws {
         let server = FakeIntegrationServer()
         server.slack("conversations.replies", T.page(0..<3, next: "page2"), T.page(3..<5, next: "page3"), T.page(5..<6, next: nil))
@@ -839,29 +933,43 @@ final class SlackStarTests: XCTestCase {
             #"{"ok":false,"error":"not_allowed"}"#,
             #"{"ok":false,"error":"missing_scope","needed":"stars:write","provided":"reactions:read,search:read,users:read"}"#,
             #"{"ok":false,"error":"not_allowed_token_type"}"#,
+            #"{"ok":false,"error":"missing_scope"}"#,
+            #"{"ok":false,"error":"missing_scope","needed":"stars:read, stars:write"}"#,
+            #"{"ok":false,"error":"missing_scope","needed":"chat:write"}"#,
         ])
         server.slack("stars.remove", replies: [#"{"ok":false,"error":"method_deprecated"}"#, #"{"ok":false,"error":"missing_scope","needed":"stars:write"}"#])
         let client = slack(server)
-        for _ in 0..<4 {
+        // The methods retired or not allowed: nothing to do about it. An app made without stars:write: update it.
+        let starring: [IntegrationError] = [
+            SlackClient.starsRefused(starring: true), SlackClient.starsRefused(starring: true), .missingPermission(.slack, "stars:write"),
+            SlackClient.starsRefused(starring: true), .missingPermission(.slack, "stars:write"), .missingPermission(.slack, "stars:read, stars:write"),
+            .missingPermission(.slack, "stars:write"),
+        ]
+        for want in starring {
             do {
                 try await client.setStarred(true, channel: "C0LEAD", ts: WholeThread.open)
                 XCTFail("Slack didn't save it")
             } catch {
-                XCTAssertEqual(error as? IntegrationError, SlackClient.starsRefused(starring: true))
-                XCTAssertTrue(SlackClient.isStarRefusal(error))
+                XCTAssertEqual(error as? IntegrationError, want)
+                XCTAssertTrue(SlackClient.isStarRefusal(error), "\(want): the star stays in Docket")
             }
         }
-        for _ in 0..<2 {
+        for want in [SlackClient.starsRefused(starring: false), .missingPermission(.slack, "stars:write")] {
             do {
                 try await client.setStarred(false, channel: "C0LEAD", ts: WholeThread.open)
                 XCTFail("Slack didn't change it")
             } catch {
-                XCTAssertEqual(error as? IntegrationError, SlackClient.starsRefused(starring: false))
+                XCTAssertEqual(error as? IntegrationError, want)
                 XCTAssertTrue(SlackClient.isStarRefusal(error))
             }
         }
         XCTAssertEqual(SlackClient.starsRefused(starring: true).errorDescription, "Saved in Docket only (Slack didn't allow saving it there)")
         XCTAssertEqual(SlackClient.starsRefused(starring: false).errorDescription, "Unstarred in Docket only (Slack didn't allow changing it there)")
+        // Other permissions, or Gmail's, aren't about saving for later.
+        XCTAssertFalse(SlackClient.isStarRefusal(IntegrationError.missingPermission(.slack, "channels:history")))
+        XCTAssertFalse(SlackClient.isStarRefusal(IntegrationError.missingPermission(.slack, "stars:write,chat:write")))
+        XCTAssertFalse(SlackClient.isStarRefusal(IntegrationError.missingPermission(.slack, "")))
+        XCTAssertFalse(SlackClient.isStarRefusal(IntegrationError.missingPermission(.gmail, "stars:write")))
     }
 
     func testOtherStarFailuresAreNotRefusals() async throws {

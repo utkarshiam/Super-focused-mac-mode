@@ -163,7 +163,9 @@ extension NoteTemplate {
         Delegated something? Put a name in **Waiting on** and it shows up under **Waiting**. Tasks that keep slipping get a gentle nudge: do it, delegate it, or drop it.
 
         ## Slack and Gmail
-        Connect them in **Settings → Connections**. React with 📌 to a Slack message or star an email in Gmail, and Docket suggests a task for it under **From Slack & Gmail**. Messages that @mention you and emails waiting on a reply show up there too. Focus sessions can set your Slack status, and you can share your plan to a channel.
+        Connect them in **Settings → Connections**. React with 📌 to a Slack message or star an email in Gmail, and it shows up under **From Slack & Gmail**, in a Slack tab and an Email tab, with a suggested task. Messages that @mention you and emails waiting on a reply show up there too.
+
+        Open one to read the whole thread or conversation with its images and files, star it, and add your notes. Then reply right there: write it yourself or click **Draft with AI**, and send it in the Slack thread or the email conversation (Docket always asks first). Focus sessions can set your Slack status, and you can share your plan to a channel.
 
         ## Alarms vs reminders
         - A **reminder** is a normal macOS notification with Complete / Snooze buttons.

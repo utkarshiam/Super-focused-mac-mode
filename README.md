@@ -32,7 +32,7 @@ Most to-do apps are built for planning. Docket is built for the day you're actua
 - **Typing is the interface.** `Board prep fri 3pm 90m !!! #work @alarm15` sets the deadline, the estimate, the priority, the list and a loud alarm in one line. Prefer clicking? Pick the date, time and list from the menus under the field.
 - **Alarms that actually stop you.** Reminders are normal notifications. Alarms ring in a window that floats above everything, full-screen apps included, until you deal with them.
 - **AI that plans, not chats.** Write what's on your mind and get real tasks back: dates resolved, durations estimated, big work split into steps. Nothing is added until you say so.
-- **Your inbox and Slack, triaged.** React with 📌 in Slack or star an email, and Docket suggests the task.
+- **Slack and email, handled in one place.** React with 📌 in Slack or star an email, and Docket suggests the task. Read the whole thread with its files, add notes, and send a reply (yours, or drafted by AI) without leaving the app.
 - **Yours.** Everything lives in one JSON file on your Mac. No account, no server, no tracking.
 
 ## Tour
@@ -78,12 +78,21 @@ Press **⌘J**, write a brain dump, and review the tasks Docket proposes: titles
   <img src="docs/images/search.png" alt="Search results for 'board' across tasks and notes" width="80%">
 </p>
 
-### From Slack and Gmail
+### Slack and email, without leaving Docket
 
-Connect Slack and Gmail in **Settings → Connections**. Messages you react to with 📌, messages that @mention you, starred emails and emails waiting on your reply become suggested tasks. Add them in one click, edit them first, or dismiss them. Focus sessions can set your Slack status, and you can share your plan to a channel.
+Connect Slack and Gmail in **Settings → Connections**, and the messages that matter land in two tabs: messages you react to with 📌 and ones that @mention you, starred emails, and emails waiting on your reply.
+
+- **Read everything.** Open a message to see all of it: the whole Slack thread or email conversation, formatted text, images and files (Quick Look or save). Emails render in a locked-down view: no scripts, no remote images, no tracking pixels.
+- **Star it.** Stars sync with Gmail, and with Slack's *Save for later*.
+- **Add notes.** Jot what to do or what to say; the notes come along if you turn the message into a task.
+- **Reply.** Write it yourself or let AI draft it from the thread and your notes (Brief, Friendly or Formal), then send it in the Slack thread or the email conversation, or save a Gmail draft. Docket always asks before anything is sent.
+- **Turn it into a task** with one click; each message comes with a suggested one.
+
+Focus sessions can set your Slack status, and you can share your plan to a channel.
 
 <p align="center">
-  <img src="docs/images/slack-gmail.png" alt="Suggested tasks from Slack and Gmail" width="80%">
+  <img src="docs/images/slack-gmail.png" alt="The Slack tab: a message with its file, notes, a suggested task and the reply composer" width="80%">
+  <img src="docs/images/email.png" alt="The Email tab: a whole email conversation with attachments, in dark mode" width="80%">
 </p>
 
 ### Delegation and slipping work
@@ -127,7 +136,7 @@ The first launch includes a **Welcome to Docket** note with a cheat sheet, and a
 2. Paste it into **Settings → AI**. It's stored in your macOS keychain and never shown again.
 3. Press **⌘J** and write something like *"board meeting thursday 10am, deck by wednesday, dry run with Sam before that"*.
 
-The default model is `gemini-3.5-flash`; you can change it in the same place. Only the text you send to an AI feature (plus your list and tag names) leaves your Mac. With Slack or Gmail connected, new messages are sent too, so Docket can tell which ones need a task.
+The default model is `gemini-3.5-flash`; you can change it in the same place. Only the text you send to an AI feature (plus your list and tag names) leaves your Mac. With Slack or Gmail connected, new messages are sent too, so Docket can tell which ones need a task, and **Draft with AI** sends the message, its thread and your notes for that message.
 
 ## Connect Slack (optional)
 
@@ -137,7 +146,9 @@ Docket talks to Slack through a small Slack app of your own, so messages go stra
 2. On the app's page, click **Install to Workspace** and allow it.
 3. Copy the **User OAuth Token** (it starts with `xoxp-`), paste it into Docket and click **Connect**.
 
-It asks for these user scopes: `reactions:read`, `search:read`, `users:read` (who sent what), `users.profile:write` and `dnd:write` (focus status), `chat:write` (sharing your plan), and `channels:read`, `groups:read`, `im:read`, `mpim:read` (the channel picker).
+It asks for these user scopes: `reactions:read` and `search:read` (finding messages), `users:read` (who sent what), `files:read` (attachments), `channels:history`, `groups:history`, `im:history` and `mpim:history` (whole threads), `stars:read` and `stars:write` (starring), `chat:write` (replies and sharing your plan), `users.profile:write` and `dnd:write` (focus status), and `channels:read`, `groups:read`, `im:read`, `mpim:read` (the channel picker). Each person in a workspace connects their own app, and nothing is shared between them.
+
+Connected with an older version? Docket shows **Update the app** in the Slack tab: create the app again (one click), install it, paste the new token, and delete the old app.
 
 ## Connect Gmail (optional)
 
@@ -145,11 +156,11 @@ Gmail uses Google sign-in in your browser, which needs an OAuth client ID from G
 
 1. Create a Google Cloud project.
 2. Turn on the **Gmail API**.
-3. Set up the **OAuth consent screen**. On Google Workspace choose **Internal**. Otherwise choose **External** and add your own address as a test user. (External apps in testing mode need reconnecting about once a week.)
+3. Set up the **OAuth consent screen** (Google Auth Platform → **Audience**). On Google Workspace choose **Internal**. Otherwise choose **External** and add every address that will sign in under **Test users**; without that, Google shows *"Access blocked: … has not completed the Google verification process"*. External apps in testing mode need reconnecting about once a week; **Publish app** on the same page stops that (Google then shows an "unverified app" warning you can click through).
 4. Create an **OAuth client ID** of type **Desktop app**, and paste its ID and secret into Docket.
 5. Click **Connect Gmail** and sign in.
 
-Docket asks for read-only access (`gmail.readonly`). It never sends, deletes or changes email.
+Docket asks for `gmail.modify`: it reads your mail, stars what you star, and sends or saves a draft only when you click **Send reply** or **Save as Gmail draft**. It never deletes or archives anything.
 
 ## Keyboard shortcuts
 
@@ -171,6 +182,7 @@ Docket asks for read-only access (`gmail.readonly`). It never sends, deletes or 
 | ⇧⌘F | Start a focus session on the selected task |
 | ⌃⌘1 – ⌃⌘4 | Priority: urgent, high, medium, low |
 | ⌥⌘C | Compact rows |
+| S | Star the selected message (Slack & email tabs) |
 | ⌃⌘S | Hide or show the sidebar |
 | ⌘D | Today's daily note |
 | ⌘E | Read or edit a note |

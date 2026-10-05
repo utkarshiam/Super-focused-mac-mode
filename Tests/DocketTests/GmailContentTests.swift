@@ -28,8 +28,8 @@ private enum Mail {
                       tokens: .init(accessToken: "ya29.first", expiresAt: Date().addingTimeInterval(3000), refreshToken: nil, scopes: scopes))
     }
 
-    static func client(_ server: FakeIntegrationServer) -> GmailClient {
-        GmailClient(session: session(server, scopes: [GoogleOAuth.gmailScope, GoogleOAuth.composeScope]), transport: server.transport)
+    static func client(_ server: FakeIntegrationServer, scopes: Set<String> = [GoogleOAuth.gmailScope, GoogleOAuth.composeScope]) -> GmailClient {
+        GmailClient(session: session(server, scopes: scopes), transport: server.transport)
     }
 
     /// The header lines of a part in Gmail's format=full JSON.
@@ -41,19 +41,47 @@ private enum Mail {
         String(decoding: (try? JSONSerialization.data(withJSONObject: text, options: .fragmentsAllowed)) ?? Data("\"\"".utf8), as: UTF8.self)
     }
 
-    /// One message as Gmail's format=full returns it, with a plain-text body (or a payload of your own).
-    static func message(_ id: String, thread: String = "t1", labels: [String] = ["INBOX"], from: String, date: Date,
-                        subject: String = "Q3 numbers", text: String? = nil, payload: String? = nil, snippet: String = "") -> String {
-        let top = headers([("From", from), ("To", "Maya Chen <maya@acme.example>"), ("Subject", subject),
-                           ("Message-ID", "<\(id)@mail.example>"), ("Date", "Mon, 5 Oct 2026 09:12:00 -0700")])
+    /// One message as Gmail's format=full returns it, with a plain-text body (or a payload of your own, which
+    /// carries its own headers). `more`: headers after the usual ones (Cc, References…). Without a `date`, it
+    /// has neither an internalDate nor a Date header.
+    static func message(_ id: String, thread: String = "t1", labels: [String] = ["INBOX"], from: String, date: Date?,
+                        subject: String = "Q3 numbers", to: String = "Maya Chen <maya@acme.example>", more: [(String, String)] = [],
+                        text: String? = nil, payload: String? = nil, snippet: String = "") -> String {
+        var pairs = [("From", from), ("To", to), ("Subject", subject), ("Message-ID", "<\(id)@mail.example>")]
+        if date != nil { pairs.append(("Date", "Mon, 5 Oct 2026 09:12:00 -0700")) }
         let body = payload ?? """
-            {"partId":"","mimeType":"text/plain","filename":"","headers":\(top),"body":{"size":\((text ?? "").utf8.count),"data":"\(base64URL(text ?? ""))"}}
+            {"partId":"","mimeType":"text/plain","filename":"","headers":\(headers(pairs + more)),"body":\(data(text ?? ""))}
             """
         let labelList = labels.map(json).joined(separator: ",")
+        let internalDate = date.map { #""internalDate":"\#(Int64($0.timeIntervalSince1970 * 1000))","# } ?? ""
         return """
             {"id":"\(id)","threadId":"\(thread)","labelIds":[\(labelList)],"snippet":\(json(snippet)),
-             "internalDate":"\(Int64(date.timeIntervalSince1970 * 1000))","payload":\(body)}
+             \(internalDate)"payload":\(body)}
             """
+    }
+
+    /// One part of a format=full payload. `body` is its JSON body: `data(…)`, or `{"attachmentId":…}` for one
+    /// Gmail keeps apart.
+    static func part(_ id: String, _ type: String, filename: String = "", headers pairs: [(String, String)] = [],
+                     body: String = #"{"size":0}"#, parts: [String] = []) -> String {
+        let children = parts.isEmpty ? "" : #","parts":[\#(parts.joined(separator: ","))]"#
+        return #"{"partId":"\#(id)","mimeType":"\#(type)","filename":\#(json(filename)),"headers":\#(headers(pairs)),"body":\#(body)\#(children)}"#
+    }
+
+    /// A body that comes with its part, as base64url.
+    static func data(_ text: String) -> String {
+        #"{"size":\#(text.utf8.count),"data":"\#(base64URL(text))"}"#
+    }
+
+    /// What a send (or, with `draft`, a draft) asked Gmail to deliver: the message and its conversation.
+    static func sent(_ request: URLRequest, draft: Bool = false) throws -> (raw: MIMEPart, threadID: String) {
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json; charset=utf-8")
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: try XCTUnwrap(request.httpBody)) as? [String: Any])
+        let message = try XCTUnwrap((draft ? object["message"] : object) as? [String: Any])
+        let raw = try XCTUnwrap(message["raw"] as? String)
+        XCTAssertFalse(raw.contains("+") || raw.contains("/") || raw.contains("="), "base64url without padding")
+        return (MailMIME.parse(try XCTUnwrap(MailBase64.decodeURLSafe(raw))), try XCTUnwrap(message["threadId"] as? String))
     }
 }
 
@@ -726,16 +754,6 @@ final class GmailContentClientTests: XCTestCase {
             """)
     }
 
-    private func sent(_ request: URLRequest, draft: Bool = false) throws -> (raw: MIMEPart, threadID: String) {
-        XCTAssertEqual(request.httpMethod, "POST")
-        XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json; charset=utf-8")
-        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: try XCTUnwrap(request.httpBody)) as? [String: Any])
-        let message = try XCTUnwrap((draft ? object["message"] : object) as? [String: Any])
-        let raw = try XCTUnwrap(message["raw"] as? String)
-        XCTAssertFalse(raw.contains("+") || raw.contains("/") || raw.contains("="), "base64url without padding")
-        return (MailMIME.parse(try XCTUnwrap(MailBase64.decodeURLSafe(raw))), try XCTUnwrap(message["threadId"] as? String))
-    }
-
     private let original = MailReplyHeaders(messageID: "<CAF123@mail.northwind.example>", references: nil, subject: "Q3 numbers",
                                             from: "Sam Lee <sam@northwind.example>", replyTo: nil,
                                             to: ["Maya Chen (CEO) <ceo@acme.example>"], cc: ["Priya Shah <priya@contoso.example>", Mail.maya])
@@ -749,7 +767,7 @@ final class GmailContentClientTests: XCTestCase {
 
         let request = try XCTUnwrap(server.requests(toPath: "/gmail/v1/users/me/messages/send").first)
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer ya29.first")
-        let (message, threadID) = try sent(request)
+        let (message, threadID) = try Mail.sent(request)
         XCTAssertEqual(threadID, "t1")
         XCTAssertEqual(MailSender(header: message.header("From") ?? "").address, "ceo@acme.example", "the address it was sent to")
         XCTAssertEqual(MailSender(header: message.header("From") ?? "").name, "Maya Chen (CEO)")
@@ -768,7 +786,7 @@ final class GmailContentClientTests: XCTestCase {
         // Without the send-as list (it failed), the reply goes from the connected address.
         let reply = MailReply(threadID: "t1", headers: original, fromAddress: Mail.maya, body: "Draft text", replyAll: false)
         try await Mail.client(server).saveDraft(reply)
-        let (message, threadID) = try sent(try XCTUnwrap(server.requests(toPath: "/gmail/v1/users/me/drafts").first), draft: true)
+        let (message, threadID) = try Mail.sent(try XCTUnwrap(server.requests(toPath: "/gmail/v1/users/me/drafts").first), draft: true)
         XCTAssertEqual(threadID, "t1")
         XCTAssertEqual(message.header("From"), Mail.maya)
         XCTAssertEqual(message.header("To"), "Sam Lee <sam@northwind.example>")
@@ -881,16 +899,417 @@ final class GmailContentClientTests: XCTestCase {
     }
 }
 
-// MARK: - Permission to reply
+// MARK: - The whole conversation
+
+final class GmailConversationTests: XCTestCase {
+    private let base = Date(timeIntervalSince1970: 1_791_200_000)
+    private let sam = #""Lee, Sam" <sam.lee@northwind.example>"#
+    /// Priya's answer: HTML only, with an inline chart, and Maya's message quoted in Gmail's quote block.
+    private let priyaHTML = #"<div>Adding the forecast tab.<img src="cid:forecast@contoso.example"></div><div class="gmail_quote">On Mon, Oct 5, 2026 Maya Chen wrote:<blockquote>Working on it.</blockquote></div>"#
+    /// Sam's follow-up as HTML: too long to come with the conversation.
+    private let samHTML = "<p>Any update? The board meets <b>Thursday</b>.</p>"
+    private let samHTMLPath = "/gmail/v1/users/me/messages/m4/attachments/ANGjdJ-m4html"
+
+    /// threads/t9 as Gmail returns it, not quite in order: Sam asks; Maya (you) answers with his message quoted;
+    /// a draft and a deleted message that aren't part of it; Priya (starred, with a PDF and an inline chart);
+    /// Sam again. `bodyReplies`: how Gmail answers for the body of Sam's follow-up.
+    private func conversation(_ server: FakeIntegrationServer, bodyReplies: [FakeIntegrationServer.Reply]? = nil) {
+        let priya = Mail.part("", "multipart/mixed", headers: [
+            ("From", "Priya Shah <priya@contoso.example>"), ("To", "Sam Lee <sam.lee@northwind.example>"),
+            ("Cc", "Maya Chen <maya@acme.example>, ops@northwind.example"), ("Subject", "Re: Q3 numbers"),
+            ("Message-ID", "<m3@mail.example>"), ("In-Reply-To", "<m2@mail.example>"), ("References", "<m1@mail.example> <m2@mail.example>"),
+        ], parts: [
+            Mail.part("0", "multipart/related", parts: [
+                Mail.part("0.0", "text/html", headers: [("Content-Type", "text/html; charset=UTF-8")], body: Mail.data(priyaHTML)),
+                Mail.part("0.1", "image/png", filename: "forecast.png",
+                          headers: [("Content-ID", "<forecast@contoso.example>"), ("Content-Disposition", #"inline; filename="forecast.png""#)],
+                          body: #"{"attachmentId":"ANGjdJ-forecast","size":4096}"#),
+            ]),
+            Mail.part("1", "application/pdf", filename: "Forecast Q4.pdf", headers: [("Content-Disposition", "attachment")],
+                      body: #"{"attachmentId":"ANGjdJ-forecast_pdf","size":88000}"#),
+        ])
+        let followUp = Mail.part("", "multipart/alternative", headers: [
+            ("From", "Sam Lee <sam.lee@northwind.example>"), ("To", "Maya Chen <maya@acme.example>"), ("Subject", "Re: Q3 numbers"),
+            ("Message-ID", "<m4@mail.example>"), ("References", "<m1@mail.example> <m2@mail.example> <m3@mail.example>"),
+        ], parts: [
+            Mail.part("0", "text/plain", headers: [("Content-Type", "text/plain; charset=UTF-8")], body: Mail.data("Any update? The board meets Thursday.")),
+            Mail.part("1", "text/html", headers: [("Content-Type", "text/html; charset=UTF-8")], body: #"{"attachmentId":"ANGjdJ-m4html","size":250000}"#),
+        ])
+        server.gmail("threads/t9", """
+            {"id":"t9","historyId":"4242","messages":[
+              \(Mail.message("m1", thread: "t9", labels: ["INBOX", "IMPORTANT"], from: sam, date: base,
+                             to: "Maya Chen <maya@acme.example>, Priya Shah <priya@contoso.example>", more: [("Cc", "ops@northwind.example")],
+                             text: "Can you send the final numbers before Friday?\r\n\r\nSam", snippet: "Can you send the final numbers before Friday? Sam")),
+              \(Mail.message("m2", thread: "t9", labels: ["SENT"], from: "Maya Chen <maya@acme.example>", date: base.addingTimeInterval(600),
+                             subject: "Re: Q3 numbers", to: sam, more: [("In-Reply-To", "<m1@mail.example>"), ("References", "<m1@mail.example>")],
+                             text: "Working on it.\r\n\r\nOn Mon, Oct 5, 2026 at 9:12 AM Sam Lee <sam.lee@northwind.example>\r\nwrote:\r\n\r\n> Can you send the final numbers before Friday?\r\n>\r\n> Sam",
+                             snippet: "Working on it. On Mon, Oct 5, 2026 at 9:12 AM Sam Lee &lt;sam.lee@northwind.example&gt; wrote: &gt; Can you send")),
+              \(Mail.message("d1", thread: "t9", labels: ["DRAFT"], from: "Maya Chen <maya@acme.example>", date: base.addingTimeInterval(700), text: "Unsent draft")),
+              \(Mail.message("m4", thread: "t9", labels: ["INBOX", "UNREAD"], from: "Sam Lee <sam.lee@northwind.example>",
+                             date: base.addingTimeInterval(1800), payload: followUp, snippet: "Any update? The board meets Thursday.")),
+              \(Mail.message("m3", thread: "t9", labels: ["INBOX", "STARRED"], from: "Priya Shah <priya@contoso.example>",
+                             date: base.addingTimeInterval(1200), payload: priya, snippet: "Adding the forecast tab. On Mon, Oct 5, 2026 Maya Chen wrote: Working on it.")),
+              \(Mail.message("x1", thread: "t9", labels: ["TRASH"], from: sam, date: base.addingTimeInterval(1300), text: "Deleted"))
+            ]}
+            """)
+        let path = samHTMLPath
+        server.on({ $0.url?.path == path }, bodyReplies ?? [.init(body: #"{"size":52,"data":"\#(Mail.base64URL(samHTML))"}"#)])
+    }
+
+    func testTheWholeConversationIsEveryMessageOldestFirst() async throws {
+        let server = FakeIntegrationServer()
+        conversation(server)
+        let emails = try await Mail.client(server).conversationMessages(threadID: "t9", myAddress: "MAYA@acme.example")
+
+        XCTAssertEqual(emails.map(\.id), ["m1", "m2", "m3", "m4"], "oldest first; no draft, nothing from the Trash")
+        XCTAssertEqual(emails.map(\.from), [sam, "Maya Chen <maya@acme.example>", "Priya Shah <priya@contoso.example>",
+                                            "Sam Lee <sam.lee@northwind.example>"], "as From headers: name and address")
+        XCTAssertEqual(emails.map { MailSender(header: $0.from).displayName }, ["Lee, Sam", "Maya Chen", "Priya Shah", "Sam Lee"])
+        XCTAssertEqual(emails.map(\.date), [base, base.addingTimeInterval(600), base.addingTimeInterval(1200), base.addingTimeInterval(1800)])
+        XCTAssertEqual(emails.map(\.isMine), [false, true, false, false], "Maya's own: sent from her account")
+        XCTAssertEqual(emails.map(\.isStarred), [false, false, true, false], "Gmail's STARRED label")
+        XCTAssertEqual(emails.map(\.snippet), ["Can you send the final numbers before Friday? Sam", "Working on it.",
+                                               "Adding the forecast tab.", "Any update? The board meets Thursday."],
+                       "a collapsed message reads as what it adds, without the quoted history Gmail's snippet has")
+
+        // Each comes whole, as `fullMessage` reads it: the quotes are there for the view to tuck away.
+        let ask = emails[0].content
+        XCTAssertEqual(ask.text, "Can you send the final numbers before Friday?\n\nSam")
+        XCTAssertNil(ask.html)
+        XCTAssertEqual(ask.to, ["Maya Chen <maya@acme.example>", "Priya Shah <priya@contoso.example>"])
+        XCTAssertEqual(ask.cc, ["ops@northwind.example"])
+        XCTAssertTrue(emails[1].content.text.hasPrefix("Working on it.\n\nOn Mon, Oct 5, 2026 at 9:12 AM"))
+        XCTAssertTrue(emails[1].content.text.hasSuffix("> Sam"))
+        let answer = emails[2].content
+        XCTAssertEqual(answer.html, priyaHTML)
+        XCTAssertEqual(answer.cc, ["Maya Chen <maya@acme.example>", "ops@northwind.example"])
+        XCTAssertEqual(answer.attachments.map(\.name), ["forecast.png", "Forecast Q4.pdf"])
+        XCTAssertEqual(answer.attachments.map(\.id), ["m3/ANGjdJ-forecast", "m3/ANGjdJ-forecast_pdf"])
+        XCTAssertEqual(answer.attachments.map(\.contentID), ["forecast@contoso.example", nil], "the chart shows in the body")
+        XCTAssertEqual(answer.attachments.map(\.remote), [.gmail(messageID: "m3", attachmentID: "ANGjdJ-forecast"),
+                                                          .gmail(messageID: "m3", attachmentID: "ANGjdJ-forecast_pdf")])
+        XCTAssertEqual(emails[3].content.text, "Any update? The board meets Thursday.")
+        XCTAssertEqual(emails[3].content.html, samHTML, "a body Gmail sent apart is fetched")
+
+        // What a reply to each one needs.
+        XCTAssertEqual(emails.map(\.replyHeaders.messageID), ["<m1@mail.example>", "<m2@mail.example>", "<m3@mail.example>", "<m4@mail.example>"])
+        XCTAssertEqual(emails[0].replyHeaders.from, sam)
+        XCTAssertEqual(emails[2].replyHeaders.references, "<m1@mail.example> <m2@mail.example>")
+        XCTAssertEqual(emails[2].replyHeaders.to, ["Sam Lee <sam.lee@northwind.example>"])
+        XCTAssertEqual(emails[2].replyHeaders.cc, ["Maya Chen <maya@acme.example>", "ops@northwind.example"])
+        XCTAssertEqual(emails[2].replyHeaders.subject, "Re: Q3 numbers")
+
+        // One call for the conversation and one for the body kept apart; attachments wait until they're opened.
+        XCTAssertEqual(server.requests.map { $0.url?.path ?? "" }, ["/gmail/v1/users/me/threads/t9", samHTMLPath])
+        let thread = try XCTUnwrap(server.requests.first)
+        XCTAssertEqual(FakeIntegrationServer.query(thread)["format"], "full")
+        XCTAssertEqual(thread.value(forHTTPHeaderField: "Authorization"), "Bearer ya29.first")
+    }
+
+    func testOddConversationsStillReadWell() async throws {
+        let server = FakeIntegrationServer()
+        // From a +tag of Maya's address (another mail app, so no SENT label); a message without a date whose
+        // body never came; and one that's only a file.
+        let bodiless = Mail.part("", "text/plain", headers: [("From", "Sam Lee <sam@northwind.example>"), ("Subject", "Deck")])
+        let fileOnly = Mail.part("", "multipart/mixed", headers: [("From", "Priya Shah <priya@contoso.example>"), ("Subject", "Deck")], parts: [
+            Mail.part("0", "application/pdf", filename: "deck.pdf", headers: [("Content-Disposition", "attachment")],
+                      body: #"{"attachmentId":"ANGjdJ-deck","size":1200}"#),
+        ])
+        server.gmail("threads/t7", """
+            {"id":"t7","messages":[
+              \(Mail.message("a1", thread: "t7", from: "Maya Chen <MAYA+board@acme.example>", date: base, text: "Sharing the deck now.")),
+              \(Mail.message("a2", thread: "t7", from: "Sam Lee <sam@northwind.example>", date: nil, payload: bodiless,
+                             snippet: "Looks good &amp; ships&nbsp;Friday &zwnj;&nbsp;&zwnj;&#8203;")),
+              \(Mail.message("a3", thread: "t7", from: "Priya Shah <priya@contoso.example>", date: base.addingTimeInterval(60), payload: fileOnly))
+            ]}
+            """)
+        let client = Mail.client(server)
+        let emails = try await client.conversationMessages(threadID: "t7", myAddress: Mail.maya)
+        XCTAssertEqual(emails.map(\.id), ["a1", "a2", "a3"], "without a date, a message keeps its place")
+        XCTAssertEqual(emails[1].date, base, "with the date of the one before it")
+        XCTAssertEqual(emails.map(\.isMine), [true, false, false], "Maya's address with a +tag is still hers")
+        XCTAssertEqual(emails[1].content.text, "Looks good & ships Friday", "no body: Gmail's snippet, without its invisible padding")
+        XCTAssertEqual(emails[1].snippet, "Looks good & ships Friday")
+        XCTAssertEqual(emails[2].content.text, "")
+        XCTAssertEqual(emails[2].content.attachments.map(\.name), ["deck.pdf"])
+        XCTAssertEqual(emails[2].snippet, "Attached: deck.pdf")
+
+        // A long message's line is cut at a word.
+        let long = (1...80).map { "word\($0)" }.joined(separator: " ")
+        server.gmail("threads/t5", #"{"id":"t5","messages":[\#(Mail.message("c1", thread: "t5", from: "Sam Lee <sam@northwind.example>", date: base, text: long))]}"#)
+        let line = try await client.conversationMessages(threadID: "t5", myAddress: Mail.maya).first?.snippet ?? ""
+        XCTAssertLessThanOrEqual(line.count, GmailClient.longestSnippet + 1)
+        XCTAssertTrue(line.hasSuffix("…"))
+        XCTAssertTrue(long.hasPrefix(String(line.dropLast())))
+
+        // All of it in the Trash: read as it is (as Gmail shows it from there), still without drafts.
+        server.gmail("threads/t8", """
+            {"id":"t8","messages":[
+              \(Mail.message("b1", thread: "t8", labels: ["TRASH"], from: "Sam Lee <sam@northwind.example>", date: base, text: "Old news")),
+              \(Mail.message("b2", thread: "t8", labels: ["TRASH", "SENT"], from: "Maya Chen <maya@acme.example>", date: base.addingTimeInterval(60), text: "Noted")),
+              \(Mail.message("b3", thread: "t8", labels: ["DRAFT"], from: "Maya Chen <maya@acme.example>", date: base.addingTimeInterval(120), text: "Never sent"))
+            ]}
+            """)
+        let binned = try await client.conversationMessages(threadID: "t8", myAddress: Mail.maya)
+        XCTAssertEqual(binned.map(\.id), ["b1", "b2"])
+
+        // Nothing in it, and ids that are no Gmail id (never sent to Gmail).
+        server.gmail("threads/t6", #"{"id":"t6"}"#)
+        let none = try await client.conversationMessages(threadID: "t6", myAddress: Mail.maya)
+        XCTAssertEqual(none, [])
+        let asked = server.requests.count
+        for bad in ["", "t1/../x", "t1?format=raw", "t 1", "t1#x"] {
+            do {
+                _ = try await client.conversationMessages(threadID: bad, myAddress: Mail.maya)
+                XCTFail("\(bad) must fail")
+            } catch {
+                XCTAssertEqual(error as? IntegrationError, .unexpected(.gmail, "a bad conversation id"))
+            }
+        }
+        XCTAssertEqual(server.requests.count, asked)
+    }
+
+    func testABodyThatDoesntArriveLeavesTheRestOfTheConversation() async throws {
+        let server = FakeIntegrationServer()
+        conversation(server, bodyReplies: [
+            .init(status: 404, body: #"{"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}"#),
+            .init(status: 429, body: #"{"error":{"code":429,"message":"Too many requests"}}"#),
+        ])
+        let client = Mail.client(server)
+        // Gone since it was listed: that message keeps its text part.
+        let emails = try await client.conversationMessages(threadID: "t9", myAddress: Mail.maya)
+        XCTAssertEqual(emails.map(\.id), ["m1", "m2", "m3", "m4"])
+        XCTAssertNil(emails[3].content.html)
+        XCTAssertEqual(emails[3].content.text, "Any update? The board meets Thursday.")
+        // Gmail asking to slow down is the whole conversation's problem.
+        do {
+            _ = try await client.conversationMessages(threadID: "t9", myAddress: Mail.maya)
+            XCTFail("must fail")
+        } catch {
+            XCTAssertEqual(error as? IntegrationError, .rateLimited(.gmail, retryAfter: 60))
+        }
+    }
+
+    func testOnlySoManyBodiesAreFetchedTheNewestFirst() async throws {
+        // Seven messages, each with four HTML bodies Gmail kept apart: more than one conversation fetches.
+        let messages = (1...7).map { n -> String in
+            let parts = (0..<4).map { k in Mail.part("\(k)", "text/html", body: #"{"attachmentId":"ANGjdJ-\#(n)-\#(k)","size":250000}"#) }
+            let payload = Mail.part("", "multipart/mixed", headers: [("From", "Sam Lee <sam@northwind.example>")], parts: parts)
+            return Mail.message("n\(n)", thread: "t4", from: "Sam Lee <sam@northwind.example>", date: base.addingTimeInterval(Double(n) * 60),
+                                payload: payload)
+        }
+        let server = FakeIntegrationServer()
+        server.gmail("threads/t4", #"{"id":"t4","messages":[\#(messages.joined(separator: ","))]}"#)
+        server.on({ $0.url?.path.contains("/attachments/") == true }, [.init(body: #"{"size":8,"data":"\#(Mail.base64URL("<p>x</p>"))"}"#)])
+        let emails = try await Mail.client(server).conversationMessages(threadID: "t4", myAddress: Mail.maya)
+
+        XCTAssertEqual(server.requests.filter { $0.url?.path.contains("/attachments/") == true }.count, GmailClient.detachedBodiesPerConversation)
+        XCTAssertEqual(emails.map(\.id), ["n1", "n2", "n3", "n4", "n5", "n6", "n7"])
+        XCTAssertNil(emails[0].content.html, "the oldest, shown collapsed, go without")
+        XCTAssertNotNil(emails[1].content.html)
+        XCTAssertNotNil(emails[6].content.html)
+    }
+
+    func testReplyingToOneMessageOfTheConversation() async throws {
+        let server = FakeIntegrationServer()
+        conversation(server)
+        server.gmail("messages/send", #"{"id":"s1","threadId":"t9","labelIds":["SENT"]}"#)
+        let client = Mail.client(server)
+        let emails = try await client.conversationMessages(threadID: "t9", myAddress: Mail.maya)
+
+        // Priya's message, though Sam's is newer: the reply answers hers, in the same conversation.
+        let priya = emails[2]
+        try await client.sendReply(MailReply(threadID: "t9", headers: priya.replyHeaders, fromAddress: Mail.maya,
+                                             body: "Thanks Priya, the tab looks right.", replyAll: false))
+        let (message, threadID) = try Mail.sent(try XCTUnwrap(server.requests(toPath: "/gmail/v1/users/me/messages/send").first))
+        XCTAssertEqual(threadID, "t9")
+        XCTAssertEqual(message.header("In-Reply-To"), "<m3@mail.example>")
+        XCTAssertEqual(message.header("References"), "<m1@mail.example> <m2@mail.example> <m3@mail.example>")
+        XCTAssertEqual(message.header("Subject"), "Re: Q3 numbers")
+        XCTAssertEqual(MailSender.list(message.header("To") ?? "").compactMap(\.address), ["priya@contoso.example"])
+        XCTAssertNil(message.header("Cc"))
+        XCTAssertEqual(MailBody(message).text, "Thanks Priya, the tab looks right.")
+
+        // Reply all: that message's people (Sam on its To, ops on its Cc), never Maya.
+        let all = MailReplyBuilder.recipients(for: MailReply(threadID: "t9", headers: priya.replyHeaders, fromAddress: Mail.maya,
+                                                             body: "Thanks.", replyAll: true))
+        XCTAssertEqual(all.to.compactMap(\.address), ["priya@contoso.example", "sam.lee@northwind.example"])
+        XCTAssertEqual(all.cc.compactMap(\.address), ["ops@northwind.example"])
+
+        // Maya's own message: back to the people she sent it to, answering hers.
+        let own = MailReply(threadID: "t9", headers: emails[1].replyHeaders, fromAddress: Mail.maya, body: "One more thing.", replyAll: false)
+        XCTAssertEqual(MailReplyBuilder.recipients(for: own).to.compactMap(\.address), ["sam.lee@northwind.example"])
+        let followUp = MailMIME.parse(MailReplyBuilder.message(for: own))
+        XCTAssertEqual(followUp.header("In-Reply-To"), "<m2@mail.example>")
+        XCTAssertEqual(followUp.header("References"), "<m1@mail.example> <m2@mail.example>")
+    }
+}
+
+// MARK: - Stars
+
+final class GmailStarTests: XCTestCase {
+    private func body(_ request: URLRequest) -> [String: [String]]? {
+        request.httpBody.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: [String]] }
+    }
+
+    func testStarringSetsOrClearsGmailsStarredLabelAndNothingElse() async throws {
+        let server = FakeIntegrationServer()
+        server.gmail("messages/m3/modify", #"{"id":"m3","threadId":"t9","labelIds":["INBOX","STARRED"]}"#)
+        let client = Mail.client(server, scopes: [GoogleOAuth.modifyScope])
+        try await client.setStarred(true, messageID: "m3")
+        try await client.setStarred(false, messageID: "m3")
+
+        let calls = server.requests(toPath: "/gmail/v1/users/me/messages/m3/modify")
+        XCTAssertEqual(calls.count, 2)
+        for call in calls {
+            XCTAssertEqual(call.httpMethod, "POST")
+            XCTAssertEqual(call.url?.host, "gmail.googleapis.com")
+            XCTAssertNil(call.url?.query)
+            XCTAssertEqual(call.value(forHTTPHeaderField: "Content-Type"), "application/json; charset=utf-8")
+            XCTAssertEqual(call.value(forHTTPHeaderField: "Authorization"), "Bearer ya29.first")
+        }
+        XCTAssertEqual(body(calls[0]), ["addLabelIds": ["STARRED"]], "only the star, nothing removed")
+        XCTAssertEqual(body(calls[1]), ["removeLabelIds": ["STARRED"]], "only the star, nothing added")
+
+        for bad in ["", "m3/../../profile", "m3?alt=media", "m 3", "../threads/t9"] {
+            do {
+                try await client.setStarred(true, messageID: bad)
+                XCTFail("\(bad) must fail")
+            } catch {
+                XCTAssertEqual(error as? IntegrationError, .unexpected(.gmail, "a bad message id"))
+            }
+        }
+        XCTAssertEqual(server.requests.count, 2, "bad ids never reach Gmail")
+    }
+
+    func testStarringErrorsSayWhatWentWrong() async throws {
+        let server = FakeIntegrationServer()
+        let gone = FakeIntegrationServer.Reply(status: 404, body: #"{"error":{"code":404,"message":"Requested entity was not found.","errors":[{"reason":"notFound"}]}}"#)
+        server.gmail("messages/m3/modify",
+                     .init(status: 401, body: #"{"error":{"code":401,"message":"Request had invalid authentication credentials."}}"#),
+                     .init(body: #"{"id":"m3","threadId":"t9","labelIds":["STARRED"]}"#),
+                     .init(status: 403, body: #"{"error":{"code":403,"message":"Request had insufficient authentication scopes.","details":[{"reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}"#),
+                     gone, gone,
+                     .init(status: 429, body: #"{"error":{"code":429,"message":"Too many requests"}}"#),
+                     .init(status: 403, body: #"{"error":{"code":403,"message":"User-rate limit exceeded.","errors":[{"reason":"userRateLimitExceeded"}]}}"#),
+                     .init(status: 400, body: #"{"error":{"code":400,"message":"Invalid id value","status":"INVALID_ARGUMENT"}}"#),
+                     .init(status: 500, body: #"{"error":{"code":500,"message":"Backend Error"}}"#))
+        server.google("/token", .init(body: #"{"access_token":"ya29.second","expires_in":3599,"token_type":"Bearer"}"#))
+        let client = Mail.client(server)
+
+        // An expired token: a fresh one, and the star goes through.
+        try await client.setStarred(true, messageID: "m3")
+        let calls = server.requests(toPath: "/gmail/v1/users/me/messages/m3/modify")
+        XCTAssertEqual(calls.map { $0.value(forHTTPHeaderField: "Authorization") }, ["Bearer ya29.first", "Bearer ya29.second"])
+
+        // The inbox puts "Couldn't star it in Gmail." in front of these, so they don't say it again.
+        let slowDown = IntegrationError.api(.gmail, "Gmail asked Docket to slow down. Try again in a minute.")
+        let expected: [(Bool, IntegrationError?)] = [
+            (true, .missingPermission(.gmail, "star emails")),
+            (false, nil),
+            (true, GmailClient.emailGone),
+            (true, slowDown),
+            (true, slowDown),
+            (true, .api(.gmail, "Gmail said “Invalid id value”.")),
+            (true, .unexpected(.gmail, "HTTP 500")),
+        ]
+        for (starred, want) in expected {
+            do {
+                try await client.setStarred(starred, messageID: "m3")
+                if let want { XCTFail("must fail with \(want)") }
+            } catch {
+                XCTAssertEqual(error as? IntegrationError, want)
+            }
+        }
+        XCTAssertEqual(server.requests(toPath: "/gmail/v1/users/me/messages/m3/modify").count, 9, "nothing tried twice by itself")
+        XCTAssertEqual(GmailClient.emailGone.errorDescription, "That email isn't in Gmail any more.")
+        XCTAssertEqual(IntegrationError.missingPermission(.gmail, GmailClient.starPermission).errorDescription,
+                       "Docket needs permission to star emails. Connect Gmail again and allow it.")
+
+        // Starring twice does no harm: a lost connection is only that, not "check whether it went through".
+        let flaky: IntegrationHTTP.Transport = { _ in throw URLError(.timedOut) }
+        let offline = GmailClient(session: Mail.session(FakeIntegrationServer(), scopes: [GoogleOAuth.modifyScope]), transport: flaky)
+        do {
+            try await offline.setStarred(true, messageID: "m3")
+            XCTFail("must fail")
+        } catch {
+            XCTAssertEqual(error as? IntegrationError, .offline(.gmail, "It took too long to answer."))
+        }
+    }
+}
+
+// MARK: - Permission to reply and to star
 
 final class GmailComposeScopeTests: XCTestCase {
-    func testSignInAsksToReadAndToCompose() throws {
-        XCTAssertEqual(GoogleOAuth.scopes, ["openid", "email", "https://www.googleapis.com/auth/gmail.readonly",
-                                            "https://www.googleapis.com/auth/gmail.compose"])
+    func testSignInAsksForGmailModifyAlone() throws {
+        XCTAssertEqual(GoogleOAuth.scopes, ["openid", "email", "https://www.googleapis.com/auth/gmail.modify"])
         let url = try XCTUnwrap(GoogleOAuth.authorizationURL(client: .init(id: "1234-test.apps.googleusercontent.com", secret: "s"),
                                                              redirectURI: "http://127.0.0.1:49152", state: "st", challenge: "ch"))
         let scope = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "scope" }?.value
-        XCTAssertEqual(scope, "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose")
+        XCTAssertEqual(scope, "openid email https://www.googleapis.com/auth/gmail.modify", "reading, stars, drafts and sending; no readonly or compose")
+    }
+
+    func testModifyAllowsWhatReadOnlyAndComposeDo() {
+        let modify: Set<String> = [GoogleOAuth.modifyScope]
+        let older: Set<String> = [GoogleOAuth.gmailScope, GoogleOAuth.composeScope]
+        XCTAssertTrue(GoogleOAuth.allows(GoogleOAuth.gmailScope, granted: modify), "reading")
+        XCTAssertTrue(GoogleOAuth.allows(GoogleOAuth.composeScope, granted: modify), "drafts and sending")
+        XCTAssertTrue(GoogleOAuth.allows(GoogleOAuth.modifyScope, granted: modify))
+        XCTAssertTrue(GoogleOAuth.allows(GoogleOAuth.composeScope, granted: older))
+        XCTAssertFalse(GoogleOAuth.allows(GoogleOAuth.modifyScope, granted: older), "a sign-in from before stars can't star")
+        XCTAssertFalse(GoogleOAuth.allows(GoogleOAuth.composeScope, granted: [GoogleOAuth.gmailScope]))
+        XCTAssertFalse(GoogleOAuth.allows(GoogleOAuth.gmailScope, granted: [GoogleOAuth.composeScope]), "compose doesn't read the inbox")
+        XCTAssertFalse(GoogleOAuth.allows(GoogleOAuth.gmailScope, granted: ["openid", "email"]))
+        XCTAssertEqual(GoogleOAuth.withIncludedScopes(older), older, "nothing added without gmail.modify")
+        XCTAssertEqual(GoogleOAuth.withIncludedScopes(["openid", GoogleOAuth.modifyScope]),
+                       ["openid", GoogleOAuth.modifyScope, GoogleOAuth.gmailScope, GoogleOAuth.composeScope])
+    }
+
+    func testANewSignInWithModifyCountsAsReadingAndComposing() async throws {
+        // Google lists only what was asked for. Docket's tokens say what it allows, so the check that a sign-in
+        // can read mail (gmail.readonly) passes, and so does the one for replying (gmail.compose).
+        let server = FakeIntegrationServer()
+        server.google("/token", .init(body: #"{"access_token":"ya29.first","expires_in":3599,"refresh_token":"1//refresh","scope":"https://www.googleapis.com/auth/gmail.modify openid https://www.googleapis.com/auth/userinfo.email","token_type":"Bearer","id_token":"x.y.z"}"#))
+        let client = GoogleOAuth.Client(id: "1234-test.apps.googleusercontent.com", secret: "test-client-secret")
+        let tokens = try await GoogleOAuth.exchange(code: "4/0AbCd", verifier: "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+                                                    redirectURI: "http://127.0.0.1:49152", client: client, transport: server.transport)
+        XCTAssertEqual(tokens.scopes, ["openid", "https://www.googleapis.com/auth/userinfo.email", GoogleOAuth.modifyScope,
+                                       GoogleOAuth.gmailScope, GoogleOAuth.composeScope])
+        let session = GoogleSession(client: client, refreshToken: "1//refresh", transport: server.transport, tokens: tokens)
+        let canCompose = await session.canCompose
+        let canModify = await session.canModify
+        XCTAssertTrue(canCompose)
+        XCTAssertTrue(canModify)
+
+        // Declined on the consent screen: only the sign-in itself, which can't read mail.
+        let declined = FakeIntegrationServer()
+        declined.google("/token", .init(body: #"{"access_token":"ya29.first","expires_in":3599,"refresh_token":"1//refresh","scope":"openid https://www.googleapis.com/auth/userinfo.email","token_type":"Bearer"}"#))
+        let bare = try await GoogleOAuth.exchange(code: "4/0AbCd", verifier: "v", redirectURI: "http://127.0.0.1:49152", client: client,
+                                                  transport: declined.transport)
+        XCTAssertFalse(bare.scopes.contains(GoogleOAuth.gmailScope))
+        XCTAssertFalse(GoogleOAuth.allows(GoogleOAuth.modifyScope, granted: bare.scopes))
+    }
+
+    func testCanModifyFollowsTheScopesGoogleGranted() async throws {
+        let server = FakeIntegrationServer()
+        let modify = Mail.session(server, scopes: [GoogleOAuth.modifyScope])
+        let modifyCanModify = await modify.canModify
+        XCTAssertTrue(modifyCanModify)
+        let older = Mail.session(server, scopes: [GoogleOAuth.gmailScope, GoogleOAuth.composeScope])
+        let olderCanModify = await older.canModify
+        XCTAssertFalse(olderCanModify, "a sign-in from before stars: reconnect to star")
+
+        // Restored at launch: unknown (so no), until a token refresh says.
+        server.google("/token", .init(body: #"{"access_token":"ya29.second","expires_in":3599,"scope":"openid https://www.googleapis.com/auth/gmail.modify","token_type":"Bearer"}"#))
+        let restored = GoogleSession(client: .init(id: "id", secret: "secret"), refreshToken: "1//refresh", transport: server.transport)
+        let before = await restored.canModify
+        XCTAssertFalse(before)
+        let canCompose = try await restored.checkCanCompose()
+        XCTAssertTrue(canCompose, "gmail.modify sends and saves drafts too")
+        let after = await restored.canModify
+        XCTAssertTrue(after)
+        let granted = await restored.grantedScopes
+        XCTAssertEqual(granted?.contains(GoogleOAuth.gmailScope), true, "a refresh counts it as reading, too")
     }
 
     func testCanComposeFollowsTheScopesGoogleGranted() async throws {
@@ -898,6 +1317,9 @@ final class GmailComposeScopeTests: XCTestCase {
         let both = Mail.session(server, scopes: [GoogleOAuth.gmailScope, GoogleOAuth.composeScope])
         let canComposeWithBoth = await both.canCompose
         XCTAssertTrue(canComposeWithBoth)
+        let modify = Mail.session(server, scopes: [GoogleOAuth.modifyScope])
+        let canComposeWithModify = await modify.canCompose
+        XCTAssertTrue(canComposeWithModify, "compose or modify")
         let readOnly = Mail.session(server, scopes: [GoogleOAuth.gmailScope])
         let canComposeReadOnly = await readOnly.canCompose
         XCTAssertFalse(canComposeReadOnly, "a sign-in from before replies, or compose left out on the consent screen")

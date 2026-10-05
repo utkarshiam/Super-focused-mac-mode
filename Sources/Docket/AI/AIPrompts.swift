@@ -263,14 +263,18 @@ enum AIPrompts {
     static let maxInstructionCharacters = 1_000
 
     /// The rules for a reply, and the user's own say on it: their notes and instruction live here, apart
-    /// from the conversation, so nothing in a message can pass itself off as them.
+    /// from the conversation, so nothing in a message can pass itself off as them. `answersAnother`: the
+    /// reply answers another message of the thread than the one the user opened (`replyInput`'s `replyingTo`).
     static func replySystem(_ format: ReplyFormat, tone: ReplyTone, notes: String, instruction: String?, myName: String?,
-                            now: Date, calendar: Calendar) -> String {
+                            answersAnother: Bool = false, now: Date, calendar: Calendar) -> String {
         let stamp = posix("EEEE yyyy-MM-dd HH:mm", calendar)
         let who = myName.map { "The user is \($0). Their own messages are marked \"(you)\"." }
             ?? "The user's own messages are marked \"(you)\"."
         let note = clip(notes.trimmingCharacters(in: .whitespacesAndNewlines), to: maxNotesCharacters)
         let ask = clip((instruction ?? "").trimmingCharacters(in: .whitespacesAndNewlines), to: maxInstructionCharacters)
+        let target = answersAnother
+            ? "\n- The reply answers one particular message of the thread, shown again at the end of the conversation under \"The message to reply to\". Answer that message, written to the person who sent it; the rest of the thread, the message the user opened included, is context."
+            : ""
         return """
         You draft a reply to \(format == .slack ? "a Slack message" : "an email") for the user to review, edit and send from their to-do app, Docket. Write it as the user: in the first person, in their voice, to the people in the conversation.
 
@@ -281,7 +285,7 @@ enum AIPrompts {
         - The user's notes and instruction (below) decide what the reply says. Cover everything they ask for, in the order that reads best. They're often shorthand ("yes thu 2pm, ask for deck"): write it out the way the user would say it.
         - When the instruction and the notes disagree, follow the instruction.
         - The notes are private: they can mix what to say with reminders to the user and frank remarks. Use only what's meant for the reply; never pass on a reminder or a private remark.
-        - Read the message and the rest of the thread for context: what's being asked, what's already been said, and the names and details to get right. Keep names, numbers and links exactly as written. You see attached files by name only, not what's in them.
+        - Read the message and the rest of the thread for context: what's being asked, what's already been said, and the names and details to get right. Keep names, numbers and links exactly as written. You see attached files by name only, not what's in them.\(target)
         - When the message you're replying to is the user's own (its sender is marked "(you)"), the reply follows it up: write to the people it went to, never to the user.
         - Never invent facts, numbers, dates, times, prices, names, links, decisions or promises that aren't in the notes, the instruction or the messages. Where the reply needs one, put a short placeholder in square brackets for the user to fill in, like [date], [amount], [yes or no] or [link to the deck].
         - When the notes and instruction don't say how to answer something the message asks, don't decide or commit for the user: put the answer in a placeholder, like [your answer].
@@ -343,7 +347,10 @@ enum AIPrompts {
 
     /// The conversation: the earlier messages in the thread (oldest first), the message itself with where
     /// and when it was sent, who else got it and the names of its files, then any replies after it.
-    static func replyInput(_ message: IncomingMessage, content: MessageContent?, thread: [ThreadMessage], calendar: Calendar) -> String {
+    /// `replyingTo`: another message of the thread that the reply answers. The message is then the one the
+    /// user opened, and the one to answer comes again at the end, so there's no mistaking it.
+    static func replyInput(_ message: IncomingMessage, content: MessageContent?, thread: [ThreadMessage],
+                           replyingTo target: ThreadMessage? = nil, calendar: Calendar) -> String {
         let when = posix("EEE yyyy-MM-dd HH:mm", calendar)
         let format = ReplyFormat(message.source.kind)
         let shown = replyThread(thread)
@@ -360,12 +367,13 @@ enum AIPrompts {
         }
 
         var head: [String]
+        let role = target == nil ? "to reply to" : "the user opened"
         if format == .slack {
             // "#leadership · Priya", "Direct message · Sam".
             let label = oneLine(message.source.label, limit: 160)
-            head = [label.isEmpty ? "The Slack message to reply to:" : "The Slack message to reply to (\(label)):"]
+            head = [label.isEmpty ? "The Slack message \(role):" : "The Slack message \(role) (\(label)):"]
         } else {
-            head = ["The email to reply to:"]
+            head = ["The email \(role):"]
         }
         let sender = oneLine(message.from, limit: 200)
         head.append("From: \(sender.isEmpty ? "unknown" : sender)")
@@ -388,7 +396,14 @@ enum AIPrompts {
         if !later.isEmpty {
             sections.append("Later in the thread, after the message:\n\n" + entries(later))
         }
-        sections.append(format == .slack ? "Write the user's reply to the Slack message." : "Write the user's reply to the email.")
+        if let target {
+            var answered = target
+            answered.text = clip(target.text.trimmingCharacters(in: .whitespacesAndNewlines), to: maxThreadMessageCharacters)
+            sections.append("The message to reply to:\n\n" + threadEntry(answered, when: when))
+            sections.append(format == .slack ? "Write the user's reply to that message, in the Slack thread." : "Write the user's reply to that email.")
+        } else {
+            sections.append(format == .slack ? "Write the user's reply to the Slack message." : "Write the user's reply to the email.")
+        }
         return sections.joined(separator: "\n\n")
     }
 

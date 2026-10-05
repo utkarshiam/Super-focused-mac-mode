@@ -183,7 +183,7 @@ enum IntegrationError: LocalizedError, Equatable {
     /// Slack's "needed" names only the permissions for saving messages for later (stars:read, stars:write).
     private static func isStarScope(_ needed: String) -> Bool {
         let names = needed.split(whereSeparator: { $0 == "," || $0.isWhitespace }).map(String.init)
-        return !names.isEmpty && names.allSatisfy(InboxScopes.slackStars.contains)
+        return !names.isEmpty && names.allSatisfy(InboxStarRules.slackScopes.contains)
     }
 
     /// Whole minutes to wait, at least one (a bad value never traps).
@@ -1036,6 +1036,10 @@ final class Integrations: ObservableObject {
               isSlackConnected, identity.0.userID == account.userID, var current = slackAccount else { return }
         current.missingScopes = Self.missingCoreScopes(granted: identity.scopes)
         slackAccount = current
+        // Allowed to save messages for later now: Slack is asked again.
+        if identity.scopes?.contains(InboxStarRules.slackWrite) == true, grantedSlackScopes?.contains(InboxStarRules.slackWrite) == false {
+            slackStarsStayInDocket = false
+        }
         grantedSlackScopes = identity.scopes
         refusedSlackScopes = []
         save()
@@ -1161,7 +1165,7 @@ final class Integrations: ObservableObject {
         var suggestion = Suggestion(source: source, from: sender, subject: subject, snippet: m.snippet,
                                     receivedAt: m.date, draft: nil, trigger: trigger)
         // Starred in Gmail: starred here too (unstarring it in Docket keeps it in the inbox until it's dismissed).
-        suggestion.isStarred = trigger == .starred || m.labels.contains(GmailClient.starredLabel)
+        suggestion.isStarred = trigger == .starred || m.labels.contains(InboxStarRules.gmailLabel)
         let message = IncomingMessage(source: source, from: m.sender.full, subject: subject, text: m.snippet, date: m.date)
         return SuggestionCandidate(suggestion: suggestion, message: message)
     }
@@ -1194,7 +1198,8 @@ final class Integrations: ObservableObject {
             guard let self else { return }
             do {
                 let tokens = try await GoogleOAuth.signIn(client: client, transport: transport, open: openURL)
-                guard tokens.scopes.isEmpty || tokens.scopes.contains(GoogleOAuth.gmailScope) else {
+                // Reading takes gmail.readonly or gmail.modify (what Docket asks for now).
+                guard Self.canReadMail(granted: tokens.scopes) else {
                     throw IntegrationError.missingPermission(.gmail, "read your email")
                 }
                 guard let refreshToken = tokens.refreshToken else {
@@ -1207,8 +1212,8 @@ final class Integrations: ObservableObject {
                 gmailAddress = email
                 isGmailConnected = true
                 gmailPausedUntil = nil
-                // What was granted: replying needs gmail.compose, which the consent screen lets people leave out.
-                // When Google doesn't list them, what Docket asked for.
+                // What was granted: starring needs gmail.modify, which the consent screen lets people leave out
+                // (replying needs it or gmail.compose). When Google doesn't list them, what Docket asked for.
                 grantedGmailScopes = tokens.scopes.isEmpty ? Set(GoogleOAuth.scopes) : tokens.scopes
                 save()
                 NSApplication.shared.activate(ignoringOtherApps: true) // back from the browser
@@ -1249,10 +1254,14 @@ final class Integrations: ObservableObject {
         save()
     }
 
-    /// Google may have granted sending (the session knows once it has a token): replies can go out from Docket.
+    /// Google may have granted more than Docket knew (the session learns it with a token): sending (gmail.compose)
+    /// and starring (gmail.modify, which covers sending too) then work from Docket.
     func noteGmailGrants(_ session: GoogleSession) async {
-        guard await session.canCompose, isGmailConnected, grantedGmailScopes?.contains(GoogleOAuth.composeScope) != true else { return }
-        grantedGmailScopes = (grantedGmailScopes ?? [GoogleOAuth.gmailScope]).union([GoogleOAuth.composeScope])
+        guard let granted = await session.grantedScopes, isGmailConnected else { return }
+        let gmail = granted.intersection([GoogleOAuth.gmailScope, GoogleOAuth.composeScope, GoogleOAuth.modifyScope])
+        let known = grantedGmailScopes ?? []
+        guard !gmail.isSubset(of: known) else { return }
+        grantedGmailScopes = known.union(gmail)
         save()
     }
 
@@ -1452,7 +1461,8 @@ final class Integrations: ObservableObject {
         refusedSlackScopes = []
         gmailAddress = address
         isGmailConnected = true
-        grantedGmailScopes = Set(GoogleOAuth.scopes).union([GoogleOAuth.composeScope])
+        grantedGmailScopes = Set(GoogleOAuth.scopes).union([GoogleOAuth.composeScope, GoogleOAuth.modifyScope])
+        slackStarsStayInDocket = false
         lastRefresh = refreshedAt
         slackProblem = nil
         gmailProblem = nil

@@ -1,10 +1,12 @@
 import AppKit
 import SwiftUI
 
-// Replying from the message detail: tone, an optional instruction, Draft with AI, the editable reply, and
+// Replying from the message detail: a plain editor that's always there, Draft with AI as an optional helper
+// (tone and an instruction), the message of the thread being answered ("Replying to Priya · 10:42 AM"), and
 // Send (always after a confirmation), Save as Gmail draft, or Copy.
 //
-// Nothing is ever sent without the confirmation: the Send button and ⌘↩ both only ask.
+// Nothing is ever sent without the confirmation: the Send button and ⌘↩ both only ask, and the reply goes to
+// exactly what the confirmation named.
 
 // MARK: - Words
 
@@ -60,23 +62,30 @@ enum ReplyText {
     /// known (it's been opened).
     static func mailRecipients(for item: Suggestion, myAddress: String?, replyAll: Bool) -> [MailSender]? {
         guard item.source.kind == .gmail, let headers = item.replyHeaders else { return nil }
+        return mailRecipients(headers: headers, myAddress: myAddress, replyAll: replyAll)
+    }
+
+    /// Who a reply to the email with these headers goes to (any message of the conversation), by the same rules.
+    static func mailRecipients(headers: MailReplyHeaders, myAddress: String?, replyAll: Bool) -> [MailSender] {
         let reply = MailReply(threadID: "", headers: headers, fromAddress: myAddress ?? "", body: "", replyAll: replyAll)
         let recipients = MailReplyBuilder.recipients(for: reply)
         return recipients.to + recipients.cc
     }
 
     /// "Send this reply to Priya Shah in #leadership?" / "Send to sam@northwind.example (and 2 others)?"
-    /// `to`: who an email goes to first, when known; `others`: how many more it goes to.
-    static func confirmation(for item: Suggestion, to first: String? = nil, others: Int) -> String {
+    /// `to`: who an email goes to first, when known; `others`: how many more it goes to. `person`: Slack, whose
+    /// message of the thread the reply answers, when one was picked (the thread is the same either way).
+    static func confirmation(for item: Suggestion, to first: String? = nil, others: Int, person: String? = nil) -> String {
         switch item.source.kind {
         case .gmail:
             return "Send to \(first ?? recipient(of: item))" + (others > 0 ? " (and \(Fmt.plural(others, "other")))?" : "?")
         case .slack, .ai:
+            let who = person ?? item.from
             switch place(of: item) {
-            case .channel(let name): return "Send this reply to \(item.from) in \(name)?"
+            case .channel(let name): return "Send this reply to \(who) in \(name)?"
             case .direct: return "Send this reply to \(item.from)?"
             case .group: return "Send this reply to the group message with \(item.from)?"
-            case .unknown: return "Send this reply to \(item.from) in Slack?"
+            case .unknown: return "Send this reply to \(who) in Slack?"
             }
         }
     }
@@ -142,6 +151,8 @@ struct ReplyComposer: View {
     let content: MessageContent?
     /// Gmail: whether the sign-in allows sending and saving drafts. Slack can always reply.
     let canSend: Bool
+    /// The open message's thread: which of its messages the reply answers.
+    @ObservedObject var conversation: ConversationModel
     /// Saves whatever is typed but not saved yet: the notes before AI reads them, the reply before it goes.
     let flush: () -> Void
     let reconnectGmail: () -> Void
@@ -159,13 +170,32 @@ struct ReplyComposer: View {
 
     private enum Retry { case send, saveDraft }
 
+    /// What the confirmation asked about: the reply goes exactly there, even if the thread changes meanwhile.
+    private struct PendingSend: Equatable {
+        var title: String
+        var replyingTo: String?
+        var replyAll: Bool
+    }
+
+    /// The message of the thread picked to reply to, as the composer names it.
+    private struct Picked {
+        var name: String
+        var isMine: Bool
+        var date: Date
+        /// Slack: the line the reply can start with to quote it.
+        var quote: String?
+    }
+
     @State private var phase: Phase = .idle
     @State private var instruction = ""
     /// What was in the editor before AI replaced it, so Undo can bring it back.
     @State private var previous: String?
     @State private var confirming = false
+    @State private var pending: PendingSend?
     @State private var replyAll = false
     @State private var drafting: Task<Void, Never>?
+    /// The quote line Docket put at the top of the reply (Slack's Quote switch).
+    @State private var quote: String?
     @FocusState private var editorFocused: Bool
 
     private var tone: ReplyTone { ReplyTone(rawValue: toneRaw) ?? .brief }
@@ -174,13 +204,32 @@ struct ReplyComposer: View {
     private var busy: Bool { phase == .drafting || phase == .sending || phase == .savingDraft }
     private var canSendNow: Bool { canSend && hasText && !busy }
 
+    private var picked: Picked? {
+        if let m = conversation.pickedSlack {
+            return Picked(name: ThreadText.sender(of: m, names: integrations.slackNames), isMine: m.isMine, date: m.date,
+                          quote: ThreadText.quoteLine(m.text))
+        }
+        if let e = conversation.pickedEmail {
+            return Picked(name: ThreadText.sender(of: e), isMine: e.isMine, date: e.date, quote: nil)
+        }
+        return nil
+    }
+
+    /// The email being answered: the message picked in the conversation, else its newest one that isn't
+    /// yours once the conversation is in, else the email itself (once its headers are known). The same
+    /// message `sendReply` gets, so the confirmation names who the reply really goes to.
+    private var replyHeaders: MailReplyHeaders? {
+        guard isEmail else { return nil }
+        return integrations.replyHeaders(for: item.id, replyingTo: conversation.replyingTo)
+    }
+
     /// Who an email reply goes to as it will be sent: replying, and with Reply all. Nil until the email's
     /// headers are known (it's been opened).
     private var mailRecipients: (direct: [MailSender], all: [MailSender])? {
-        guard isEmail,
-              let direct = ReplyText.mailRecipients(for: item, myAddress: integrations.gmailAddress, replyAll: false),
-              let all = ReplyText.mailRecipients(for: item, myAddress: integrations.gmailAddress, replyAll: true) else { return nil }
-        return (direct, all)
+        guard let headers = replyHeaders else { return nil }
+        let me = integrations.gmailAddress
+        return (ReplyText.mailRecipients(headers: headers, myAddress: me, replyAll: false),
+                ReplyText.mailRecipients(headers: headers, myAddress: me, replyAll: true))
     }
 
     /// Who Reply all adds.
@@ -214,8 +263,11 @@ struct ReplyComposer: View {
                 }
             }
 
+            if let picked { replyingRow(picked) }
+
             destination(others: others, sendingTo: sendingTo)
 
+            // Optional: the editor below works without AI.
             if aiEnabled {
                 SegmentedControl(selection: Binding(get: { tone }, set: { toneRaw = $0.rawValue }),
                                  options: ReplyTone.allCases.map { ($0, $0.label) })
@@ -224,7 +276,7 @@ struct ReplyComposer: View {
                 instructionRow
             }
 
-            GrowingTextEditor(text: $text, placeholder: isEmail ? "Write your reply…" : "Write your reply in the thread…",
+            GrowingTextEditor(text: $text, placeholder: "Write a reply…",
                               minHeight: 96, maxHeight: 340, focus: $editorFocused, disabled: busy)
                 .help("Your reply. ⌘↩ sends it, after asking.")
 
@@ -250,6 +302,7 @@ struct ReplyComposer: View {
             }
         }
         .animation(Motion.base, value: phase)
+        .animation(Motion.base, value: conversation.target)
         .background {
             // ⌘↩ asks to send, wherever the cursor is in the detail (kept out of the button rows).
             Button("") { requestSend() }
@@ -258,16 +311,86 @@ struct ReplyComposer: View {
                 .opacity(0)
                 .accessibilityHidden(true)
         }
-        .alert(confirmationTitle(others: others, sendingTo: sendingTo), isPresented: $confirming) {
-            Button("Send") { send(replyAll: replyAll && !others.isEmpty) }
+        .alert(pending?.title ?? "", isPresented: $confirming) {
+            Button("Send") { if let pending { send(pending) } }
                 .keyboardShortcut(.defaultAction)
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(confirmationMessage)
         }
+        .onChange(of: conversation.target) { _ in
+            // Answering another message: the quote of the last one goes.
+            setQuote(nil)
+        }
+        .onChange(of: conversation.composerRequests) { _ in editorFocused = true }
         .onDisappear {
             // A draft being written goes with the message; a reply being sent finishes either way.
             drafting?.cancel()
+        }
+    }
+
+    // MARK: Replying to one message
+
+    /// The message picked in the thread: "Replying to Priya · 10:42 AM", the Quote switch (Slack), and ✕ to
+    /// answer the default one again (Slack: the thread; email: its newest message that isn't yours).
+    private func replyingRow(_ picked: Picked) -> some View {
+        let who = Text("Replying to \(ThreadText.replyingToName(picked.name, isMine: picked.isMine))")
+            .font(.system(size: 12.5, weight: .semibold))
+            .foregroundStyle(Color.ink)
+        return HStack(spacing: Space.sm) {
+            Image(systemName: "arrowshape.turn.up.left")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.ink2)
+            // When it's narrow, the time goes first (it's in the tooltip), then the name is cut short.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 4) {
+                    who
+                    Text("· " + ThreadText.when(picked.date, now: app.clock))
+                        .font(.system(size: 12.5, weight: .medium))
+                        .monospacedDigit()
+                        .foregroundStyle(Color.ink2)
+                }
+                .lineLimit(1)
+                .fixedSize()
+                who.lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if let line = picked.quote {
+                Toggle("Quote", isOn: Binding(get: { quote != nil }, set: { setQuote($0 ? line : nil) }))
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color.ink2)
+                    .fixedSize()
+                    .disabled(busy)
+                    .help(picked.isMine ? "Start your reply with a quote of your message"
+                          : "Start your reply with a quote of \(ThreadText.firstName(picked.name))’s message")
+            }
+            Button { withAnimation(Motion.base) { conversation.target = nil } } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9.5, weight: .bold))
+            }
+            .buttonStyle(IconButtonStyle(size: 22))
+            .disabled(busy)
+            .help(isEmail ? "Reply to the latest message instead" : "Reply to the thread instead")
+            .accessibilityLabel(isEmail ? "Reply to the latest message instead" : "Reply to the thread instead")
+        }
+        .padding(.leading, 10)
+        .padding(.trailing, 5)
+        .frame(height: 32)
+        .background(RoundedRectangle(cornerRadius: Radius.sm, style: .continuous).fill(Color.fill))
+        .help(ThreadText.replyingTo(picked.name, isMine: picked.isMine, at: picked.date, now: app.clock))
+        .transition(.opacity)
+    }
+
+    /// Puts `line` at the top of the reply as a quote, replacing the one Docket put there before (nil takes it away).
+    private func setQuote(_ line: String?) {
+        guard line != quote else { return }
+        if let quote { text = ThreadText.removing(quote: quote, from: text) }
+        quote = line
+        if let line {
+            text = ThreadText.adding(quote: line, to: text)
+            editorFocused = true
         }
     }
 
@@ -303,7 +426,7 @@ struct ReplyComposer: View {
     }
 
     private func destinationHelp(others: [String], sendingTo: [MailSender]?) -> String {
-        guard isEmail else { return "Your reply posts as you, under the message in Slack" }
+        guard isEmail else { return "Your reply posts as you, in the message's thread in Slack" }
         if let sendingTo, !sendingTo.isEmpty { return "To " + sendingTo.map(\.headerForm).joined(separator: ", ") }
         let to = ReplyText.recipient(of: item)
         return replyAll && !others.isEmpty ? "To \(to), and \(others.joined(separator: ", "))" : "To \(to)"
@@ -312,9 +435,15 @@ struct ReplyComposer: View {
     /// The confirmation's question, naming who the reply really goes to.
     private func confirmationTitle(others: [String], sendingTo: [MailSender]?) -> String {
         guard let sendingTo, let first = sendingTo.first else {
-            return ReplyText.confirmation(for: item, others: replyAll ? others.count : 0)
+            return ReplyText.confirmation(for: item, others: replyAll ? others.count : 0, person: pickedPerson)
         }
         return ReplyText.confirmation(for: item, to: first.address ?? first.displayName, others: sendingTo.count - 1)
+    }
+
+    /// Slack: whose message of the thread the reply answers, when one was picked ("the thread" for your own).
+    private var pickedPerson: String? {
+        guard !isEmail, let picked else { return nil }
+        return picked.isMine ? "the thread" : picked.name
     }
 
     private var instructionRow: some View {
@@ -501,17 +630,20 @@ struct ReplyComposer: View {
         let id = item.id
         let tone = self.tone
         let ask = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        // AI answers the message the reply goes to (the one picked in the thread, or the default).
+        let target = conversation.replyingTo
         withAnimation(Motion.base) { phase = .drafting }
         drafting = Task { @MainActor in
             do {
-                let reply = try await integrations.draftReply(for: id, tone: tone, instruction: ask.isEmpty ? nil : ask)
+                let reply = try await integrations.draftReply(for: id, tone: tone, instruction: ask.isEmpty ? nil : ask, replyingTo: target)
                 try Task.checkCancellation()
                 let written = reply.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !written.isEmpty else { throw AIError.badResponse("") }
                 let before = text
                 withAnimation(Motion.base) {
                     previous = before.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : before
-                    text = written
+                    // The quote stays on top while Quote is on.
+                    text = quote.map { ThreadText.adding(quote: $0, to: written) } ?? written
                     phase = .drafted
                 }
                 editorFocused = true
@@ -530,15 +662,20 @@ struct ReplyComposer: View {
         withAnimation(Motion.base) { phase = .idle }
     }
 
-    /// Only ever asks: sending happens from the confirmation.
+    /// Only ever asks: sending happens from the confirmation, to what it named (taken down now).
     private func requestSend() {
         guard canSendNow else { return }
         flush()
+        let others = self.others
+        let sendingTo = self.sendingTo(others: others)
+        pending = PendingSend(title: confirmationTitle(others: others, sendingTo: sendingTo), replyingTo: conversation.sendTarget,
+                              replyAll: replyAll && !others.isEmpty)
         confirming = true
     }
 
-    /// Integrations marks the message Replied, clears the saved draft and says so in a toast.
-    private func send(replyAll all: Bool) {
+    /// Integrations marks the message Replied, clears the saved draft and says so in a toast; the reply shows
+    /// in the thread at once.
+    private func send(_ request: PendingSend) {
         guard canSendNow else { return }
         let body = text
         let id = item.id
@@ -547,10 +684,12 @@ struct ReplyComposer: View {
         // Not cancelled when the message closes: a reply on its way finishes, and says so.
         Task { @MainActor in
             do {
-                try await integrations.sendReply(body, for: id, replyAll: all)
+                try await integrations.sendReply(body, for: id, replyingTo: request.replyingTo, replyAll: request.replyAll)
                 Haptics.success()
+                conversation.didSend()
                 withAnimation(Motion.base) {
                     if text == body { text = "" }
+                    quote = nil
                     previous = nil
                     instruction = ""
                     replyAll = false
@@ -566,12 +705,14 @@ struct ReplyComposer: View {
         guard canSend, hasText, !busy else { return }
         let body = text
         let id = item.id
+        // To the people the composer shows now, even if the conversation arrives meanwhile.
+        let target = conversation.sendTarget
         flush()
         withAnimation(Motion.base) { phase = .savingDraft }
         Task { @MainActor in
             do {
                 // The text stays here too; Integrations says it's saved.
-                try await integrations.saveReplyAsDraft(body, for: id, replyAll: all)
+                try await integrations.saveReplyAsDraft(body, for: id, replyingTo: target, replyAll: all)
                 withAnimation(Motion.base) { phase = .idle }
             } catch {
                 withAnimation(Motion.base) { phase = .failed(Self.message(for: error, service: .gmail), retry: .saveDraft) }

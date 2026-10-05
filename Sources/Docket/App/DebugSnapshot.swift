@@ -163,29 +163,14 @@ enum DebugSnapshot {
                         TaskDraft(title: "Book flights to NYC for the offsite", estimateMinutes: 20, listName: "Personal", reason: "No date given"),
                     ])
             }),
-            ("35-suggestions", {
+            ("35-inbox-slack", {
                 d.app.aiPlanner = nil
-                let integrations = Integrations.shared
-                integrations.isSlackConnected = true
-                integrations.isGmailConnected = true
-                integrations.suggestions = [
-                    Suggestion(source: TaskSource(kind: .slack, externalID: "slack:demo/1", url: nil, label: "#leadership · Priya"),
-                               from: "Priya Shah", subject: nil,
-                               snippet: "Can you send me the Q3 numbers before Thursday's board call? I need them for the deck.",
-                               receivedAt: Date().addingTimeInterval(-3_600),
-                               draft: TaskDraft(title: "Send Priya the Q3 numbers", due: day(3), estimateMinutes: 20, priority: .high)),
-                    Suggestion(source: TaskSource(kind: .gmail, externalID: "gmail:demo-2", url: nil, label: "Sam Lee · Contract redlines"),
-                               from: "Sam Lee", subject: "Contract redlines",
-                               snippet: "Attached are the redlines from their legal team. Could you review sections 4 and 7 by Friday?",
-                               receivedAt: Date().addingTimeInterval(-7_200),
-                               draft: TaskDraft(title: "Review the contract redlines", due: day(5), estimateMinutes: 45, priority: .medium)),
-                    Suggestion(source: TaskSource(kind: .slack, externalID: "slack:demo/3", url: nil, label: "#product · Alex"),
-                               from: "Alex Kim", subject: nil, snippet: "Pricing page copy is ready for your sign-off.",
-                               receivedAt: Date().addingTimeInterval(-86_400),
-                               draft: TaskDraft(title: "Sign off on the pricing page copy", estimateMinutes: 15)),
-                ]
+                UserDefaults.standard.set(TaskSource.Kind.slack.rawValue, forKey: SuggestionsView.tabKey)
+                let files = sampleAttachments(in: dir)
+                Integrations.shared.debugSeed(imageFile: files.image, documentFile: files.document, now: Date())
                 d.app.selection = .suggestions
             }),
+            ("35b-inbox-email", { UserDefaults.standard.set(TaskSource.Kind.gmail.rawValue, forKey: SuggestionsView.tabKey) }),
             ("36-waiting", {
                 var sow = TaskItem(title: "Get the signed SOW back from Northwind")
                 sow.waitingOn = "Priya"
@@ -339,6 +324,36 @@ enum DebugSnapshot {
         } else {
             reader.scrollToEndOfDocument(nil)
         }
+    }
+
+    /// Neutral sample attachments for the inbox screenshots: a small bar chart and a CSV, made here so the
+    /// published screenshots contain nothing that isn't ours.
+    static func sampleAttachments(in dir: URL) -> (image: URL?, document: URL?) {
+        let imageURL = dir.appendingPathComponent("q3-revenue-chart.png")
+        let size = NSSize(width: 960, height: 600)
+        let image = NSImage(size: size, flipped: false) { rect in
+            NSColor(srgbRed: 0.984, green: 0.984, blue: 0.976, alpha: 1).setFill()
+            rect.fill()
+            let values: [CGFloat] = [0.38, 0.46, 0.52, 0.61, 0.70, 0.83]
+            let barWidth: CGFloat = 96, gap: CGFloat = 44, base: CGFloat = 70
+            for (i, v) in values.enumerated() {
+                let x = 90 + CGFloat(i) * (barWidth + gap)
+                let bar = NSRect(x: x, y: base, width: barWidth, height: (rect.height - 160) * v)
+                (i == values.count - 1 ? NSColor(srgbRed: 0.055, green: 0.055, blue: 0.047, alpha: 1)
+                                       : NSColor(srgbRed: 0.80, green: 0.79, blue: 0.76, alpha: 1)).setFill()
+                NSBezierPath(roundedRect: bar, xRadius: 10, yRadius: 10).fill()
+            }
+            NSColor(srgbRed: 0.88, green: 0.87, blue: 0.84, alpha: 1).setFill()
+            NSRect(x: 60, y: base - 2, width: rect.width - 120, height: 2).fill()
+            return true
+        }
+        if let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            try? png.write(to: imageURL)
+        }
+        let csvURL = dir.appendingPathComponent("Q3 board numbers.csv")
+        try? "Metric,Q2,Q3\nARR,$1.20M,$1.66M\nCustomers,41,57\nNet retention,112%,118%\n".write(to: csvURL, atomically: true, encoding: .utf8)
+        return (FileManager.default.fileExists(atPath: imageURL.path) ? imageURL : nil, csvURL)
     }
 
     /// Start of the day `offset` days from today, optionally at an hour.

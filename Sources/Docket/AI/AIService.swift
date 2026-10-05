@@ -330,18 +330,22 @@ extension AIService {
     /// with a greeting and a sign-off with `myName` (an address isn't a name; without one it signs
     /// "[your name]"). `content` nil uses `message.text`. Nothing is ever sent from here.
     ///
-    /// `replyingTo`: the message in `thread` being answered, when the user picked one; the prompt says which.
+    /// `thread` is the rest of the thread or conversation, as much as there is (the prompt keeps the newest
+    /// ~30 messages, ~12,000 characters). `replyingTo`: the message of the thread being answered when it isn't
+    /// `message` (the user picked another one, or a newer email is the one replies go to); the prompt says
+    /// which, and the reply answers that one.
     func draftReply(to message: IncomingMessage, content: MessageContent?, thread: [ThreadMessage], notes: String,
                     tone: ReplyTone, instruction: String?, myName: String?, replyingTo: ThreadMessage? = nil,
                     now: Date = Date()) async throws -> String {
-        // TODO(group 3): tell the model which message is being answered (`replyingTo`).
         let client = try client()
         let calendar = Calendar.current
         let format = AIPrompts.ReplyFormat(message.source.kind)
         let system = AIPrompts.replySystem(format, tone: tone, notes: notes, instruction: instruction,
-                                           myName: AIPrompts.personName(myName), now: now, calendar: calendar)
+                                           myName: AIPrompts.personName(myName), answersAnother: replyingTo != nil,
+                                           now: now, calendar: calendar)
         let answer = try await client.generate(system: system,
-                                               prompt: AIPrompts.replyInput(message, content: content, thread: thread, calendar: calendar),
+                                               prompt: AIPrompts.replyInput(message, content: content, thread: thread,
+                                                                            replyingTo: replyingTo, calendar: calendar),
                                                schema: AIPrompts.replySchema)
         return try AIAnswers.reply(answer, format: format)
     }

@@ -243,7 +243,7 @@ final class GoogleSignInTests: XCTestCase {
         XCTAssertEqual(GoogleOAuth.PKCE.base64URL(Data([0xFB, 0xFF, 0xFE])), "-__-", "URL-safe alphabet, no padding")
     }
 
-    func testAuthorizationURLAsksForReadOnlyGmailWithPKCE() throws {
+    func testAuthorizationURLAsksForGmailWithPKCE() throws {
         let client = GoogleOAuth.Client(id: "1234-test.apps.googleusercontent.com", secret: "test-client-secret")
         let url = try XCTUnwrap(GoogleOAuth.authorizationURL(client: client, redirectURI: "http://127.0.0.1:49152",
                                                              state: "st4te_x-1", challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"))
@@ -253,8 +253,8 @@ final class GoogleSignInTests: XCTestCase {
         XCTAssertEqual(items["client_id"], client.id)
         XCTAssertEqual(items["redirect_uri"], "http://127.0.0.1:49152")
         XCTAssertEqual(items["response_type"], "code")
-        // Reading, and replying (gmail.compose) only when the user clicks Send or Save draft.
-        XCTAssertEqual(items["scope"], "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose")
+        // gmail.modify: reading, stars, and replying only when the user clicks Send or Save draft.
+        XCTAssertEqual(items["scope"], "openid email https://www.googleapis.com/auth/gmail.modify")
         XCTAssertEqual(items["state"], "st4te_x-1")
         XCTAssertEqual(items["code_challenge"], "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
         XCTAssertEqual(items["code_challenge_method"], "S256")

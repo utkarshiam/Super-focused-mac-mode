@@ -543,7 +543,10 @@ extension SlackClient {
     /// the others are looked up, and the inbox message (`around`, its ts), which a long thread keeps.
     ///
     /// Asked for a message that has no replies, Slack sends just that message: a conversation of one.
-    /// Joins and the like, deleted, hidden and empty messages are left out (the inbox message never is).
+    /// Asked for a reply rather than its parent, this reads the parent's thread, keeping the reply in it (as
+    /// `around`, when that's nil).
+    /// The parent always comes first, even deleted. Joins and the like, deleted, hidden and empty replies
+    /// are left out (the inbox message never is).
     /// A thread is read 200 messages a page, at most 1,000 (`fullThreadPages`), and shows at most 500
     /// (`fullThreadLimit`): beyond that, its first message, which says what it's about, and the ones
     /// closest to the inbox message, or the newest ones when there's no `around`.
@@ -559,8 +562,70 @@ extension SlackClient {
     func fullThread(channel: String, threadTS: String, myUserID: String, names known: [String: String],
                     around target: String?) async throws -> [ThreadSlackMessage] {
         guard !channel.isEmpty, Self.isTimestamp(threadTS) else { throw IntegrationError.unexpected(.slack, "no thread to read") }
-        let target = target.flatMap { Self.isTimestamp($0) ? $0 : nil }
+        var byTS = try await wholeThread(channel: channel, threadTS: threadTS)
+        // A reply comes back alone, its parent elsewhere: the thread is the parent's.
+        if let asked = byTS.first(where: { Self.compare($0.key, threadTS) == 0 })?.value, let parent = asked.threadTs,
+           Self.isTimestamp(parent), !byTS.keys.contains(where: { Self.compare($0, parent) == 0 }) {
+            byTS = try await wholeThread(channel: channel, threadTS: parent)
+        }
 
+        // The parent always leads, as in Slack, even deleted ("This message was deleted.") or empty.
+        let first = byTS.keys.min { Self.compare($0, $1) < 0 }
+        // Asked by a reply rather than its parent (Slack sends the whole thread, or the reply alone): that reply
+        // is the one being looked at, kept like `around`.
+        let target = target.flatMap { Self.isTimestamp($0) ? $0 : nil }
+            ?? first.flatMap { Self.compare($0, threadTS) == 0 ? nil : threadTS }
+        let shown = byTS.filter { ts, m in m.isShownInThread || ts == first || target.map { Self.compare(ts, $0) == 0 } == true }
+        let chosen = Self.fullThreadWindow(Array(shown.keys), around: target, limit: Self.fullThreadLimit).compactMap { shown[$0] }
+        let names = await names(for: chosen, known: known, lookups: Self.fullThreadLookups)
+
+        return chosen.compactMap { m in
+            guard let mts = m.ts else { return nil }
+            let markup = SlackText.naming(m.displayText, names: names)
+            let userID = m.user.flatMap { $0.isEmpty ? nil : $0 }
+            return ThreadSlackMessage(id: mts, from: Self.sender(of: m, names: names), userID: userID,
+                                      date: Date(timeIntervalSince1970: TimeInterval(mts) ?? 0), markup: markup,
+                                      text: SlackText.readable(markup, names: names), files: m.attachmentList,
+                                      isMine: userID != nil && userID == myUserID)
+        }
+    }
+
+    /// Saves the message for later in Slack, or takes it out again (stars.add / stars.remove with channel and
+    /// timestamp; needs stars:write).
+    ///
+    /// Already saved (or already not) counts as done, and so does taking out a message that's gone.
+    ///
+    /// When Slack won't save messages for this app, the star stays in Docket only; `isStarRefusal` tells
+    /// those errors apart from failures to put the star back for. An app made without stars:write throws
+    /// `.missingPermission(.slack, "stars:write")` (updating the app fixes it); the methods retired or not
+    /// allowed for this token or workspace throw `starsRefused(starring:)`. Anything else (offline, signed
+    /// out, the message deleted) throws as usual.
+    func setStarred(_ starred: Bool, channel: String, ts: String) async throws {
+        guard !channel.isEmpty, Self.isTimestamp(ts) else { throw IntegrationError.unexpected(.slack, "no message to star") }
+        do {
+            _ = try await perform(starred ? "stars.add" : "stars.remove", [("channel", channel), ("timestamp", ts)], as: Envelope.self)
+        } catch let refusal as Refusal {
+            switch refusal.code {
+            case "already_starred" where starred, "not_starred" where !starred:
+                return
+            case "message_not_found", "channel_not_found":
+                // Nothing left in Slack to take out.
+                if !starred { return }
+                throw refusal.code == "message_not_found" ? Self.messageGone : Self.error(code: refusal.code, needed: refusal.needed)
+            case "missing_scope":
+                let needed = refusal.needed.flatMap { Self.namesStarScopes($0) ? $0 : nil } ?? "stars:write"
+                throw IntegrationError.missingPermission(.slack, needed)
+            case _ where Self.starRefusals.contains(refusal.code):
+                throw Self.starsRefused(starring: starred)
+            default:
+                throw Self.error(code: refusal.code, needed: refusal.needed)
+            }
+        }
+    }
+
+    /// Every message of the thread at `threadTS` (conversations.replies, 200 a page, `fullThreadPages` pages at
+    /// most), each once, by ts.
+    private func wholeThread(channel: String, threadTS: String) async throws -> [String: RawMessage] {
         var byTS: [String: RawMessage] = [:]
         var cursor: String?
         for _ in 0..<Self.fullThreadPages {
@@ -581,51 +646,10 @@ extension SlackClient {
             guard page.hasMore != false, let next = page.responseMetadata?.nextCursor, !next.isEmpty, next != cursor else { break }
             cursor = next
         }
-
-        let shown = byTS.filter { ts, m in m.isShownInThread || target.map { Self.compare(ts, $0) == 0 } == true }
-        let chosen = Self.fullThreadWindow(Array(shown.keys), around: target, limit: Self.fullThreadLimit).compactMap { shown[$0] }
-        let names = await names(for: chosen, known: known, lookups: Self.fullThreadLookups)
-
-        return chosen.compactMap { m in
-            guard let mts = m.ts else { return nil }
-            let markup = SlackText.naming(m.displayText, names: names)
-            let userID = m.user.flatMap { $0.isEmpty ? nil : $0 }
-            return ThreadSlackMessage(id: mts, from: Self.sender(of: m, names: names), userID: userID,
-                                      date: Date(timeIntervalSince1970: TimeInterval(mts) ?? 0), markup: markup,
-                                      text: SlackText.readable(markup, names: names), files: m.attachmentList,
-                                      isMine: userID != nil && userID == myUserID)
-        }
+        return byTS
     }
 
-    /// Saves the message for later in Slack, or takes it out again (stars.add / stars.remove with channel and
-    /// timestamp; needs stars:write).
-    ///
-    /// Already saved (or already not) counts as done, and so does taking out a message that's gone. When
-    /// Slack won't save messages for this app at all (the methods retired, not allowed for this token or
-    /// workspace, or the app made without stars:write), this throws `starsRefused(starring:)`: the star
-    /// then stays in Docket only, which `isStarRefusal` tells apart from failures to undo it for. Anything
-    /// else (offline, signed out, the message deleted) throws as usual.
-    func setStarred(_ starred: Bool, channel: String, ts: String) async throws {
-        guard !channel.isEmpty, Self.isTimestamp(ts) else { throw IntegrationError.unexpected(.slack, "no message to star") }
-        do {
-            _ = try await perform(starred ? "stars.add" : "stars.remove", [("channel", channel), ("timestamp", ts)], as: Envelope.self)
-        } catch let refusal as Refusal {
-            switch refusal.code {
-            case "already_starred" where starred, "not_starred" where !starred:
-                return
-            case "message_not_found", "channel_not_found":
-                // Nothing left in Slack to take out.
-                if !starred { return }
-                throw refusal.code == "message_not_found" ? Self.messageGone : Self.error(code: refusal.code, needed: refusal.needed)
-            case _ where Self.starRefusals.contains(refusal.code):
-                throw Self.starsRefused(starring: starred)
-            default:
-                throw Self.error(code: refusal.code, needed: refusal.needed)
-            }
-        }
-    }
-
-    // MARK: Pieces
+    // MARK: Pieces of whole threads and stars
 
     /// The most messages a whole thread shows: its first and 499 more.
     static let fullThreadLimit = 500
@@ -637,26 +661,41 @@ extension SlackClient {
     /// The message (or its whole thread) was deleted in Slack.
     static let messageGone = IntegrationError.api(.slack, "That message isn't in Slack any more.")
 
-    /// What `setStarred` throws when Slack won't save messages for later for this app: the star is kept (or
-    /// taken off) in Docket only, and the views say so once, quietly.
+    /// What `setStarred` throws when Slack won't save messages for later for this app (the methods retired, or
+    /// not allowed): the star is kept (or taken off) in Docket only, and the views say so once, quietly.
     static func starsRefused(starring: Bool) -> IntegrationError {
         .api(.slack, starring ? "Saved in Docket only (Slack didn't allow saving it there)"
                               : "Unstarred in Docket only (Slack didn't allow changing it there)")
     }
 
-    /// Whether `error` is Slack refusing stars for this app (`starsRefused`), rather than a failure to undo
-    /// the star for.
+    /// Whether `error` is Slack not saving messages for later for this app (`starsRefused`, or the app
+    /// without stars:write), so the star stays in Docket, rather than a failure to put the star back for.
     static func isStarRefusal(_ error: Error) -> Bool {
-        guard let e = error as? IntegrationError else { return false }
-        return e == starsRefused(starring: true) || e == starsRefused(starring: false)
+        switch error as? IntegrationError {
+        case .missingPermission(.slack, let needed)?:
+            return namesStarScopes(needed)
+        case let e?:
+            return e == starsRefused(starring: true) || e == starsRefused(starring: false)
+        case nil:
+            return false
+        }
     }
 
-    /// Slack's answers to stars.add and stars.remove that mean it won't save messages for this app at all:
-    /// the methods retired, not allowed for this token or workspace, or the permission missing.
+    /// The permissions for saving messages for later (stars.add, stars.remove, stars.list).
+    static let starScopes: Set<String> = ["stars:read", "stars:write"]
+
+    /// Whether Slack's "needed" ("stars:write", or a list) names only the permissions for saving for later.
+    static func namesStarScopes(_ needed: String) -> Bool {
+        let names = needed.split(whereSeparator: { $0 == "," || $0.isWhitespace }).map(String.init)
+        return !names.isEmpty && names.allSatisfy(starScopes.contains)
+    }
+
+    /// Slack's answers to stars.add and stars.remove that mean it won't save messages for this app at all,
+    /// whatever the app's permissions: the methods retired, or not allowed for this token or workspace.
     static let starRefusals: Set<String> = [
         "method_deprecated", "deprecated_endpoint", "unknown_method", "not_allowed", "not_allowed_token_type",
-        "no_permission", "missing_scope", "restricted_action", "access_denied", "ekm_access_denied",
-        "team_access_not_granted", "enterprise_is_restricted", "feature_not_enabled",
+        "no_permission", "restricted_action", "access_denied", "ekm_access_denied", "team_access_not_granted",
+        "enterprise_is_restricted", "feature_not_enabled",
     ]
 
     /// Which of a thread's messages (by timestamp, in any order) the whole thread shows, oldest first: all of
@@ -1184,7 +1223,7 @@ enum SlackManifest {
     static let contentScopes: Set<String> = ["files:read", "channels:history", "groups:history", "im:history", "mpim:history",
                                              "stars:read", "stars:write"]
 
-    static let description = "Turns saved Slack messages into tasks, shows their files and threads, posts your replies and plans, and sets your focus status."
+    static let description = "Turns Slack messages into tasks, shows files and threads, saves messages for later, posts your replies and plans, and sets focus status."
 
     static var manifest: [String: Any] {
         [
