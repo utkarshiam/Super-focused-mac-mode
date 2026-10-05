@@ -76,7 +76,8 @@ final class BulkActionsTests: XCTestCase {
         XCTAssertNil(call.scheduledDate, "the plan date goes, so the task follows its deadline")
         XCTAssertEqual(store.task(ids[1])!.scheduledDate, friday)
         XCTAssertNil(store.task(ids[1])!.dueDate)
-        XCTAssertEqual(store.task(ids[2])!.dueDate, friday)
+        XCTAssertEqual(store.task(ids[2])!.scheduledDate, friday, "before its deadline it's re-planned")
+        XCTAssertEqual(store.task(ids[2])!.dueDate, day(5), "and the deadline stays put")
         XCTAssertEqual(undo.undoActionName, "Reschedule")
 
         // One ⌘Z puts all three back with a single restore: the steps setDueDay/setScheduled record are folded in.
@@ -90,7 +91,7 @@ final class BulkActionsTests: XCTestCase {
 
         undo.redo()
         XCTAssertEqual(store.task(ids[1])!.scheduledDate, friday)
-        XCTAssertEqual(store.task(ids[2])!.dueDate, friday)
+        XCTAssertEqual(store.task(ids[2])!.scheduledDate, friday)
         XCTAssertNil(store.task(ids[0])!.scheduledDate)
     }
 
@@ -170,7 +171,8 @@ final class BulkActionsTests: XCTestCase {
         undo.undo()
 
         XCTAssertEqual(step { store.pushTasksToTomorrow(ids) }, 3)
-        XCTAssertEqual(store.task(ids[0])!.dueDate, day(1), "the deadline moves when there is one")
+        XCTAssertEqual(store.task(ids[0])!.dueDate, day(3), "a later deadline stays put")
+        XCTAssertEqual(store.task(ids[0])!.scheduledDate, day(1))
         XCTAssertEqual(store.task(ids[1])!.scheduledDate, day(1))
         XCTAssertEqual(store.task(ids[2])!.scheduledDate, day(1))
         XCTAssertEqual(undo.undoActionName, "Move to Tomorrow")
@@ -322,13 +324,15 @@ final class TaskSelectionTests: XCTestCase {
     }
 
     /// The Inbox with tasks due on consecutive days, so the list reads in the order given.
-    private func makeInbox(_ titles: [String] = ["A", "B", "C", "D", "E"]) -> (Store, AppState, [UUID]) {
-        let store = Store(persistence: Persistence(directory: dir), seedIfEmpty: false)
+    /// Tasks due on consecutive days starting `firstDue` days from today, listed in the Inbox.
+    private func makeInbox(_ titles: [String] = ["A", "B", "C", "D", "E"], firstDue: Int = 1) -> (Store, AppState, [UUID]) {
+        // Each inbox gets its own folder, so two in one test don't share a data file.
+        let store = Store(persistence: Persistence(directory: dir.appendingPathComponent(UUID().uuidString)), seedIfEmpty: false)
         let cal = Calendar.current
         let today = cal.startOfDay(for: Date())
         let ids = titles.enumerated().map { i, title in
             var t = TaskItem(title: title)
-            t.dueDate = cal.date(byAdding: .day, value: i + 1, to: today)
+            t.dueDate = cal.date(byAdding: .day, value: firstDue + i, to: today)
             return store.addTask(t).id
         }
         let app = AppState()
@@ -569,29 +573,35 @@ final class TaskSelectionTests: XCTestCase {
     }
 
     func testMovingTheFocusedTaskAwayHandsTheCursorOn() {
-        let (store, app, ids) = makeInbox()
-        let today = Calendar.current.startOfDay(for: Date())
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
 
-        // A is first and stays first when it moves to today: the cursor stays on it.
+        // Due later: "Today" only re-plans A, so it keeps its place and the cursor stays on it.
+        let (store, app, ids) = makeInbox()
         app.click(ids[0], .plain, in: store)
         XCTAssertTrue(app.triage(.move(.today), in: store))
-        XCTAssertEqual(store.task(ids[0])!.dueDate, today)
+        XCTAssertEqual(store.task(ids[0])!.scheduledDate, today)
+        XCTAssertEqual(store.task(ids[0])!.dueDate, cal.date(byAdding: .day, value: 1, to: today), "the deadline stays put")
+        XCTAssertEqual(app.visibleTaskOrder(in: store), ids)
         XCTAssertEqual(app.selectedTaskID, ids[0])
 
-        // C jumps up to sit after A, so the cursor goes on to D, the next task where C was.
-        app.click(ids[2], .plain, in: store)
-        XCTAssertTrue(app.triage(.move(.today), in: store))
-        XCTAssertEqual(app.visibleTaskOrder(in: store), [ids[0], ids[2], ids[1], ids[3], ids[4]])
-        XCTAssertEqual(app.selectedTaskID, ids[3])
+        // Overdue: moving A to today moves its deadline, A drops to the end, and the cursor goes on to B.
+        let (late, lateApp, lateIDs) = makeInbox(firstDue: -5)
+        lateApp.click(lateIDs[0], .plain, in: late)
+        XCTAssertTrue(lateApp.triage(.move(.today), in: late))
+        XCTAssertEqual(late.task(lateIDs[0])!.dueDate, today)
+        XCTAssertEqual(lateApp.visibleTaskOrder(in: late), Array(lateIDs.dropFirst()) + [lateIDs[0]])
+        XCTAssertEqual(lateApp.selectedTaskID, lateIDs[1])
 
         // Several selected: they all move and stay selected for the next change.
-        app.click(ids[4], .toggle, in: store)
-        XCTAssertTrue(app.triage(.move(.tomorrow), in: store))
-        XCTAssertEqual(app.selectedTaskIDs, [ids[3], ids[4]])
-        XCTAssertTrue([ids[3], ids[4]].allSatisfy { store.task($0)!.dueDate == QuickDay.tomorrow.date() })
+        lateApp.click(lateIDs[3], .plain, in: late)
+        lateApp.click(lateIDs[4], .toggle, in: late)
+        XCTAssertTrue(lateApp.triage(.move(.tomorrow), in: late))
+        XCTAssertEqual(lateApp.selectedTaskIDs, [lateIDs[3], lateIDs[4]])
+        XCTAssertTrue([lateIDs[3], lateIDs[4]].allSatisfy { late.task($0)!.dueDate == QuickDay.tomorrow.date() })
 
-        app.deselectAll()
-        XCTAssertFalse(app.triage(.move(.today), in: store), "nothing selected")
+        lateApp.deselectAll()
+        XCTAssertFalse(lateApp.triage(.move(.today), in: late), "nothing selected")
     }
 
     func testSearchResultsUseTheOrderTheSearchViewReports() {
@@ -711,5 +721,21 @@ final class ListLayoutTests: XCTestCase {
         let host = NSHostingView(rootView: panel)
         host.layoutSubtreeIfNeeded()
         XCTAssertEqual(host.fittingSize.width, 370, accuracy: 0.5)
+    }
+
+    func testTagChipsCountEachTagOnceInAStableOrder() {
+        var agenda = TaskItem(title: "Agenda")
+        agenda.tags = ["q4", "board", "Finance", "hiring"]
+        var budget = TaskItem(title: "Budget")
+        budget.tags = ["finance", "ops", "Board", "board"]
+
+        let counts = BulkEditPanel.tagCounts([agenda, budget])
+        XCTAssertEqual(counts.map(\.tag), ["board", "Finance", "q4", "hiring", "ops"],
+                       "most common first, then as they first appear, spelled as first seen")
+        XCTAssertEqual(counts.map(\.count), [2, 2, 1, 1, 1], "a tag twice on one task counts once")
+        // The panel redraws often; equal counts must not swap places between draws.
+        for _ in 0..<50 {
+            XCTAssertEqual(BulkEditPanel.tagCounts([agenda, budget]).map(\.tag), counts.map(\.tag))
+        }
     }
 }

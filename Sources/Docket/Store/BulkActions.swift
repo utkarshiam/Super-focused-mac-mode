@@ -100,11 +100,7 @@ extension Store {
     @discardableResult
     func pushTasksToTomorrow(_ ids: [UUID], now: Date = Date()) -> Int {
         let tomorrow = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: now))!
-        let changing = bulkTargets(ids).filter { t in
-            guard !t.isCompleted else { return false }
-            guard let date = t.dueDate ?? t.scheduledDate else { return true }
-            return !calendar.isDate(date, inSameDayAs: tomorrow)
-        }
+        let changing = bulkTargets(ids).filter { !$0.isCompleted && !isPlaced($0, on: tomorrow) }
         guard !changing.isEmpty else { return 0 }
         undoableBatch("Move to Tomorrow") {
             for t in changing { pushToTomorrow(t.id) }
@@ -196,11 +192,15 @@ extension Store {
 
     // MARK: Helpers
 
-    /// Whether moving `t` to `day` would change nothing: its deadline is on that day with no separate plan
-    /// date, or it has no deadline and is planned for that day.
+    /// Whether moving `t` to `day` would change nothing (same rules as `move(_:toDay:)`): before its deadline
+    /// it's already planned for that day; otherwise its deadline is on that day with no separate plan date,
+    /// or it has no deadline and is planned for that day.
     func isPlaced(_ t: TaskItem, on day: Date) -> Bool {
-        if let due = t.dueDate { return t.scheduledDate == nil && calendar.isDate(due, inSameDayAs: day) }
-        return t.scheduledDate.map { calendar.isDate($0, inSameDayAs: day) } ?? false
+        let target = calendar.startOfDay(for: day)
+        let plannedThere = t.scheduledDate.map { calendar.isDate($0, inSameDayAs: target) } ?? false
+        guard let due = t.dueDate else { return plannedThere }
+        if calendar.startOfDay(for: due) > target { return plannedThere }
+        return t.scheduledDate == nil && calendar.isDate(due, inSameDayAs: target)
     }
 
     /// A tag as it's stored: no leading "#", no spaces (they become "-"). Nil when nothing is left.

@@ -62,7 +62,8 @@ struct AIPlanSheet: View {
             }
         }
         .transition(.opacity)
-        .frame(width: 640, height: 600)
+        // Short enough to hang inside the smallest main window (600 pt, less its title bar).
+        .frame(width: 640, height: 560)
         .background(Color.raised)
         .tint(Color.ink)
         .onAppear { if openedFrom == nil { openedFrom = app.selection } }
@@ -147,17 +148,17 @@ struct AIPlanSheet: View {
     private var notice: some View {
         if !aiEnabled {
             AINotice(icon: "sparkles", message: "AI is turned off. You can turn it on in Settings → AI.",
-                     actions: [NoticeAction("Open Settings", help: "Open Settings", app.showSettings)])
+                     actions: [NoticeAction("Open Settings", help: "Open Settings → AI") { SettingsView.show(.ai, app: app) }])
         } else if !ai.isConfigured {
             AINotice(icon: "key", message: "Add a Google Gemini API key in Settings → AI to use this. Keys are free from Google AI Studio.",
-                     actions: [NoticeAction("Open Settings", help: "Open Settings", app.showSettings),
+                     actions: [NoticeAction("Open Settings", help: "Open Settings → AI") { SettingsView.show(.ai, app: app) },
                                NoticeAction("Get a key", help: "Open Google AI Studio in your browser") { openAIStudio() }])
         } else if let problem {
             switch problem {
             case .failed(let message, let needsSettings):
                 AINotice(icon: "exclamationmark.triangle", message: message, tone: .danger,
                          actions: [NoticeAction("Try again", help: "Send it again", run)]
-                            + (needsSettings ? [NoticeAction("Open Settings", help: "Open Settings", app.showSettings)] : []))
+                            + (needsSettings ? [NoticeAction("Open Settings", help: "Open Settings → AI") { SettingsView.show(.ai, app: app) }] : []))
             case .nothingFound:
                 AINotice(icon: "text.magnifyingglass",
                          message: isNote ? "No tasks found in this note." : "No tasks found in that. Add a little more detail and try again.",
@@ -981,7 +982,7 @@ struct AIBreakdownRow: View {
                     .buttonStyle(SecondaryPill(height: 28))
                     .help("Ask again")
                 if needsSettings {
-                    Button("Open Settings") { app.showSettings() }
+                    Button("Open Settings") { SettingsView.show(.ai, app: app) }
                         .buttonStyle(SecondaryPill(height: 28))
                         .help("Open Settings")
                 }
@@ -1153,7 +1154,7 @@ private struct OrderDayPopover: View {
             case .failed(let message, let needsSettings):
                 AINotice(icon: "exclamationmark.triangle", message: message, tone: .danger,
                          actions: [NoticeAction("Try again", help: "Ask again") { attempt += 1 }]
-                            + (needsSettings ? [NoticeAction("Open Settings", help: "Open Settings", app.showSettings)] : []))
+                            + (needsSettings ? [NoticeAction("Open Settings", help: "Open Settings → AI") { SettingsView.show(.ai, app: app) }] : []))
             }
 
             HStack(spacing: Space.sm) {

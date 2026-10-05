@@ -133,7 +133,7 @@ extension NoteTemplate {
         ## Capture anything, fast
         - Press **⌃⌥T** from any app to open Quick Capture (change it in Settings).
         - Or click the ✓ icon in the menu bar.
-        - Type naturally — Docket picks out the details:
+        - Type naturally, or pick the date, time and list from the menus under the field:
           - `Board prep fri 3pm 90m !!! #work @alarm15`
           - `Pay contractor invoice tomorrow #finance`
           - `Gym every mon, wed, fri 7am 1h`
@@ -147,24 +147,40 @@ extension NoteTemplate {
         - **Repeat:** daily, every weekday, every mon & thu, every 2 weeks, monthly
         - **Reminders:** @remind (at deadline), @remind30 (30 min before), @alarm10 (loud alarm 10 min before)
 
+        ## Plan with AI
+        Press **⌘J** (or the ✨ in the add field), write what's on your mind, and Docket turns it into tasks with dates, durations and steps. You check them before anything is added. **Break down with AI** in a task's checklist splits big work into steps, and **Order my day** (✨ in Calendar) suggests an order for today. Add a Google Gemini key in **Settings → AI**.
+
+        ## Your calendar
+        **Calendar** is every dated task in one list, overdue first. Each line shows its real date, time and how long it takes. Drag tasks to reorder a day (dragging never changes a date), switch to **Month** to drop a task on another day, and press **⌥⌘C** for compact rows when the list gets long.
+
+        ## Many tasks at once
+        ⌘-click or ⇧-click to select several tasks, or ⌘A for all. Then press **T** (today), **M** (tomorrow), **W** (next week) or **X** (done), or use the panel on the right to change the list, priority, tags or estimate. One ⌘Z undoes the lot.
+
+        ## Search
+        **⌘F** searches every task and note. Use `"quotes"` for a phrase and `#tag` to narrow it down.
+
+        ## Waiting on others
+        Delegated something? Put a name in **Waiting on** and it shows up under **Waiting**. Tasks that keep slipping get a gentle nudge: do it, delegate it, or drop it.
+
+        ## Slack and Gmail
+        Connect them in **Settings → Connections**. React with 📌 to a Slack message or star an email in Gmail, and Docket suggests a task for it under **From Slack & Gmail**. Messages that @mention you and emails waiting on a reply show up there too. Focus sessions can set your Slack status, and you can share your plan to a channel.
+
         ## Alarms vs reminders
         - A **reminder** is a normal macOS notification with Complete / Snooze buttons.
         - An **alarm** rings and keeps ringing in a window on top of everything until you snooze or dismiss it.
-
-        ## Your calendar
-        **Calendar** is today and everything after it in one place. Click a day in the week strip to jump to it, switch to **Month** for the whole month, and drag any task onto a day to move it. Turn on calendar events in Settings to see your meetings next to your tasks.
 
         ## Notes that look finished
         Notes open in **Read** mode: headings, lists, checkboxes, tables and code show formatted. Press **⌘E** to edit the Markdown underneath. Paste Markdown from anywhere into an empty note, or use **New Note from Clipboard (⌥⌘V)**, and it shows formatted right away. Drag in photos or videos, or paste a screenshot.
 
         ## Notes → tasks
-        Write meeting notes with checklists like the sample note, then click **Extract action items**. Each open item becomes a task. Ticking it in the note completes the task, and completing the task ticks it in the note.
+        Write meeting notes with checklists like the sample note, then click **Extract action items**. Each open item becomes a task. Ticking it in the note completes the task, and completing the task ticks it in the note. **Find Tasks with AI** (in the note's ⋯ menu) catches the ones without checkboxes.
 
         ## Shortcuts
-        - ⌘N new task · ⇧⌘N new note · ⌘K jump to anything
-        - ⌘1 Calendar · ⌘2 Inbox · ⌘3 Notes
-        - ↑ ↓ move through tasks · ← → change day · esc close
-        - ⌘E read or edit a note · ⌥⌘V note from clipboard · ⌃⌘S hide the sidebar
+        - ⌘N new task · ⇧⌘N new note · ⌘K jump to anything · ⌘F search · ⌘J plan with AI
+        - ⌘1 Calendar · ⌘2 Inbox · ⌘3 Notes · ⌘8 Waiting
+        - ↑ ↓ move through tasks · ⇧↑ ⇧↓ select more · esc close
+        - T today · M tomorrow · W next week · X done (on the selected tasks)
+        - ⌘E read or edit a note · ⌥⌘V note from clipboard · ⌃⌘S hide the sidebar · ⌥⌘C compact rows
         - ⌘↩ complete selected task · ⌘D today's daily note
         """
 }

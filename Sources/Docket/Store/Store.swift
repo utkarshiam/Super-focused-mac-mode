@@ -322,9 +322,8 @@ final class Store: ObservableObject {
 
     /// "Tomorrow" from a notification: moves whichever date the task uses.
     func pushToTomorrow(_ id: UUID) {
-        guard let t = task(id) else { return }
         let tomorrow = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: Date()))!
-        if t.dueDate != nil { setDueDay(id, tomorrow) } else { setScheduled(id, tomorrow) }
+        move(id, toDay: tomorrow)
     }
 
     private func pruneOldSnoozes() {

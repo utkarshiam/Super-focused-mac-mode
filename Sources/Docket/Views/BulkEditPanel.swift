@@ -186,8 +186,10 @@ struct BulkEditPanel: View {
             LazyVGrid(columns: [GridItem(.flexible(), spacing: Space.sm), GridItem(.flexible(), spacing: Space.sm)], spacing: Space.sm) {
                 ForEach(QuickDay.allCases, id: \.self) { quick in
                     let day = quick.date(now: now)
-                    // Lit when they're all on that day already, so pressing it would change nothing.
-                    let current = !open.isEmpty && open.allSatisfy { store.isPlaced($0, on: day) }
+                    // Lit when they're all on that day already, so pressing it would change nothing. On a Sunday
+                    // next week starts tomorrow: only the first of the two tiles for that day lights up.
+                    let firstForDay = QuickDay.allCases.first { $0.date(now: now) == day } == quick
+                    let current = firstForDay && !open.isEmpty && open.allSatisfy { store.isPlaced($0, on: day) }
                     MoveTile(title: quick.label, detail: Fmt.absoluteDay(day, now: now), key: quick.key, selected: current) {
                         app.move(ids, toDay: quick.date(), in: store)
                     }
@@ -325,7 +327,7 @@ struct BulkEditPanel: View {
     }
 
     private func tagsBlock(_ tasks: [TaskItem], _ ids: [UUID]) -> some View {
-        let counts = tagCounts(tasks)
+        let counts = Self.tagCounts(tasks)
         let known = store.allTags
         return VStack(alignment: .leading, spacing: Space.sm) {
             HStack(alignment: .center, spacing: Space.md) {
@@ -385,8 +387,9 @@ struct BulkEditPanel: View {
         .padding(.vertical, 12)
     }
 
-    /// Each tag on the selected tasks (any capitalisation counts as one) and how many have it, most common first.
-    private func tagCounts(_ tasks: [TaskItem]) -> [(tag: String, count: Int)] {
+    /// Each tag on the selected tasks (any capitalisation counts as one) and how many have it, most common first,
+    /// then in the order they first appear.
+    static func tagCounts(_ tasks: [TaskItem]) -> [(tag: String, count: Int)] {
         var firstSeen: [String: Int] = [:]
         var counts: [String: (tag: String, count: Int)] = [:]
         for t in tasks {
@@ -431,8 +434,8 @@ struct BulkEditPanel: View {
         Button { app.copyChecklist(ids, in: store) } label: {
             Label("Copy as checklist", systemImage: "checklist")
         }
-        // The same height as the Slack button beside it.
-        .buttonStyle(SecondaryPill())
+        // The same height as the Slack button beside it (and "Clear dates" above).
+        .buttonStyle(SecondaryPill(height: 32))
         .help("Copy them as a Markdown checklist with dates and estimates")
         ShareToSlackButton(taskIDs: ids)
     }

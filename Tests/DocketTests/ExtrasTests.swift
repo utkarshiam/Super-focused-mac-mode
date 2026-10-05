@@ -124,6 +124,53 @@ final class ExtrasSlipCountingTests: ExtrasTestCase {
         XCTAssertNil(store.task(id)?.scheduledDate)
     }
 
+    func testLeavingTodayForALaterDayIsAPushEvenWhenNoDateMovesLater() {
+        // Planned for today, due later: moving it to tomorrow re-plans it and the deadline stays put.
+        let store = makeStore()
+        let id = add(store, "Prep the board pack", due: day(4), planned: day(0))
+        store.moveTasks([id], toDay: day(1))
+        XCTAssertEqual(store.task(id)?.dueDate, day(4), "the deadline isn't pulled in")
+        XCTAssertEqual(store.task(id)?.scheduledDate, day(1))
+        XCTAssertEqual(count(store, id), 1, "it left today")
+        // Straight back to today: that push didn't happen after all.
+        store.moveTasks([id], toDay: day(0))
+        XCTAssertEqual(count(store, id), 0)
+
+        func pushes(_ old: (due: Int?, planned: Int?), _ new: (due: Int?, planned: Int?)) -> Bool {
+            var before = TaskItem(title: "Hire a designer")
+            before.dueDate = old.due.map { day($0) }
+            before.scheduledDate = old.planned.map { day($0) }
+            var after = before
+            after.dueDate = new.due.map { day($0) }
+            after.scheduledDate = new.planned.map { day($0) }
+            return Slipping.isPostponement(from: before, to: after, calendar: cal)
+        }
+        XCTAssertTrue(pushes((4, 0), (4, nil)), "today's plan dropped, so it sits on its later deadline")
+        XCTAssertTrue(pushes((4, -2), (1, nil)), "a missed plan date counts as today")
+        XCTAssertFalse(pushes((0, -1), (0, nil)), "a missed plan date dropped, still due today")
+        XCTAssertFalse(pushes((5, 2), (5, nil)), "a later plan date dropped: it was never on today's plate")
+        XCTAssertFalse(pushes((4, 0), (nil, nil)), "no date left at all")
+    }
+
+    func testDatesSetAndUnsetInQuickSuccessionArentAPush() {
+        let store = makeStore()
+        // "Do Today", then taken straight back.
+        let planned = add(store, "Review the budget", due: day(4))
+        store.setScheduled(planned, day(0))
+        store.setScheduled(planned, nil)
+        XCTAssertEqual(count(store, planned), 0)
+        // A first date, picked in two goes.
+        let undated = add(store, "Book the venue")
+        store.setDueDay(undated, day(2))
+        store.setDueDay(undated, day(5))
+        XCTAssertEqual(count(store, undated), 0)
+        // Pulled in, then pushed past where it started: one push.
+        let pulled = add(store, "Send the contract", due: day(3))
+        store.setDueDay(pulled, day(1))
+        store.setDueDay(pulled, day(6))
+        XCTAssertEqual(count(store, pulled), 1)
+    }
+
     func testQuickRepicksCountOnceAndMovingBackCancelsThePush() {
         let store = makeStore()
         let id = add(store, "Hire a CFO", due: day(0))

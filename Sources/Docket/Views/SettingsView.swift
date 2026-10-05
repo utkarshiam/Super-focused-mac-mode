@@ -20,14 +20,24 @@ struct SettingsView: View {
         }
     }
 
-    @State private var tab: Tab = .general
+    /// Remembered, so other screens can open Settings on the right page (`SettingsView.show(_:app:)`).
+    @AppStorage(SettingsView.tabKey) private var tabName = Tab.general.rawValue
+    private var tab: Tab { Tab(rawValue: tabName) ?? .general }
     @Namespace private var ns
+
+    static let tabKey = "settingsTab"
+
+    /// Opens Settings on a given page.
+    @MainActor static func show(_ tab: Tab, app: AppState) {
+        UserDefaults.standard.set(tab.rawValue, forKey: tabKey)
+        app.showSettings()
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
                 ForEach(Tab.allCases) { t in
-                    Button { withAnimation(Motion.snappy) { tab = t } } label: {
+                    Button { withAnimation(Motion.snappy) { tabName = t.rawValue } } label: {
                         VStack(spacing: 5) {
                             Image(systemName: t.icon).font(.system(size: 17, weight: .medium))
                             Text(t.rawValue).font(.system(size: 11.5, weight: .semibold))

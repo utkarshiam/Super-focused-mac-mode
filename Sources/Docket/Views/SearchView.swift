@@ -100,13 +100,13 @@ private struct SearchResultsPane: View {
                         if !results.tasks.isEmpty {
                             sectionHeader("Tasks", TaskSection(id: "search", title: "Tasks", tasks: results.tasks).subtitle, first: true)
                             ForEach(Array(results.tasks.enumerated()), id: \.element.id) { i, task in
-                                TaskRow(task: task, context: .search, index: i)
+                                TaskRow(task: task, context: .search, index: i, titleMatches: results.query.highlights(in: task.title))
                             }
                         }
                         if !results.completed.isEmpty {
                             sectionHeader("Completed", completedSubtitle(results), first: results.tasks.isEmpty)
                             ForEach(Array(results.completed.enumerated()), id: \.element.id) { i, task in
-                                TaskRow(task: task, context: .search, index: results.tasks.count + i)
+                                TaskRow(task: task, context: .search, index: results.tasks.count + i, titleMatches: results.query.highlights(in: task.title))
                             }
                         }
                         if !results.notes.isEmpty {
@@ -200,23 +200,30 @@ private struct SearchNoteRow: View {
 
     var body: some View {
         let excerpt = query.excerpt(for: note)
+        let compact = app.compactRows
         Button { app.reveal(note: note.id) } label: {
-            HStack(alignment: .center, spacing: 14) {
+            // Sized and spaced like the task rows' check circles, so titles line up in both row styles.
+            HStack(alignment: .center, spacing: compact ? 10 : 14) {
                 Image(systemName: note.dailyKey != nil ? "sun.max" : "doc.text")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: compact ? 12 : 13, weight: .semibold))
                     .foregroundStyle(Color.ink2)
-                    .frame(width: 22, height: 22)
-                TitleWhenLayout {
-                    if app.compactRows {
-                        HStack(spacing: Space.sm) {
-                            title
-                            if !excerpt.isEmpty {
-                                highlighted(excerpt)
-                                    .font(.system(size: 12.5))
-                                    .lineLimit(1)
-                            }
+                    .frame(width: compact ? 16 : 22, height: compact ? 16 : 22)
+                if compact {
+                    // One line, like a compact task row: the excerpt gives way first, the date stays whole.
+                    HStack(spacing: Space.sm) {
+                        title
+                        if !excerpt.isEmpty {
+                            highlighted(excerpt)
+                                .font(.system(size: 12.5))
+                                .lineLimit(1)
+                                // A few words even beside a long title, never a lone "…".
+                                .frame(minWidth: 48, alignment: .leading)
                         }
-                    } else {
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    edited
+                } else {
+                    TitleWhenLayout {
                         VStack(alignment: .leading, spacing: 3) {
                             title
                             if !excerpt.isEmpty {
@@ -225,20 +232,14 @@ private struct SearchNoteRow: View {
                                     .lineLimit(2)
                             }
                         }
+                        edited
                     }
-                    Text(Fmt.absoluteDay(note.updatedAt, now: app.clock))
-                        .font(.system(size: app.compactRows ? 13 : 14, weight: .semibold))
-                        .tracking(-0.2)
-                        .monospacedDigit()
-                        .foregroundStyle(Color.ink2)
-                        .lineLimit(1)
-                        .fixedSize()
                 }
             }
             .padding(.horizontal, 14)
-            .padding(.vertical, app.compactRows ? 6 : 11)
+            .padding(.vertical, compact ? 6 : 11)
             .background(
-                RoundedRectangle(cornerRadius: Radius.md, style: .continuous)
+                RoundedRectangle(cornerRadius: compact ? Radius.sm : Radius.md, style: .continuous)
                     .fill(hovering ? Color.pressedTint : Color.clear)
             )
             .contentShape(Rectangle())
@@ -263,6 +264,17 @@ private struct SearchNoteRow: View {
             .foregroundStyle(Color.ink)
             .lineLimit(1)
             .layoutPriority(1)
+    }
+
+    /// When the note was last edited, as a real date.
+    private var edited: some View {
+        Text(Fmt.absoluteDay(note.updatedAt, now: app.clock))
+            .font(.system(size: app.compactRows ? 13 : 14, weight: .semibold))
+            .tracking(-0.2)
+            .monospacedDigit()
+            .foregroundStyle(Color.ink2)
+            .lineLimit(1)
+            .fixedSize()
     }
 
     /// The excerpt in ink2, with the words that matched in ink.

@@ -23,8 +23,10 @@ enum DebugSnapshot {
         guard let dir = directory else { return }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         d.showMainWindow()
-        // Same size every run (the stress step shrinks it, and the frame is autosaved).
+        // Same size every run (the stress step shrinks it, and the frame is autosaved), same Settings page.
         d.mainWindow.setContentSize(NSSize(width: 1220, height: 780))
+        UserDefaults.standard.set(SettingsView.Tab.general.rawValue, forKey: SettingsView.tabKey)
+        d.app.compactRows = false
 
         let firstTask = { d.store.todayTasks().first { $0.estimateMinutes ?? 0 > 2 } ?? d.store.tasks.first }
         let steps: [(String, () -> Void)] = [
@@ -129,8 +131,94 @@ enum DebugSnapshot {
             }),
             ("27-detail-stress-bottom", { scrollDetail(in: d.mainWindow) }),
             ("28-detail-default-size", { d.mainWindow.setContentSize(NSSize(width: 1220, height: 780)) }),
+            // Compact rows, multi-select, search, AI planning, Slack & Gmail, delegation, slipping, celebration.
+            ("30-compact", {
+                d.app.selection = .calendar
+                d.app.selectedTaskID = nil
+                d.app.compactRows = true
+            }),
+            ("31-compact-detail", { d.app.selectedTaskID = firstTask()?.id }),
+            ("32-multiselect", {
+                d.app.compactRows = false
+                let ids = d.store.timeline(keeping: [], now: d.app.clock).compactMap { $0.item.task?.id }
+                d.app.selectedTaskID = ids.first
+                d.app.selectedTaskIDs = Set(ids.prefix(3))
+            }),
+            ("33-search", {
+                d.app.selectionBeforeSearch = .calendar
+                d.app.searchText = "board"
+                d.app.selection = .search
+            }),
+            ("34-ai-plan", {
+                d.app.searchText = ""
+                d.app.selection = .calendar
+                d.app.aiPlanner = AIPlannerRequest(
+                    text: "Board meeting Thursday 10am. Deck done by Wednesday, dry run with Sam before that. Book flights to NYC for the offsite.",
+                    drafts: [
+                        TaskDraft(title: "Finish the board deck", due: day(3), estimateMinutes: 120, priority: .high, listName: "Work",
+                                  subtasks: ["Update the metrics", "Write the ask", "Send to Sam for review"], reason: "Due before Thursday's board meeting"),
+                        TaskDraft(title: "Dry run the deck with Sam", due: day(2, hour: 15), dueHasTime: true, estimateMinutes: 45,
+                                  priority: .medium, listName: "Work", reason: "Before the deck is final"),
+                        TaskDraft(title: "Board meeting", due: day(4, hour: 10), dueHasTime: true, estimateMinutes: 90, priority: .high, listName: "Work"),
+                        TaskDraft(title: "Book flights to NYC for the offsite", estimateMinutes: 20, listName: "Personal", reason: "No date given"),
+                    ])
+            }),
+            ("35-suggestions", {
+                d.app.aiPlanner = nil
+                let integrations = Integrations.shared
+                integrations.isSlackConnected = true
+                integrations.isGmailConnected = true
+                integrations.suggestions = [
+                    Suggestion(source: TaskSource(kind: .slack, externalID: "slack:demo/1", url: nil, label: "#leadership · Priya"),
+                               from: "Priya Shah", subject: nil,
+                               snippet: "Can you send me the Q3 numbers before Thursday's board call? I need them for the deck.",
+                               receivedAt: Date().addingTimeInterval(-3_600),
+                               draft: TaskDraft(title: "Send Priya the Q3 numbers", due: day(3), estimateMinutes: 20, priority: .high)),
+                    Suggestion(source: TaskSource(kind: .gmail, externalID: "gmail:demo-2", url: nil, label: "Sam Lee · Contract redlines"),
+                               from: "Sam Lee", subject: "Contract redlines",
+                               snippet: "Attached are the redlines from their legal team. Could you review sections 4 and 7 by Friday?",
+                               receivedAt: Date().addingTimeInterval(-7_200),
+                               draft: TaskDraft(title: "Review the contract redlines", due: day(5), estimateMinutes: 45, priority: .medium)),
+                    Suggestion(source: TaskSource(kind: .slack, externalID: "slack:demo/3", url: nil, label: "#product · Alex"),
+                               from: "Alex Kim", subject: nil, snippet: "Pricing page copy is ready for your sign-off.",
+                               receivedAt: Date().addingTimeInterval(-86_400),
+                               draft: TaskDraft(title: "Sign off on the pricing page copy", estimateMinutes: 15)),
+                ]
+                d.app.selection = .suggestions
+            }),
+            ("36-waiting", {
+                var sow = TaskItem(title: "Get the signed SOW back from Northwind")
+                sow.waitingOn = "Priya"
+                sow.dueDate = day(2)
+                d.store.addTask(sow)
+                var plan = TaskItem(title: "Feedback on the hiring plan")
+                plan.waitingOn = "Sam"
+                plan.scheduledDate = day(1)
+                d.store.addTask(plan)
+                d.app.selection = .waiting
+            }),
+            ("37-slipping", {
+                var late = TaskItem(title: "Write the hiring plan")
+                late.dueDate = day(-2)
+                late.postponeCount = 4
+                late.estimateMinutes = 60
+                let added = d.store.addTask(late)
+                d.app.selection = .calendar
+                d.app.selectedTaskID = added.id
+            }),
+            ("38-celebration", {
+                d.app.selectedTaskID = nil
+                UserDefaults.standard.removeObject(forKey: DayClear.lastCelebratedKey)
+                Celebration.shared.dayCleared(app: d.app)
+            }),
+            ("39-settings-ai", {
+                UserDefaults.standard.set(SettingsView.Tab.ai.rawValue, forKey: SettingsView.tabKey)
+                d.showSettings()
+            }),
+            ("40-settings-connections", { UserDefaults.standard.set(SettingsView.Tab.connections.rawValue, forKey: SettingsView.tabKey) }),
             ("18-pickers-light", {
                 NSApp.windows.first { $0.title == "Docket Settings" }?.close()
+                UserDefaults.standard.set(SettingsView.Tab.general.rawValue, forKey: SettingsView.tabKey)
                 showGallery(appearance: .aqua)
             }),
             ("19-pickers-dark", { showGallery(appearance: .darkAqua) }),
@@ -153,6 +241,11 @@ enum DebugSnapshot {
             let responder = NSApp.keyWindow?.firstResponder.map { "\(Swift.type(of: $0))" } ?? "-"
             return "t=\(t) active=\(NSApp.isActive) key=\(key) responder=\(responder) palette=\(d.app.showPalette) front=\(NSWorkspace.shared.frontmostApplication?.localizedName ?? "?")"
         }
+        // DOCKET_SNAPSHOT_STEP slows the walk-through (seconds per screen) so animations settle before capture.
+        let step = max(1.6, Double(ProcessInfo.processInfo.environment["DOCKET_SNAPSHOT_STEP"] ?? "") ?? 1.6)
+        // Capture a little past halfway, so animations have settled and the capture (screencapture takes a
+        // moment to start) is done before the next step changes the screen.
+        let settle = min(step - 0.7, max(0.9, step * 0.55))
         var delay = 1.2
         for (name, action) in steps + interactive {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
@@ -160,11 +253,11 @@ enum DebugSnapshot {
                 action()
                 if ProcessInfo.processInfo.environment["DOCKET_SNAPSHOT_TRACE"] != nil { note("step \(name) end:   \(stamp())") }
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.9) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay + settle) {
                 let panel = NSApp.windows.first { ($0 is FloatingPanel || $0.title == "Docket Settings" || $0.title == galleryTitle) && $0.isVisible }
                 capture(panel ?? d.mainWindow, to: dir.appendingPathComponent("\(name).png"))
             }
-            delay += 1.6
+            delay += step
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
             d.alarms.test()
@@ -248,6 +341,13 @@ enum DebugSnapshot {
         }
     }
 
+    /// Start of the day `offset` days from today, optionally at an hour.
+    static func day(_ offset: Int, hour: Int? = nil) -> Date {
+        let cal = Calendar.current
+        let d = cal.date(byAdding: .day, value: offset, to: cal.startOfDay(for: Date()))!
+        return hour.flatMap { cal.date(bySettingHour: $0, minute: 0, second: 0, of: d) } ?? d
+    }
+
     /// Scrolls the rightmost scroll view (the task detail panel) to its end.
     static func scrollDetail(in window: NSWindow) {
         func all(_ v: NSView) -> [NSScrollView] { ((v as? NSScrollView).map { [$0] } ?? []) + v.subviews.flatMap(all) }
@@ -309,15 +409,16 @@ enum DebugSnapshot {
         // Real on-screen pixels (vibrancy and AppKit-backed lists don't show up in cacheDisplay).
         let shot = Process()
         shot.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        if window is FloatingPanel, let primary = NSScreen.screens.first {
-            // Translucent panels: capture the screen area so the blurred background is included.
-            let f = window.frame.insetBy(dx: -24, dy: -24)
-            let rect = "\(Int(f.minX)),\(Int(primary.frame.height - f.maxY)),\(Int(f.width)),\(Int(f.height))"
-            shot.arguments = ["-x", "-R\(rect)", url.deletingPathExtension().path + "-screen.png"]
-        } else {
-            shot.arguments = ["-x", "-o", "-l\(window.windowNumber)", url.deletingPathExtension().path + "-screen.png"]
-        }
+        // The window alone (panels are solid now), so nothing else on screen ever ends up in a screenshot.
+        shot.arguments = ["-x", "-o", "-l\(window.windowNumber)", url.deletingPathExtension().path + "-screen.png"]
         try? shot.run()
+        // A sheet (Plan with AI, Connect…) is its own window: save it on its own too.
+        if let sheet = window.attachedSheet {
+            let sheetShot = Process()
+            sheetShot.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            sheetShot.arguments = ["-x", "-o", "-l\(sheet.windowNumber)", url.deletingPathExtension().path + "-sheet.png"]
+            try? sheetShot.run()
+        }
         // Also record the window number so the shell can use `screencapture -l` if needed.
         let ids = dirFile(url.deletingLastPathComponent())
         let line = "\(url.lastPathComponent) \(window.windowNumber)\n"

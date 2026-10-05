@@ -14,8 +14,22 @@ struct TaskRow: View {
     var onDropBefore: ((UUID) -> Bool)?
     /// Whether a dragged task may land above this row (drags only reorder; they never change a date).
     var canDropBefore: ((UUID) -> Bool)?
+    /// Search: the parts of the title that matched, drawn on a soft highlight.
+    var titleMatches: [Range<String.Index>] = []
     @State private var hovering = false
     @State private var dropTarget = false
+
+    /// The title, with search matches on a soft highlight.
+    private var titleText: Text {
+        guard !titleMatches.isEmpty else { return Text(task.title) }
+        var title = AttributedString(task.title)
+        for range in titleMatches {
+            guard let lower = AttributedString.Index(range.lowerBound, within: title),
+                  let upper = AttributedString.Index(range.upperBound, within: title), lower < upper else { continue }
+            title[lower..<upper].backgroundColor = .fillStrong
+        }
+        return Text(title)
+    }
 
     /// The focused task and every task in a multi-selection share the selected look.
     private var isSelected: Bool { app.isSelected(task.id) }
@@ -79,7 +93,7 @@ struct TaskRow: View {
 
             TitleWhenLayout {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(task.title)
+                    titleText
                         .font(.system(size: 15, weight: .semibold))
                         .tracking(-0.2)
                         .foregroundStyle(dimmed ? Color.ink3 : Color.ink)
@@ -107,7 +121,7 @@ struct TaskRow: View {
             }
             // The title always keeps room to be read; the glyphs, then source, delegation and tags, get what's left.
             CompactLineLayout {
-                Text(task.title)
+                titleText
                     .font(.system(size: 13.5, weight: .semibold))
                     .tracking(-0.1)
                     .foregroundStyle(dimmed ? Color.ink3 : Color.ink)

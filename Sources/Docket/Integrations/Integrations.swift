@@ -1042,7 +1042,8 @@ final class Integrations: ObservableObject {
     /// One undo step takes the task away and brings the card back.
     @discardableResult
     func add(_ suggestion: Suggestion, toast: Bool = true) -> TaskItem? {
-        guard let store else { return nil }
+        // Only a card that's still waiting: a second click as it animates away adds nothing more.
+        guard let store, suggestions.contains(where: { $0.id == suggestion.id }) else { return nil }
         let undo = store.undoManager
         undo?.beginUndoGrouping()
         let task = store.addTask(Self.task(for: suggestion, lists: store.lists))

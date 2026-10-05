@@ -1112,6 +1112,8 @@ final class IntegrationsFlowTests: XCTestCase {
         let first = integrations.suggestions[0]
         integrations.add(first, toast: false)
         XCTAssertEqual(store.tasks.count, 1)
+        XCTAssertNil(integrations.add(first, toast: false), "a second click as the card goes adds nothing")
+        XCTAssertEqual(store.tasks.count, 1)
         XCTAssertFalse(integrations.suggestions.contains(first))
         XCTAssertEqual(undo.undoActionName, "Add Task")
         undo.undo()

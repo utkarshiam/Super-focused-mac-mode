@@ -27,10 +27,13 @@ struct TaskRowBadges: View {
                     HStack(spacing: 4) {
                         Image(systemName: "hourglass")
                             .font(.system(size: 10, weight: .semibold))
-                        // A long name ends in "…" when the line is crowded; the tooltip has it whole.
-                        Text(person)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
+                        // A long name ends in "…" (the tooltip has it whole) rather than squeezing the list
+                        // name beside it down to a letter in a narrow list.
+                        WidthLimit(limit: 100) {
+                            Text(person)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
                     }
                     .help("Waiting on \(person)")
                     .accessibilityElement(children: .ignore)
@@ -50,6 +53,21 @@ struct TaskRowBadges: View {
                 }
             }
         }
+    }
+}
+
+/// Its content at its own width, but never wider than `limit`. (`.frame(maxWidth:)` would pad a short
+/// name out to the limit.)
+private struct WidthLimit: Layout {
+    var limit: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let content = subviews.first else { return .zero }
+        return content.sizeThatFits(ProposedViewSize(width: min(proposal.width ?? limit, limit), height: proposal.height))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(at: bounds.origin, proposal: ProposedViewSize(bounds.size))
     }
 }
 

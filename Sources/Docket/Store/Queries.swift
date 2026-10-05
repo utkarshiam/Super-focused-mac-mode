@@ -407,14 +407,19 @@ extension Store {
 
     // MARK: Rescheduling
 
-    /// Drag-and-drop onto a day: moves the deadline if the task has one (keeping its time), otherwise the plan date.
+    /// Puts a task on a day (Month view drops, Move to, t/m/w, rollover, Move to Tomorrow). Before its
+    /// deadline that only re-plans it ("Do on") and the deadline stays put; on or after the deadline the
+    /// deadline itself moves (keeping its time) and a separate plan date is dropped. No deadline: plan date.
     func move(_ id: UUID, toDay day: Date) {
         guard let t = task(id) else { return }
-        if t.dueDate != nil {
-            setDueDay(id, day)
+        let target = calendar.startOfDay(for: day)
+        if let due = t.dueDate, calendar.startOfDay(for: due) > target {
+            setScheduled(id, target)
+        } else if t.dueDate != nil {
+            setDueDay(id, target)
             if t.scheduledDate != nil { mutateTask(id) { $0.scheduledDate = nil } }
         } else {
-            setScheduled(id, day)
+            setScheduled(id, target)
         }
     }
 }
