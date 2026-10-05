@@ -15,12 +15,37 @@ struct Suggestion: Identifiable, Codable, Hashable {
     var draft: TaskDraft?
     /// What picked it up: a 📌 reaction, a mention, a star, an email waiting for a reply.
     var trigger: SuggestionTrigger?
+    /// The user's own notes on the message (what to do, what to say back). They go into the task's notes
+    /// when the message becomes a task.
+    var note = ""
+    /// The reply being written, typed or drafted with AI. Cleared once it's sent.
+    var replyDraft = ""
+    /// When a reply went out from Docket.
+    var repliedAt: Date?
+    /// The complete message. Slack: filled at refresh from the message itself; email: filled when first opened.
+    var content: MessageContent?
+    /// Slack: the parent message's ts when this one is a reply in a thread.
+    var threadTS: String?
+    /// Email: what a reply needs from the original (Message-ID, subject, sender, recipients), kept with the
+    /// complete message so sending doesn't fetch it again.
+    var replyHeaders: MailReplyHeaders?
+    /// Starred in Docket: shown first in its tab and in the tab's Starred filter. Starring an email stars it in
+    /// Gmail too, and a Slack message is saved for later in Slack when Slack allows it (`Integrations.setStarred`).
+    var isStarred = false
+    /// Other messages of its thread or conversation that Docket shows starred on its own: Slack messages (by
+    /// ts; Slack doesn't say which ones are saved for later), and emails Gmail couldn't star (by message id).
+    /// The item's own message is `isStarred`; other emails are starred in Gmail.
+    var starredInThread: Set<String> = []
 
-    enum CodingKeys: String, CodingKey { case source, from, subject, snippet, receivedAt, draft, trigger }
+    enum CodingKeys: String, CodingKey {
+        case source, from, subject, snippet, receivedAt, draft, trigger
+        case note, replyDraft, repliedAt, content, threadTS, replyHeaders, isStarred, starredInThread
+    }
 }
 
 extension Suggestion {
-    // In an extension so the memberwise initializer stays available. Missing keys fall back to defaults.
+    // In an extension so the memberwise initializer stays available. Missing keys fall back to defaults,
+    // so files from before the inbox (no notes, replies or content) or before stars load as they are.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         source = try c.decode(TaskSource.self, forKey: .source)
@@ -30,6 +55,15 @@ extension Suggestion {
         receivedAt = c.value(.receivedAt, default: Date())
         draft = c.value(.draft, default: nil)
         trigger = c.value(.trigger, default: nil)
+        note = c.value(.note, default: "")
+        replyDraft = c.value(.replyDraft, default: "")
+        repliedAt = c.value(.repliedAt, default: nil)
+        content = c.value(.content, default: nil)
+        threadTS = c.value(.threadTS, default: nil)
+        replyHeaders = c.value(.replyHeaders, default: nil)
+        // Saved before stars: an email that came in because it's starred in Gmail is starred.
+        isStarred = c.value(.isStarred, default: source.kind == .gmail && trigger == .starred)
+        starredInThread = c.value(.starredInThread, default: [])
     }
 }
 
@@ -113,6 +147,10 @@ enum IntegrationError: LocalizedError, Equatable {
             "Slack no longer accepts Docket's token. Paste a new one in Settings → Connections."
         case .signedOut:
             "Google signed Docket out of Gmail. Connect it again in Settings → Connections. (Google signs out apps in testing after 7 days.)"
+        case .missingPermission(.slack, let scope) where Self.isStarScope(scope):
+            "Docket needs one more Slack permission to save messages for later in Slack. Update the Docket app in Settings → Connections."
+        case .missingPermission(.slack, let scope) where Self.isContentScope(scope):
+            "Docket needs more Slack permissions to show files and threads. Update the Docket app in Settings → Connections."
         case .missingPermission(.slack, let scope):
             "The Docket app in Slack is missing the \(scope) permission. Create the app again from step 1 in Settings → Connections."
         case .missingPermission(_, let what):
@@ -134,6 +172,18 @@ enum IntegrationError: LocalizedError, Equatable {
         case .cancelled:
             "Cancelled."
         }
+    }
+
+    /// Slack's "needed" names only permissions the complete message needs (files, thread history, stars).
+    private static func isContentScope(_ needed: String) -> Bool {
+        let names = needed.split(whereSeparator: { $0 == "," || $0.isWhitespace }).map(String.init)
+        return !names.isEmpty && names.allSatisfy(SlackManifest.contentScopes.contains)
+    }
+
+    /// Slack's "needed" names only the permissions for saving messages for later (stars:read, stars:write).
+    private static func isStarScope(_ needed: String) -> Bool {
+        let names = needed.split(whereSeparator: { $0 == "," || $0.isWhitespace }).map(String.init)
+        return !names.isEmpty && names.allSatisfy(InboxScopes.slackStars.contains)
     }
 
     /// Whole minutes to wait, at least one (a bad value never traps).
@@ -172,8 +222,10 @@ enum IntegrationHTTP {
     /// Ephemeral: no cookies, cache or credentials on disk.
     private static let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
+        // A request that stalls gives up after 30 s; a whole transfer may take longer, so an attachment of
+        // up to 100 MB (`InboxCache.largestFile`) still arrives on a slow connection.
         config.timeoutIntervalForRequest = 30
-        config.timeoutIntervalForResource = 90
+        config.timeoutIntervalForResource = 10 * 60
         config.httpCookieStorage = nil
         config.urlCache = nil
         config.httpAdditionalHeaders = ["User-Agent": "Docket (macOS)"]
@@ -262,7 +314,11 @@ enum IntegrationHTTP {
 /// What Integrations remembers between launches, in integrations.json in the data folder.
 /// No tokens: those stay in the keychain.
 struct IntegrationsFile: Codable {
-    var version = 1
+    /// 2 added the inbox: notes, replies, complete messages, granted permissions. 3 added stars (on items and
+    /// on messages of their threads). Older files load as they are (the new fields start empty).
+    static let currentVersion = 3
+
+    var version = currentVersion
     var suggestions: [Suggestion] = []
     /// Message ids (`TaskSource.externalID`) that were added or dismissed, and when. Never suggested again.
     var handled: [String: Date] = [:]
@@ -273,10 +329,23 @@ struct IntegrationsFile: Codable {
     var gmailAddress: String?
     /// Set while Docket's "Heads down" status is on Slack, so it can be undone even after a crash.
     var focusStatus: SlackFocusRecord?
+    /// The permissions the Slack token has, as Slack last listed them (nil: not known).
+    var slackScopes: [String]?
+    /// The Gmail permissions Google granted at sign-in (nil: not known, as for sign-ins from version 1).
+    var gmailScopes: [String]?
+    /// Names of the people and channels the waiting Slack messages mention ("U0…" → "Priya Shah"), so
+    /// their markup reads right after a relaunch.
+    var slackNames: [String: String] = [:]
+    /// Slack turned saving messages for later down (an app made after Slack retired it, a workspace that
+    /// doesn't allow it, or an app without stars:write): stars stay in Docket until Slack is connected again.
+    var slackStarsStayInDocket = false
 
     init() {}
 
-    enum CodingKeys: String, CodingKey { case version, suggestions, handled, skipped, lastRefresh, slack, gmailAddress, focusStatus }
+    enum CodingKeys: String, CodingKey {
+        case version, suggestions, handled, skipped, lastRefresh, slack, gmailAddress, focusStatus
+        case slackScopes, gmailScopes, slackNames, slackStarsStayInDocket
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -289,6 +358,10 @@ struct IntegrationsFile: Codable {
         slack = c.value(.slack, default: nil)
         gmailAddress = c.value(.gmailAddress, default: nil)
         focusStatus = c.value(.focusStatus, default: nil)
+        slackScopes = c.value(.slackScopes, default: nil)
+        gmailScopes = c.value(.gmailScopes, default: nil)
+        slackNames = c.value(.slackNames, default: [:])
+        slackStarsStayInDocket = c.value(.slackStarsStayInDocket, default: false)
     }
 
     static func load(from url: URL) -> IntegrationsFile {
@@ -393,9 +466,10 @@ enum SuggestionDrafts {
         return d
     }
 
-    /// The draft a suggestion would be added with: AI's when there is one, else the plain fallback.
+    /// The draft a suggestion would be added with: AI's when there is one, else the plain fallback, with the
+    /// user's notes on the message above a link back to it (`withNote`).
     static func draft(for s: Suggestion) -> TaskDraft {
-        prepared(s.draft ?? fallback(for: s), for: s)
+        withNote(prepared(s.draft ?? fallback(for: s), for: s), for: s)
     }
 }
 
@@ -453,7 +527,8 @@ struct SeenMessages {
 
 // MARK: - Integrations
 
-/// Slack and Gmail: suggestions to turn into tasks, sharing a plan, and the Slack focus status.
+/// Slack and Gmail: suggestions to turn into tasks, the Slack and Email tabs (InboxStore.swift: the complete
+/// message, its thread and attachments, notes, replies), sharing a plan, and the Slack focus status.
 ///
 /// Network calls run in the background and never block the UI; problems become a status line
 /// (`slackProblem`, `gmailProblem`, `aiProblem`). Tokens live in the keychain only and are never logged.
@@ -481,8 +556,10 @@ final class Integrations: ObservableObject {
     @Published private(set) var aiProblem: String?
 
     /// The Docket app in Slack lacks permissions some features need. Stays until Slack is connected again.
+    /// The ones only the complete message needs (files, threads) have their own banner: `missingSlackScopes`.
     var slackScopeWarning: String? {
-        guard isSlackConnected, let missing = slackAccount?.missingScopes, !missing.isEmpty else { return nil }
+        let missing = (slackAccount?.missingScopes ?? []).filter { !SlackManifest.contentScopes.contains($0) }
+        guard isSlackConnected, !missing.isEmpty else { return nil }
         return "The Docket app in Slack is missing \(missing.joined(separator: ", ")). Create it again from step 1 in Settings → Connections and paste the new token."
     }
     /// Waiting for the user to finish signing in to Google in the browser.
@@ -490,12 +567,39 @@ final class Integrations: ObservableObject {
     /// Bumped when the Google OAuth client changes, so Settings re-reads it.
     @Published private(set) var googleClientRevision = 0
 
+    // The Slack and Email tabs (InboxStore.swift).
+    /// The permissions the Slack token has, as Slack last listed them (nil: not known yet).
+    @Published var grantedSlackScopes: Set<String>?
+    /// Permissions Slack turned a request down for since then (not saved: the next launch asks Slack again).
+    @Published var refusedSlackScopes: Set<String> = []
+    /// The Gmail permissions Google granted at sign-in (nil: not known, as for sign-ins from before the inbox).
+    @Published var grantedGmailScopes: Set<String>?
+    /// Threads, and the loads and sends under way. Kept while Docket runs, never saved.
+    var inbox = InboxMemory()
+    /// The whole Slack threads and email conversations opened this session, by item id, with the replies sent
+    /// from Docket and the stars changed since (`fullThread(for:reload:)`). Never saved.
+    @Published var wholeThreads: [String: InboxThread] = [:]
+    /// Stars that didn't take in Gmail or Slack (and went back), by `StarTarget.key`: why, in plain words, for
+    /// a moment or until the next try (`starProblem(for:message:)`).
+    @Published var starProblems: [String: String] = [:]
+    /// Slack turned saving messages for later down: stars stay in Docket (saved; cleared when Slack is
+    /// connected again).
+    var slackStarsStayInDocket = false
+    /// Names from the last launch of the people and channels the waiting Slack messages mention.
+    var savedSlackNames: [String: String] = [:]
+
     // Dependencies. Tests swap them, so nothing reaches the network, Gemini or a browser.
     var transport: IntegrationHTTP.Transport
     var triage: SuggestionTriage
     var sleep: @Sendable (TimeInterval) async throws -> Void
     var settings: () -> IntegrationSettings = { .current }
     var openURL: (URL) -> Void = { url in _ = NSWorkspace.shared.open(url) }
+    /// Stand-ins for the inbox's Slack and Gmail clients; none means the real ones, through `transport`.
+    var inboxClients = InboxClients()
+    /// Writes replies with AI.
+    var replyWriter: ReplyWriter = .gemini
+    /// The user's name, to sign a reply ("Maya Chen"): the Mac account's full name.
+    var fullName: () -> String = { NSFullUserName() }
 
     static let refreshInterval: TimeInterval = 15 * 60
     /// Coming back to Docket refreshes when the last check is older than this.
@@ -507,7 +611,8 @@ final class Integrations: ObservableObject {
     static let unsortedLimit = 15
 
     private weak var store: Store?
-    private weak var app: AppState?
+    /// For toasts.
+    private(set) weak var app: AppState?
     private var fileURL: URL?
     private var handled: [String: Date] = [:]
     private var skipped: [String: Date] = [:]
@@ -525,7 +630,15 @@ final class Integrations: ObservableObject {
     private var conversations: [String: SlackChannel] = [:]
     private var channelList: (channels: [SlackChannel], fetched: Date)?
     private var google: GoogleSession?
-    private let saveQueue = DispatchQueue(label: "docket.integrations.save", qos: .utility)
+    private let saver = IntegrationsSaver()
+
+    /// IntegrationCache/ in the data folder: attachments downloaded for Quick Look (see `InboxCache`).
+    var cacheDirectory: URL? {
+        fileURL?.deletingLastPathComponent().appendingPathComponent(InboxCache.folderName, isDirectory: true)
+    }
+
+    /// Whether saved state was loaded (`attach`): screenshot samples never replace it.
+    var hasSavedState: Bool { fileURL != nil }
 
     init(transport: @escaping IntegrationHTTP.Transport = IntegrationHTTP.live,
          triage: SuggestionTriage = .gemini,
@@ -555,9 +668,10 @@ final class Integrations: ObservableObject {
         observers.append(center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.refreshIfStale() }
         })
-        // Saves are written in the background; let the last one land before the app exits.
-        observers.append(center.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [saveQueue] _ in
-            saveQueue.sync {}
+        // Saves are written in the background (a note once typing pauses); write what's waiting before the app
+        // exits, and whatever the views save as it quits.
+        observers.append(center.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [saver] _ in
+            saver.quit()
         })
 
         // After launch, so a keychain prompt never holds up the first window.
@@ -581,6 +695,12 @@ final class Integrations: ObservableObject {
         focusRecord = file.focusStatus
         isSlackConnected = file.slack != nil
         isGmailConnected = file.gmailAddress != nil
+        grantedSlackScopes = file.slackScopes.map(Set.init)
+        grantedGmailScopes = file.gmailScopes.map(Set.init)
+        savedSlackNames = file.slackNames
+        slackStarsStayInDocket = file.slackStarsStayInDocket
+        // Attachments of messages that are gone, and a cache grown too big.
+        pruneInboxCache()
 
         cancellables = []
         // A message that becomes a task (Add task here, Edit… in the planner, redo, an import) is done.
@@ -594,11 +714,15 @@ final class Integrations: ObservableObject {
         // Accounts whose state file went missing come back from the keychain by themselves.
         if slackAccount == nil, let token = Keychain.string(Keychain.Account.slackUserToken) {
             try? await connectSlack(token: token, refreshAfter: false)
+        } else if isSlackConnected {
+            // The app may have gained (or lost) permissions since: the Slack tab's banner follows.
+            await checkSlackPermissions()
         }
         if gmailAddress == nil, Keychain.string(Keychain.Account.googleRefreshToken) != nil, let session = googleSession() {
             if let email = try? await GmailClient(session: session, transport: transport).profileEmail() {
                 gmailAddress = email
                 isGmailConnected = true
+                await noteGmailGrants(session)
                 save()
             }
         }
@@ -654,6 +778,8 @@ final class Integrations: ObservableObject {
         }
         // Recomputed: tasks may have been added (or cards handled) while this check waited on the network.
         suggestions = SuggestionInbox.merge(accepted, into: suggestions, blocked: blockedIDs(store))
+        fillIn(slack.wholeMessages)
+        savedSlackNames = slackNamesToKeep()
         handled = SuggestionInbox.pruned(handled, now: now)
         skipped = SuggestionInbox.pruned(skipped, now: now)
         // "Updated 10:42 AM" only when something was actually checked; otherwise coming back retries.
@@ -664,6 +790,26 @@ final class Integrations: ObservableObject {
     private func blockedIDs(_ store: Store) -> Set<String> {
         SuggestionInbox.blockedIDs(pending: suggestions, handled: handled,
                                    taskSourceIDs: Set(store.tasks.compactMap { $0.source?.externalID }))
+    }
+
+    /// Slack items saved before Docket kept whole messages get theirs (text, files, thread) when a check
+    /// meets the message again.
+    private func fillIn(_ found: [Suggestion]) {
+        for s in found {
+            guard let i = suggestions.firstIndex(where: { $0.id == s.id }), suggestions[i].content == nil else { continue }
+            suggestions[i].content = s.content
+            suggestions[i].threadTS = s.threadTS
+        }
+    }
+
+    /// The names the waiting Slack messages' markup refers to (people, channels), to save with them.
+    private func slackNamesToKeep() -> [String: String] {
+        var ids = Set<String>()
+        for s in suggestions where s.source.kind == .slack {
+            if let markup = s.content?.markup { ids.formUnion(InboxText.slackIDs(in: markup)) }
+            if let channel = InboxIDs.slack(s.id)?.channel { ids.insert(channel) }
+        }
+        return slackNames.filter { ids.contains($0.key) }
     }
 
     /// Splits new messages into suggestions (with drafts) and ones AI found nothing to do for.
@@ -723,7 +869,7 @@ final class Integrations: ObservableObject {
 
     // MARK: Slack
 
-    private func slackToken() -> String? {
+    func slackToken() -> String? {
         Keychain.string(Keychain.Account.slackUserToken)
     }
 
@@ -731,16 +877,19 @@ final class Integrations: ObservableObject {
         SlackClient(token: token, transport: transport, sleep: sleep)
     }
 
-    /// New Slack messages to consider, and whether Slack could be checked at all.
-    private func collectSlack(settings: IntegrationSettings, seen: SeenMessages, now: Date) async -> (found: [SuggestionCandidate], checked: Bool) {
-        guard isSlackConnected, let account = slackAccount else { return ([], false) }
-        if let until = slackPausedUntil, until > now { return ([], false) }
+    /// New Slack messages to consider, the whole messages of waiting items saved without them, and whether
+    /// Slack could be checked at all.
+    private func collectSlack(settings: IntegrationSettings, seen: SeenMessages, now: Date) async
+        -> (found: [SuggestionCandidate], wholeMessages: [Suggestion], checked: Bool) {
+        guard isSlackConnected, let account = slackAccount else { return ([], [], false) }
+        if let until = slackPausedUntil, until > now { return ([], [], false) }
         // Unreadable isn't gone: the keychain may be locked, or access was refused this time. Only Slack
         // turning the token down disconnects.
         guard let token = slackToken() else {
             slackProblem = "Docket couldn't read the Slack token from your keychain. If it was removed, disconnect Slack and connect it again in Settings → Connections."
-            return ([], false)
+            return ([], [], false)
         }
+        let unfilled = Set(suggestions.lazy.filter { $0.source.kind == .slack && $0.content == nil }.map(\.id))
         let client = slackClient(token)
         do {
             var found = try await client.savedMessages(by: account.userID, emoji: settings.saveEmoji,
@@ -753,15 +902,18 @@ final class Integrations: ObservableObject {
             // A saved message that also mentions you counts as saved (it's listed first).
             var ids = Set<String>()
             let fresh = found.filter { seen.isNew($0.0.externalID, $0.1) && ids.insert($0.0.externalID).inserted }
-            await learnNames(for: fresh.map { $0.0 }, client: client)
+            var filled = Set<String>()
+            let old = found.filter { unfilled.contains($0.0.externalID) && filled.insert($0.0.externalID).inserted }
+            await learnNames(for: (fresh + old).map { $0.0 }, client: client)
             // The check may have outlived the connection (Disconnect while it ran).
-            guard isSlackConnected, slackAccount?.userID == account.userID else { return ([], false) }
+            guard isSlackConnected, slackAccount?.userID == account.userID else { return ([], [], false) }
             slackProblem = nil
             slackPausedUntil = nil
-            return (fresh.map { slackCandidate($0.0, trigger: $0.1, account: account) }, true)
+            return (fresh.map { slackCandidate($0.0, trigger: $0.1, account: account, now: now) },
+                    old.map { slackCandidate($0.0, trigger: $0.1, account: account, now: now).suggestion }, true)
         } catch {
             handleSlack(error, now: now)
-            return ([], false)
+            return ([], [], false)
         }
     }
 
@@ -782,7 +934,20 @@ final class Integrations: ObservableObject {
         for channel in foundChannels.compactMap({ $0 }) { conversations[channel.id] = channel }
     }
 
-    private func slackCandidate(_ m: SlackMessage, trigger: SuggestionTrigger, account: SlackAccount) -> SuggestionCandidate {
+    /// Slack ids and the names they stand for, people ("U…" → "Priya Shah") and channels ("C…" → "leadership"),
+    /// as learned while checking for messages (and saved for the messages waiting). For `SlackText.attributed(_:names:)`.
+    var slackNames: [String: String] {
+        let channels = conversations.compactMapValues { $0.isDirect || $0.isGroupDM ? nil : $0.name }
+        let learned = userNames.merging(channels) { person, _ in person }
+        return savedSlackNames.merging(learned) { _, fresh in fresh }
+    }
+
+    /// People looked up outside a check (the authors of a thread), remembered for the session like the others.
+    func rememberSlackUsers(_ users: [SlackUser]) {
+        for user in users { userNames[user.id] = user.name }
+    }
+
+    private func slackCandidate(_ m: SlackMessage, trigger: SuggestionTrigger, account: SlackAccount, now: Date) -> SuggestionCandidate {
         let sender = m.userID.flatMap { userNames[$0] } ?? m.userName ?? "Someone"
         let conversation = conversations[m.channelID]
         let place: String
@@ -799,8 +964,11 @@ final class Integrations: ObservableObject {
         let text = SlackText.plain(m.text, users: userNames, channels: channelNames)
         let link = m.permalink ?? account.permalink(channel: m.channelID, ts: m.ts)
         let source = TaskSource(kind: .slack, externalID: m.externalID, url: link, label: "\(place) · \(sender)")
-        let suggestion = Suggestion(source: source, from: sender, subject: nil, snippet: String(SlackText.collapsed(text).prefix(500)),
+        var suggestion = Suggestion(source: source, from: sender, subject: nil, snippet: String(SlackText.collapsed(text).prefix(500)),
                                     receivedAt: m.date, draft: nil, trigger: trigger)
+        // The complete message comes with it: the markup as sent (for rich text), its files, its thread.
+        suggestion.content = MessageContent(text: text, markup: m.text, attachments: m.files, fetchedAt: now)
+        suggestion.threadTS = m.threadTS
         let message = IncomingMessage(source: source, from: sender, subject: nil, text: String(text.prefix(4000)), date: m.date)
         return SuggestionCandidate(suggestion: suggestion, message: message)
     }
@@ -834,17 +1002,43 @@ final class Integrations: ObservableObject {
         }
         guard !DebugSnapshot.isActive else { throw IntegrationError.notConnected(.slack) }
         var (account, scopes) = try await slackClient(token).identity()
-        // Slack lists the token's permissions with each reply; unknown means fine.
-        let missing = SlackManifest.userScopes.filter { scope in scopes.map { !$0.contains(scope) } ?? false }
-        account.missingScopes = missing.isEmpty ? nil : missing
+        account.missingScopes = Self.missingCoreScopes(granted: scopes)
         Keychain.set(token, for: Keychain.Account.slackUserToken)
         slackAccount = account
         isSlackConnected = true
         slackPausedUntil = nil
         slackProblem = nil
         channelList = nil
+        grantedSlackScopes = scopes
+        refusedSlackScopes = []
+        // A new app may read the threads the old one couldn't, and may be allowed to save messages for later.
+        inbox.threads = [:]
+        wholeThreads = wholeThreads.filter { !$0.key.hasPrefix("slack:") }
+        slackStarsStayInDocket = false
         save()
         if refreshAfter { refresh() }
+    }
+
+    /// The permissions the token lacks, apart from the ones only the complete message needs (those have
+    /// their own banner: `missingSlackScopes`). Slack lists a token's permissions with each reply; when it
+    /// doesn't, none count as missing.
+    static func missingCoreScopes(granted scopes: Set<String>?) -> [String]? {
+        guard let scopes else { return nil }
+        let missing = SlackManifest.userScopes.filter { !SlackManifest.contentScopes.contains($0) && !scopes.contains($0) }
+        return missing.isEmpty ? nil : missing
+    }
+
+    /// Asks Slack which permissions the token has now (auth.test), for the warnings and `missingSlackScopes`.
+    /// Quietly does nothing when Slack can't be reached.
+    func checkSlackPermissions() async {
+        guard isSlackConnected, let account = slackAccount, let token = slackToken(),
+              let identity = try? await slackClient(token).identity(),
+              isSlackConnected, identity.0.userID == account.userID, var current = slackAccount else { return }
+        current.missingScopes = Self.missingCoreScopes(granted: identity.scopes)
+        slackAccount = current
+        grantedSlackScopes = identity.scopes
+        refusedSlackScopes = []
+        save()
     }
 
     /// Forgets the Slack token. `problem` explains why when Docket did it by itself; a manual disconnect
@@ -859,7 +1053,15 @@ final class Integrations: ObservableObject {
         userNames = [:]
         conversations = [:]
         focusRecord = nil
-        if problem == nil { suggestions.removeAll { $0.source.kind == .slack } }
+        grantedSlackScopes = nil
+        refusedSlackScopes = []
+        slackStarsStayInDocket = false
+        if problem == nil {
+            // Their files and threads go with them.
+            forgetInbox(suggestions.filter { $0.source.kind == .slack })
+            suggestions.removeAll { $0.source.kind == .slack }
+            savedSlackNames = [:]
+        }
         save()
     }
 
@@ -908,7 +1110,7 @@ final class Integrations: ObservableObject {
         googleClientRevision += 1
     }
 
-    private func googleSession() -> GoogleSession? {
+    func googleSession() -> GoogleSession? {
         if let google { return google }
         guard let client = googleClient, let refreshToken = Keychain.string(Keychain.Account.googleRefreshToken) else { return nil }
         let session = GoogleSession(client: client, refreshToken: refreshToken, transport: transport)
@@ -943,6 +1145,7 @@ final class Integrations: ObservableObject {
             let triggers = Dictionary(fresh.map { ($0.0.id, $0.1) }, uniquingKeysWith: { first, _ in first })
             gmailProblem = nil
             gmailPausedUntil = nil
+            await noteGmailGrants(session)
             return (messages.compactMap { m in triggers[m.id].map { gmailCandidate(m, trigger: $0, address: address) } }, true)
         } catch {
             handleGmail(error, now: now)
@@ -1002,6 +1205,9 @@ final class Integrations: ObservableObject {
                 gmailAddress = email
                 isGmailConnected = true
                 gmailPausedUntil = nil
+                // What was granted: replying needs gmail.compose, which the consent screen lets people leave out.
+                // When Google doesn't list them, what Docket asked for.
+                grantedGmailScopes = tokens.scopes.isEmpty ? Set(GoogleOAuth.scopes) : tokens.scopes
                 save()
                 NSApplication.shared.activate(ignoringOtherApps: true) // back from the browser
                 refresh()
@@ -1032,7 +1238,19 @@ final class Integrations: ObservableObject {
         isGmailConnected = false
         gmailProblem = problem
         gmailPausedUntil = nil
-        if problem == nil { suggestions.removeAll { $0.source.kind == .gmail } }
+        grantedGmailScopes = nil
+        if problem == nil {
+            // Their attachments and conversations go with them.
+            forgetInbox(suggestions.filter { $0.source.kind == .gmail })
+            suggestions.removeAll { $0.source.kind == .gmail }
+        }
+        save()
+    }
+
+    /// Google may have granted sending (the session knows once it has a token): replies can go out from Docket.
+    func noteGmailGrants(_ session: GoogleSession) async {
+        guard await session.canCompose, isGmailConnected, grantedGmailScopes?.contains(GoogleOAuth.composeScope) != true else { return }
+        grantedGmailScopes = (grantedGmailScopes ?? [GoogleOAuth.gmailScope]).union([GoogleOAuth.composeScope])
         save()
     }
 
@@ -1042,12 +1260,13 @@ final class Integrations: ObservableObject {
     /// One undo step takes the task away and brings the card back.
     @discardableResult
     func add(_ suggestion: Suggestion, toast: Bool = true) -> TaskItem? {
-        // Only a card that's still waiting: a second click as it animates away adds nothing more.
-        guard let store, suggestions.contains(where: { $0.id == suggestion.id }) else { return nil }
+        // Only a card that's still waiting: a second click as it animates away adds nothing more. As it is
+        // now, not as the view last saw it: notes saved a moment before the click go into the task.
+        guard let store, let current = self.suggestion(suggestion.id) else { return nil }
         let undo = store.undoManager
         undo?.beginUndoGrouping()
-        let task = store.addTask(Self.task(for: suggestion, lists: store.lists))
-        retire([suggestion.id]) // usually done already, as the task appeared
+        let task = store.addTask(Self.task(for: current, lists: store.lists))
+        retire([current.id]) // usually done already, as the task appeared
         undo?.setActionName("Add Task")
         undo?.endUndoGrouping()
         if toast { app?.showToast("Added “\(Self.shortTitle(task.title))”") }
@@ -1068,10 +1287,11 @@ final class Integrations: ObservableObject {
     }
 
     /// Opens the draft in "Plan with AI" to adjust before adding. The draft carries its source, so the task
-    /// it becomes links back, and the card goes once that task exists (in the same undo step).
+    /// it becomes links back, and the card goes once that task exists (in the same undo step). Like `add`,
+    /// it reads the card as it is now, with the notes just saved.
     func edit(_ suggestion: Suggestion) {
         guard let app else { return }
-        app.aiPlanner = AIPlannerRequest(drafts: [SuggestionDrafts.draft(for: suggestion)])
+        app.aiPlanner = AIPlannerRequest(drafts: [SuggestionDrafts.draft(for: self.suggestion(suggestion.id) ?? suggestion)])
     }
 
     /// Stops suggesting the message. Undoable.
@@ -1219,32 +1439,116 @@ final class Integrations: ObservableObject {
         }
     }
 
+    // MARK: Screenshot mode
+
+    /// Both services connected as made-up accounts with every permission, checked a few minutes ago. Nothing
+    /// is read from the keychain or the network (see `debugSeed`).
+    func showSampleAccounts(slack account: SlackAccount, gmail address: String, refreshedAt: Date) {
+        slackAccount = account
+        isSlackConnected = true
+        grantedSlackScopes = Set(SlackManifest.userScopes).union(SlackManifest.contentScopes)
+        refusedSlackScopes = []
+        gmailAddress = address
+        isGmailConnected = true
+        grantedGmailScopes = Set(GoogleOAuth.scopes).union([GoogleOAuth.composeScope])
+        lastRefresh = refreshedAt
+        slackProblem = nil
+        gmailProblem = nil
+        aiProblem = nil
+    }
+
     // MARK: Saving
 
-    private func save() {
+    /// Writes integrations.json in the background. `soon`: the user is typing (a note, a reply), so the
+    /// write waits for a pause; quitting writes whatever is waiting.
+    func save(soon: Bool = false) {
         guard let fileURL else { return }
         var file = IntegrationsFile()
-        file.suggestions = suggestions
+        file.suggestions = suggestions.map(\.forSaving)
         file.handled = handled
         file.skipped = skipped
         file.lastRefresh = lastRefresh
         file.slack = slackAccount
         file.gmailAddress = gmailAddress
         file.focusStatus = focusRecord
-        guard let data = try? file.encoded() else { return }
-        // Serial queue: writes land in order.
-        saveQueue.async {
-            do {
-                try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try data.write(to: fileURL, options: .atomic)
-            } catch {
-                NSLog("Docket: couldn't save integrations.json (%@)", (error as NSError).localizedDescription)
-            }
+        file.slackScopes = grantedSlackScopes?.sorted()
+        file.gmailScopes = grantedGmailScopes?.sorted()
+        file.slackNames = savedSlackNames
+        file.slackStarsStayInDocket = slackStarsStayInDocket
+        saver.save(file, to: fileURL, after: soon ? IntegrationsSaver.typingPause : 0)
+    }
+
+    /// Writes what's waiting and returns once it's on disk (quitting, tests). Blocks until then: not for
+    /// everyday use on the main thread.
+    func flushSaves() {
+        saver.flush()
+    }
+}
+
+/// Writes integrations.json on a background queue, so a big file (whole emails) never holds up typing.
+/// The newest state wins. A write can wait for a pause in typing; `flush` writes what's waiting right away.
+final class IntegrationsSaver: @unchecked Sendable {
+    /// How long typing pauses before a note or a reply is written.
+    static let typingPause: TimeInterval = 0.6
+
+    private let queue = DispatchQueue(label: "docket.integrations.save", qos: .utility)
+    private let lock = NSLock()
+    private var pending: (file: IntegrationsFile, url: URL)?
+    private var generation = 0
+    /// Docket is quitting: there's no pause left to wait for.
+    private var quitting = false
+
+    func save(_ file: IntegrationsFile, to url: URL, after delay: TimeInterval = 0) {
+        lock.lock()
+        pending = (file, url)
+        generation += 1
+        let mine = generation
+        let now = quitting
+        lock.unlock()
+        if now {
+            // On disk before Docket exits (a note's last words, saved as the window closes).
+            queue.sync { writePending() }
+            return
+        }
+        guard delay > 0 else {
+            queue.async { self.writePending() }
+            return
+        }
+        queue.asyncAfter(deadline: .now() + delay) {
+            // Typing went on: the newest change waits for its own pause (or was written with something else).
+            self.lock.lock()
+            let newest = self.generation == mine
+            self.lock.unlock()
+            if newest { self.writePending() }
         }
     }
 
-    /// Waits for pending writes (tests).
-    func flushSaves() {
-        saveQueue.sync {}
+    /// Writes what's waiting and returns once it's on disk (tests).
+    func flush() {
+        queue.sync { writePending() }
+    }
+
+    /// Docket is quitting: writes what's waiting, and from now on writes each save at once, so one made
+    /// while Docket quits (the views save what was typed then too) still lands.
+    func quit() {
+        lock.lock()
+        quitting = true
+        lock.unlock()
+        flush()
+    }
+
+    private func writePending() {
+        lock.lock()
+        let job = pending
+        pending = nil
+        lock.unlock()
+        guard let job else { return }
+        do {
+            let data = try job.file.encoded()
+            try FileManager.default.createDirectory(at: job.url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: job.url, options: .atomic)
+        } catch {
+            NSLog("Docket: couldn't save integrations.json (%@)", (error as NSError).localizedDescription)
+        }
     }
 }

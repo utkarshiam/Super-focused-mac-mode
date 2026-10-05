@@ -253,7 +253,8 @@ final class GoogleSignInTests: XCTestCase {
         XCTAssertEqual(items["client_id"], client.id)
         XCTAssertEqual(items["redirect_uri"], "http://127.0.0.1:49152")
         XCTAssertEqual(items["response_type"], "code")
-        XCTAssertEqual(items["scope"], "openid email https://www.googleapis.com/auth/gmail.readonly")
+        // Reading, and replying (gmail.compose) only when the user clicks Send or Save draft.
+        XCTAssertEqual(items["scope"], "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose")
         XCTAssertEqual(items["state"], "st4te_x-1")
         XCTAssertEqual(items["code_challenge"], "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
         XCTAssertEqual(items["code_challenge_method"], "S256")
@@ -406,7 +407,9 @@ final class SlackClientTests: XCTestCase {
         let scopes = try XCTUnwrap((manifest["oauth_config"] as? [String: Any])?["scopes"] as? [String: Any])
         XCTAssertEqual(Set(scopes["user"] as? [String] ?? []),
                        ["reactions:read", "search:read", "users:read", "users.profile:write", "dnd:write",
-                        "chat:write", "channels:read", "groups:read", "im:read", "mpim:read"])
+                        "chat:write", "channels:read", "groups:read", "im:read", "mpim:read",
+                        "files:read", "channels:history", "groups:history", "im:history", "mpim:history",
+                        "stars:read", "stars:write"])
         XCTAssertNil(scopes["bot"], "no bot scopes")
         XCTAssertNil(manifest["features"], "no bot user")
     }
@@ -756,6 +759,46 @@ final class SuggestionInboxTests: XCTestCase {
         XCTAssertTrue(empty.suggestions.isEmpty)
         XCTAssertNil(empty.slack)
         XCTAssertNil(empty.lastRefresh)
+    }
+
+    func testFilesFromBeforeTheInboxStillLoad() throws {
+        // A suggestion as version 1 saved it: no notes, reply, complete message or thread.
+        let v1 = #"""
+        {"version": 1, "suggestions": [{"source": {"kind": "slack", "externalID": "slack:C0LEAD/1791200000.000100", "label": "#leadership · Priya Shah"},
+          "from": "Priya Shah", "snippet": "Can you approve the Q4 budget?", "receivedAt": "2026-10-05T09:12:00Z", "trigger": "reaction"}]}
+        """#
+        let old = try XCTUnwrap(Persistence.decoder.decode(IntegrationsFile.self, from: Data(v1.utf8)).suggestions.first)
+        XCTAssertEqual(old.id, "slack:C0LEAD/1791200000.000100")
+        XCTAssertEqual(old.snippet, "Can you approve the Q4 budget?")
+        XCTAssertEqual(old.note, "")
+        XCTAssertEqual(old.replyDraft, "")
+        XCTAssertNil(old.repliedAt)
+        XCTAssertNil(old.content)
+        XCTAssertNil(old.threadTS)
+
+        // Notes, the reply, the complete message and its attachments come back as they were saved.
+        var full = old
+        full.note = "Approve if it's under budget"
+        full.replyDraft = "Approved, thanks."
+        full.repliedAt = Date(timeIntervalSince1970: 1_791_300_000)
+        full.threadTS = "1791199000.000050"
+        let file = try XCTUnwrap(URL(string: "https://files.slack.com/files-pri/T0ACME-F07BUDGET/download/budget.pdf"))
+        full.content = MessageContent(text: "Can you approve the Q4 budget?", markup: "Can you approve the *Q4 budget*?",
+                                      attachments: [MessageAttachment(id: "F07BUDGET", name: "budget.pdf", mimeType: "application/pdf", size: 52_000,
+                                                                      remote: .slack(url: file, thumbnail: nil))],
+                                      fetchedAt: Date(timeIntervalSince1970: 1_791_300_000))
+        var saved = IntegrationsFile()
+        saved.suggestions = [full]
+        XCTAssertEqual(try Persistence.decoder.decode(IntegrationsFile.self, from: saved.encoded()).suggestions, [full])
+
+        // One unreadable attachment doesn't cost the message; missing details fall back to defaults.
+        let odd = #"{"text": "See attached", "attachments": [{"id": "F1"}, {"id": "m1/a1", "remote": {"gmail": {"messageID": "m1", "attachmentID": "a1"}}}]}"#
+        let content = try Persistence.decoder.decode(MessageContent.self, from: Data(odd.utf8))
+        XCTAssertEqual(content.text, "See attached")
+        XCTAssertEqual(content.attachments.map(\.id), ["m1/a1"])
+        XCTAssertEqual(content.attachments.first?.remote, .gmail(messageID: "m1", attachmentID: "a1"))
+        XCTAssertEqual(content.attachments.first?.mimeType, "application/octet-stream")
+        XCTAssertEqual(content.fetchedAt, .distantPast)
     }
 }
 

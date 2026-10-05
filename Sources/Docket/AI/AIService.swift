@@ -187,8 +187,8 @@ extension Prefs {
 // MARK: - Service
 
 /// AI features backed by Google Gemini: planning tasks from free text, breaking a task into steps,
-/// finding tasks in a note, ordering the day, and sorting Slack and Gmail messages.
-/// Everything returns drafts or suggestions for the user to review; nothing is changed behind their back.
+/// finding tasks in a note, ordering the day, sorting Slack and Gmail messages, and drafting replies to them.
+/// Everything returns drafts or suggestions for the user to review; nothing is changed or sent behind their back.
 @MainActor
 final class AIService: ObservableObject {
     static let shared = AIService()
@@ -319,6 +319,34 @@ final class AIService: ObservableObject {
     }
 }
 
+// MARK: - Replying to a message
+
+extension AIService {
+    /// A reply to `message` in the user's voice, for them to edit and send. What to say comes from `notes`
+    /// and `instruction`; the complete message and the earlier messages in its thread give the context.
+    /// Facts that aren't in them are left as "[placeholder]".
+    ///
+    /// Slack: a few sentences for the thread, no greeting or sign-off, Slack formatting. Email: plain text
+    /// with a greeting and a sign-off with `myName` (an address isn't a name; without one it signs
+    /// "[your name]"). `content` nil uses `message.text`. Nothing is ever sent from here.
+    ///
+    /// `replyingTo`: the message in `thread` being answered, when the user picked one; the prompt says which.
+    func draftReply(to message: IncomingMessage, content: MessageContent?, thread: [ThreadMessage], notes: String,
+                    tone: ReplyTone, instruction: String?, myName: String?, replyingTo: ThreadMessage? = nil,
+                    now: Date = Date()) async throws -> String {
+        // TODO(group 3): tell the model which message is being answered (`replyingTo`).
+        let client = try client()
+        let calendar = Calendar.current
+        let format = AIPrompts.ReplyFormat(message.source.kind)
+        let system = AIPrompts.replySystem(format, tone: tone, notes: notes, instruction: instruction,
+                                           myName: AIPrompts.personName(myName), now: now, calendar: calendar)
+        let answer = try await client.generate(system: system,
+                                               prompt: AIPrompts.replyInput(message, content: content, thread: thread, calendar: calendar),
+                                               schema: AIPrompts.replySchema)
+        return try AIAnswers.reply(answer, format: format)
+    }
+}
+
 // MARK: - Reading answers
 
 /// Reads the model's JSON answers. Lenient on purpose: a missing or mistyped field falls back to
@@ -369,6 +397,54 @@ enum AIAnswers {
             return (index: number - 1, reason: item.text("reason").map { title($0, limit: 140) } ?? "")
         }
     }
+
+    /// {"reply": "…"} → the reply, tidied for where it goes (see `tidyReply`). No text is a `badResponse`.
+    static func reply(_ data: Data, format: AIPrompts.ReplyFormat) throws -> String {
+        guard let raw = try object(data)["reply"] as? String else {
+            throw AIError.badResponse(GeminiClient.unexpectedFormat)
+        }
+        let reply = tidyReply(raw, format: format)
+        guard !reply.isEmpty else { throw AIError.badResponse(emptyReply) }
+        return reply
+    }
+
+    static let emptyReply = "Gemini didn't write a reply. Try again, or add a note on what to say."
+
+    /// Fixes the slips models make out of habit: line breaks escaped twice, Markdown bold (one asterisk in
+    /// Slack, none in a plain-text email), Markdown links (as "text (url)", which both show as a link), a
+    /// subject line on top of an email, trailing spaces and runs of blank lines.
+    static func tidyReply(_ raw: String, format: AIPrompts.ReplyFormat) -> String {
+        var text = raw.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+        if !text.contains("\n"), text.contains(#"\n"#) {
+            text = text.replacingOccurrences(of: #"\n"#, with: "\n").replacingOccurrences(of: #"\""#, with: "\"")
+        }
+        text = text.replacingOccurrences(of: #"\*\*(?=\S)([^\n]+?)(?<=\S)\*\*"#, with: format == .slack ? "*$1*" : "$1",
+                                         options: .regularExpression)
+        text = text.replacingOccurrences(of: #"\[(https?://[^\s()\[\]]+)\]\(\1\)"#, with: "$1", options: .regularExpression)
+        text = text.replacingOccurrences(of: #"\[([^\[\]\n]+)\]\((https?://[^\s()]+)\)"#, with: "$1 ($2)", options: .regularExpression)
+        var lines = text.components(separatedBy: "\n").map { $0.replacingOccurrences(of: #"\s+$"#, with: "", options: .regularExpression) }
+        if format == .email, let first = lines.firstIndex(where: { !$0.isEmpty }), lines[first].lowercased().hasPrefix("subject:") {
+            lines.removeSubrange(...first)
+        }
+        return lines.joined(separator: "\n")
+            .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// What's still to fill in a drafted reply ("[date]", "[link to the deck]"), in order, each once: for a
+    /// last look before it's sent. Checkboxes, footnote numbers and Markdown links don't count.
+    static func placeholders(in text: String) -> [String] {
+        let ns = text as NSString
+        var seen = Set<String>()
+        return placeholderPattern.matches(in: text, range: NSRange(location: 0, length: ns.length)).compactMap { match in
+            let found = ns.substring(with: match.range)
+            guard ns.substring(with: match.range(at: 1)).filter(\.isLetter).count >= 2,
+                  seen.insert(found.lowercased()).inserted else { return nil }
+            return found
+        }
+    }
+
+    private static let placeholderPattern = try! NSRegularExpression(pattern: #"\[([^\[\]\n]{1,80})\](?!\()"#)
 
     /// One task object from the model, cleaned up.
     static func draft(_ item: [String: Any], calendar: Calendar) -> TaskDraft? {

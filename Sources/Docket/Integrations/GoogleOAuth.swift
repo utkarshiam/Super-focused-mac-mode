@@ -2,13 +2,19 @@ import CryptoKit
 import Foundation
 
 /// Google sign-in for a desktop app (RFC 8252): the system browser, a loopback redirect to
-/// 127.0.0.1 on a random port, PKCE (S256) and a `state` check. Docket asks for read-only Gmail.
+/// 127.0.0.1 on a random port, PKCE (S256) and a `state` check. Docket asks for gmail.modify: it reads
+/// mail, stars what the user stars, and sends or saves a draft only when they click Send or Save draft. It
+/// never deletes or archives anything.
 enum GoogleOAuth {
     static let authEndpoint = URL(string: "https://accounts.google.com/o/oauth2/v2/auth")!
     static let tokenEndpoint = URL(string: "https://oauth2.googleapis.com/token")!
     static let revokeEndpoint = URL(string: "https://oauth2.googleapis.com/revoke")!
+    /// Reading only. Sign-ins from before stars have it, with `composeScope`; gmail.modify includes it.
     static let gmailScope = "https://www.googleapis.com/auth/gmail.readonly"
-    static let scopes = ["openid", "email", gmailScope]
+    /// One Gmail scope, gmail.modify, for reading, stars, drafts and sending (see `allows`). Sign-ins from
+    /// before stars have gmail.readonly and gmail.compose instead: replying still works with those, and
+    /// starring asks them to reconnect (see `GoogleSession.canModify`).
+    static let scopes = ["openid", "email", modifyScope]
 
     /// The OAuth client ("Desktop app") the user created in Google Cloud.
     struct Client: Hashable, Sendable {
@@ -21,6 +27,8 @@ enum GoogleOAuth {
         /// A minute early, so a token is never used right as it runs out.
         var expiresAt: Date
         var refreshToken: String?
+        /// What the sign-in allows: the scopes Google granted, with those gmail.modify includes
+        /// (`withIncludedScopes`), so a check for reading or for composing finds them.
         var scopes: Set<String>
     }
 
@@ -107,7 +115,7 @@ enum GoogleOAuth {
             let lifetime = TimeInterval(max(120, reply.expiresIn ?? 3600))
             return Tokens(accessToken: access, expiresAt: now.addingTimeInterval(lifetime - 60),
                           refreshToken: reply.refreshToken.flatMap { $0.isEmpty ? nil : $0 },
-                          scopes: Set((reply.scope ?? "").split(separator: " ").map(String.init)))
+                          scopes: withIncludedScopes(Set((reply.scope ?? "").split(separator: " ").map(String.init))))
         }
         let failure = try? decoder.decode(TokenFailure.self, from: data)
         switch failure?.error {
@@ -167,6 +175,25 @@ enum GoogleOAuth {
     }
 }
 
+extension GoogleOAuth {
+    /// Creating drafts and sending mail, for replying from the Email tab. Docket only sends or saves a draft
+    /// when the user clicks Send or Save draft.
+    static let composeScope = "https://www.googleapis.com/auth/gmail.compose"
+    /// Reading, starring (labels), drafts and sending. Docket never deletes or archives anything with it.
+    static let modifyScope = "https://www.googleapis.com/auth/gmail.modify"
+
+    /// `granted`, plus what gmail.modify includes: it allows all that gmail.readonly and gmail.compose do
+    /// (reading; drafts and sending), so a sign-in with it passes a check for either.
+    static func withIncludedScopes(_ granted: Set<String>) -> Set<String> {
+        granted.contains(modifyScope) ? granted.union([gmailScope, composeScope]) : granted
+    }
+
+    /// Whether a sign-in with `granted` can do what `scope` allows: it was granted, or gmail.modify was.
+    static func allows(_ scope: String, granted: Set<String>) -> Bool {
+        withIncludedScopes(granted).contains(scope)
+    }
+}
+
 /// Hands out a valid Gmail access token, refreshing it from the refresh token when it runs out.
 /// The access token lives only in memory.
 actor GoogleSession {
@@ -175,12 +202,16 @@ actor GoogleSession {
     private let transport: IntegrationHTTP.Transport
     private var current: (token: String, expires: Date)?
     private var pending: Task<GoogleOAuth.Tokens, Error>?
+    /// What Google says the sign-in allows, from its latest token reply. Nil until one arrives: a session
+    /// restored at launch learns it with its first access token.
+    private(set) var grantedScopes: Set<String>?
 
     init(client: GoogleOAuth.Client, refreshToken: String, transport: @escaping IntegrationHTTP.Transport, tokens: GoogleOAuth.Tokens? = nil) {
         self.client = client
         self.refreshToken = refreshToken
         self.transport = transport
         current = tokens.map { ($0.accessToken, $0.expiresAt) }
+        grantedScopes = tokens.flatMap { $0.scopes.isEmpty ? nil : $0.scopes }
     }
 
     func accessToken(now: Date = Date()) async throws -> String {
@@ -198,6 +229,30 @@ actor GoogleSession {
         defer { pending = nil }
         let tokens = try await task.value
         current = (tokens.accessToken, tokens.expiresAt)
+        // A reply without a scope list says nothing new about them.
+        if !tokens.scopes.isEmpty { grantedScopes = tokens.scopes }
         return tokens.accessToken
+    }
+}
+
+extension GoogleSession {
+    /// Whether the sign-in allows sending replies and saving drafts: gmail.compose, or gmail.modify, which
+    /// includes it. False while the scopes aren't known (see `checkCanCompose`): sign-ins from before
+    /// replies only ever had read access.
+    var canCompose: Bool {
+        grantedScopes.map { GoogleOAuth.allows(GoogleOAuth.composeScope, granted: $0) } ?? false
+    }
+
+    /// `canCompose`, asking Google first when the scopes aren't known yet (one token refresh).
+    func checkCanCompose() async throws -> Bool {
+        if grantedScopes == nil { _ = try await refreshAccessToken() }
+        return canCompose
+    }
+
+    /// Whether the sign-in allows starring: gmail.modify, which covers reading, drafts and sending too.
+    /// False while the scopes aren't known, and for sign-ins from before stars (gmail.readonly and
+    /// gmail.compose): those reconnect to star.
+    var canModify: Bool {
+        grantedScopes.map { GoogleOAuth.allows(GoogleOAuth.modifyScope, granted: $0) } ?? false
     }
 }
