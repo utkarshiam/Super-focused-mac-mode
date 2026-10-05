@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 // Small extras with some personality: delegation ("Waiting on Sam"), slipping tasks ("This has slipped
@@ -26,6 +27,7 @@ struct TaskRowBadges: View {
                     HStack(spacing: 4) {
                         Image(systemName: "hourglass")
                             .font(.system(size: 10, weight: .semibold))
+                        // A long name ends in "…" when the line is crowded; the tooltip has it whole.
                         Text(person)
                             .lineLimit(1)
                             .truncationMode(.tail)
@@ -85,6 +87,9 @@ struct DelegateRow: View {
                 .font(.system(size: 13.5, weight: .semibold))
                 .foregroundStyle(Color.ink)
                 .multilineTextAlignment(.trailing)
+                // A long name ends in "…" until it's clicked into, instead of being cut off mid-letter.
+                .lineLimit(1)
+                .truncationMode(.tail)
                 .focused($editing)
                 .onSubmit {
                     save(draft)
@@ -220,13 +225,14 @@ struct SlipNudge: View {
     private func delegate(_ id: UUID, to name: String) {
         guard let person = Delegation.normalized(name) else { return }
         delegating = false
-        // Let the popover close before the nudge (its anchor) goes away.
+        // Let the popover finish closing before the nudge (its anchor) folds away.
         let store = store, app = app
-        DispatchQueue.main.async {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            guard store.task(id) != nil else { return }
             withAnimation(Motion.gentle) {
                 store.mutateTask(id, undo: "Delegate") { $0.waitingOn = person }
             }
-            app.showToast("Delegated to \(person). It's in Waiting.")
+            app.showToast("Delegated to \(Extras.shortTitle(person, limit: 32)). It's in Waiting.")
         }
     }
 
@@ -367,11 +373,17 @@ struct OverdueRollover: View {
 // MARK: - Day cleared
 
 /// Confetti when the day is cleared. Purely decorative: it never takes a click.
+/// It sits over the main window for as long as the app runs, so it's also where the window's store is
+/// watched for tasks ticked off away from a checkbox (see `Celebration.watch`).
 struct CelebrationOverlay: View {
+    @EnvironmentObject private var store: Store
+    @EnvironmentObject private var app: AppState
     @ObservedObject private var celebration = Celebration.shared
 
     var body: some View {
         ZStack {
+            // Always there, so the overlay appears (and starts watching) before any confetti does.
+            Color.clear
             if let burst = celebration.burst {
                 ConfettiView(burst: burst)
                     .id(burst.id)
@@ -379,6 +391,7 @@ struct CelebrationOverlay: View {
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)
+        .onAppear { celebration.watch(store, app: app) }
     }
 }
 
@@ -402,6 +415,28 @@ final class Celebration: ObservableObject {
     var playsSound = NSClassFromString("XCTestCase") == nil
     /// With Reduce Motion on, the day-cleared moment is the toast alone.
     var reduceMotion: () -> Bool = { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+
+    private var watching: AnyCancellable?
+    private weak var watchedStore: Store?
+
+    /// Checkboxes and keyboard triage report completions through `Extras.didComplete`. This catches the
+    /// rest: a focus session's Done, Done on an alarm or a notification, a box ticked in a note. A task
+    /// ticked off twice over (by the hook and here) is fine: the moment plays once a day.
+    func watch(_ store: Store, app: AppState) {
+        guard watchedStore !== store else { return }
+        watchedStore = store
+        watching = store.$tasks.sink { [weak store, weak app] tasks in
+            // @Published sends before it stores, so `store.tasks` is still the list from before the change.
+            guard let store, let app else { return }
+            let finished = DayClear.justFinished(from: store.tasks, to: tasks, now: Date())
+            guard !finished.isEmpty else { return }
+            // Once the change has landed and whoever made it has had their say ("Marked 3 tasks as done"),
+            // so "Day cleared" is the last word.
+            DispatchQueue.main.async {
+                for id in finished { Extras.didComplete(id, store: store, app: app) }
+            }
+        }
+    }
 
     func dayCleared(app: AppState, now: Date = Date()) {
         guard DayClear.shouldCelebrate(lastCelebrated: defaults.string(forKey: DayClear.lastCelebratedKey), now: now) else { return }
@@ -545,7 +580,7 @@ enum Extras {
         Celebration.shared.dayCleared(app: app, now: now)
     }
 
-    /// A task title short enough for a one-line toast.
+    /// A task title (or a name) short enough for a one-line toast.
     static func shortTitle(_ title: String, limit: Int = 40) -> String {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "Untitled" }

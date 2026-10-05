@@ -10,6 +10,8 @@ struct SlackAccount: Codable, Hashable, Sendable {
     var teamID: String
     var teamName: String
     var teamURL: URL?
+    /// Permissions the Docket app in Slack was made without (seen when connecting), so Settings can say so.
+    var missingScopes: [String]?
 
     /// A link to a message, for the rare reply that comes without a permalink.
     func permalink(channel: String, ts: String) -> URL? {
@@ -221,19 +223,24 @@ struct SlackClient: Sendable {
         }
     }
 
-    /// Channels you're a member of (public and private), by name.
+    /// Channels you're a member of (public and private), by name: the ones you can post a plan to.
+    /// users.conversations lists only your own channels (conversations.list would page through every
+    /// public channel in the workspace), with the same scopes.
     func channels(pages: Int = 5) async throws -> [SlackChannel] {
         var result: [SlackChannel] = []
         var cursor: String?
         for _ in 0..<pages {
             var params = [("types", "public_channel,private_channel"), ("exclude_archived", "true"), ("limit", "200")]
             if let cursor { params.append(("cursor", cursor)) }
-            let (reply, _) = try await call("conversations.list", params, as: ConversationsReply.self)
-            result += (reply.channels ?? []).compactMap(\.value).compactMap(\.channel).filter { $0.isMember && !$0.isArchived }
+            let (reply, _) = try await call("users.conversations", params, as: ConversationsReply.self)
+            result += (reply.channels ?? []).compactMap(\.value).compactMap(\.channel)
+                .filter { $0.isMember && !$0.isArchived && !$0.isDirect && !$0.isGroupDM }
             guard let next = reply.responseMetadata?.nextCursor, !next.isEmpty else { break }
             cursor = next
         }
-        return result.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        var seen = Set<String>()
+        return result.filter { seen.insert($0.id).inserted }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
     func conversation(_ id: String) async throws -> SlackChannel {
@@ -388,8 +395,9 @@ private struct RawChannel: Decodable {
 
     var channel: SlackChannel? {
         guard let id, !id.isEmpty else { return nil }
+        // users.conversations only lists your own channels and may leave is_member out.
         return SlackChannel(id: id, name: name ?? id, isPrivate: isPrivate ?? false, isDirect: isDirect, isGroupDM: isGroupDM,
-                            isMember: isMember ?? false, isArchived: isArchived ?? false)
+                            isMember: isMember ?? true, isArchived: isArchived ?? false)
     }
 }
 
@@ -446,7 +454,8 @@ private struct RawMessage: Decodable {
 
 private extension SlackMessage {
     init?(_ raw: RawMessage, channel: String, info: RawChannel?) {
-        guard let ts = raw.ts, !ts.isEmpty, TimeInterval(ts) != nil else { return nil }
+        // "1712345678.000100": seconds since 1970.
+        guard let ts = raw.ts, let seconds = TimeInterval(ts), seconds.isFinite, seconds > 0, seconds < 1e11, !channel.isEmpty else { return nil }
         self.init(channelID: channel, channelName: info.flatMap { $0.isDirect || $0.isGroupDM ? nil : $0.name },
                   isDirect: info?.isDirect ?? channel.hasPrefix("D"), isGroupDM: info?.isGroupDM ?? false,
                   ts: ts, userID: raw.user, userName: raw.username, text: raw.displayText,
@@ -525,7 +534,11 @@ enum SlackText {
         if let space = cut.lastIndex(of: " "), cut.distance(from: cut.startIndex, to: space) > limit / 2 {
             cut = String(cut[..<space])
         }
-        return cut.trimmingCharacters(in: CharacterSet.whitespaces.union(.punctuationCharacters)) + "…"
+        // Only the end: "(Draft) Board deck, budget…" keeps its opening bracket.
+        while let last = cut.unicodeScalars.last, CharacterSet.whitespaces.union(.punctuationCharacters).contains(last) {
+            cut.unicodeScalars.removeLast()
+        }
+        return cut + "…"
     }
 }
 

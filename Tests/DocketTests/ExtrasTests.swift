@@ -180,6 +180,18 @@ final class ExtrasSlipCountingTests: ExtrasTestCase {
         XCTAssertEqual(store.tasks.first { $0.isCompleted }?.postponeCount, 4, "the logged copy keeps its history")
     }
 
+    func testADuplicateStartsWithoutTheOriginalsPushes() {
+        let store = makeStore()
+        var original = TaskItem(title: "Draft the hiring plan")
+        original.dueDate = day(1)
+        original.postponeCount = 5
+        let id = store.addTask(original).id
+
+        let copy = store.duplicateTask(id)
+        XCTAssertEqual(copy?.postponeCount, 0)
+        XCTAssertEqual(count(store, id), 5, "the original keeps its count")
+    }
+
     func testPushesFarApartCountSeparately() {
         var tracker = SlipTracker(window: 60)
         let start = Date()
@@ -335,6 +347,48 @@ final class ExtrasDayClearedTests: ExtrasTestCase {
         complete(id, store, app)
         XCTAssertEqual(app.toast, "Day cleared. Nice work.")
         XCTAssertEqual(Celebration.shared.burst, before, "no confetti")
+    }
+
+    func testTickingOffAwayFromACheckboxStillClearsTheDay() {
+        let store = makeStore()
+        let app = AppState()
+        let id = add(store, "Finish the board memo", planned: day(0))
+        Celebration.shared.watch(store, app: app)
+
+        // A focus session's Done, an alarm's or a notification's: the store alone, no checkbox hook.
+        store.setCompleted(id, true)
+        XCTAssertNil(app.toast, "it waits until the change has landed")
+        let deadline = Date().addingTimeInterval(2)
+        while app.toast == nil, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertEqual(app.toast, "Day cleared. Nice work.")
+    }
+
+    func testOnlyTasksTickedOffJustNowCount() {
+        var open = TaskItem(title: "Sign the lease")
+        open.dueDate = day(0)
+        var done = open
+        done.completedAt = Date()
+        var longAgo = open
+        longAgo.completedAt = Date().addingTimeInterval(-3600)
+        let other = TaskItem(title: "Call Northwind")
+        let now = Date()
+
+        XCTAssertEqual(DayClear.justFinished(from: [other, open], to: [other, done], now: now), [open.id])
+        XCTAssertEqual(DayClear.justFinished(from: [open], to: [longAgo], now: now), [], "back already done: an import, an undo long after")
+        XCTAssertEqual(DayClear.justFinished(from: [done], to: [done], now: now), [])
+        XCTAssertEqual(DayClear.justFinished(from: [open], to: [other], now: now), [], "a different task in that spot")
+
+        // A repeating task moves on to its next date instead of being done; its logged copy is new.
+        let store = makeStore()
+        var daily = TaskItem(title: "Inbox zero")
+        daily.recurrence = .daily
+        daily.dueDate = day(0)
+        let id = store.addTask(daily).id
+        let before = store.tasks
+        store.setCompleted(id, true)
+        XCTAssertEqual(DayClear.justFinished(from: before, to: store.tasks, now: Date()), [])
     }
 
     func testOnlyOncePerCalendarDay() {

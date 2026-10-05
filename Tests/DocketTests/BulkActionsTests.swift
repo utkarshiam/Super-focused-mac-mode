@@ -14,8 +14,8 @@ final class BulkActionsTests: XCTestCase {
 
     override func setUp() async throws {
         dir = FileManager.default.temporaryDirectory.appendingPathComponent("docket-bulk-\(UUID().uuidString)")
+        // Groups by event, like the main window's undo manager (see `step`).
         undo = UndoManager()
-        undo.groupsByEvent = false
     }
 
     override func tearDown() async throws {
@@ -45,11 +45,17 @@ final class BulkActionsTests: XCTestCase {
         return (store, ids)
     }
 
-    /// One user action: the window's undo manager groups by event.
+    /// One user action. Like the main window's, `undo` groups by event: the first change an action registers
+    /// opens a step, and the step closes when the event ends (a turn of the run loop). So an action that
+    /// changes nothing leaves no step behind, as in the app. Wrapping each action in begin/endUndoGrouping
+    /// instead would not: Foundation keeps an empty group as an undo step of its own.
     private func step<T>(_ body: () -> T) -> T {
-        undo.beginUndoGrouping()
-        defer { undo.endUndoGrouping() }
-        return body()
+        let result = body()
+        for _ in 0..<10 where undo.groupingLevel > 0 {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertEqual(undo.groupingLevel, 0, "the action's undo step closes with the event")
+        return result
     }
 
     func testMovingSeveralTasksKeepsTimesAndIsOneUndoStep() {
@@ -101,6 +107,40 @@ final class BulkActionsTests: XCTestCase {
         XCTAssertEqual(undo.undoActionName, "Rename")
         undo.undo()
         XCTAssertEqual(store.task(ids[0])?.title, "Planned today")
+    }
+
+    func testIsPlacedMeansMovingThereWouldChangeNothing() {
+        let (store, ids) = makeStore([
+            task("Planned", planned: today),
+            task("Timed", due: at(9, on: today), timed: true),
+            task("Both", due: today, planned: today),
+            task("Loose"),
+        ])
+        let tasks = ids.map { store.task($0)! }
+        XCTAssertTrue(store.isPlaced(tasks[0], on: today))
+        XCTAssertTrue(store.isPlaced(tasks[1], on: today), "a deadline's time doesn't matter")
+        XCTAssertFalse(store.isPlaced(tasks[2], on: today), "moving clears the separate plan date")
+        XCTAssertFalse(store.isPlaced(tasks[3], on: today))
+        XCTAssertFalse(store.isPlaced(tasks[0], on: day(1)))
+
+        XCTAssertEqual(step { store.moveTasks(ids, toDay: today) }, 2)
+        XCTAssertTrue(ids.allSatisfy { store.isPlaced(store.task($0)!, on: today) })
+        XCTAssertEqual(store.task(ids[1])!.dueDate, at(9, on: today))
+    }
+
+    func testFinishedTasksKeepTheirDates() {
+        var done = task("Sent the deck", due: day(-2), planned: day(-3))
+        done.completedAt = Date()
+        let (store, ids) = makeStore([task("Open", due: day(2)), done])
+        XCTAssertEqual(step { store.moveTasks(ids, toDay: day(5)) }, 1)
+        XCTAssertEqual(step { store.planTasks(ids, on: day(6)) }, 1)
+        XCTAssertEqual(step { store.pushTasksToTomorrow(ids) }, 1)
+        XCTAssertEqual(step { store.clearDates(of: ids) }, 1)
+        XCTAssertNil(store.task(ids[0])!.dueDate)
+        XCTAssertEqual(store.task(ids[1])!.dueDate, day(-2))
+        XCTAssertEqual(store.task(ids[1])!.scheduledDate, day(-3))
+        XCTAssertEqual(step { store.moveTasks([ids[1]], toDay: today) }, 0)
+        XCTAssertEqual(undo.undoActionName, "Remove Dates", "the no-op left no step")
     }
 
     func testClearingDatesRemovesPlanDateDeadlineAndTime() {
@@ -336,6 +376,49 @@ final class TaskSelectionTests: XCTestCase {
         XCTAssertEqual(app.selectedTaskID, ids[2])
     }
 
+    func testAClickOnTheOpenTaskWaitsOutADoubleClick() {
+        let (store, app, ids) = makeInbox()
+        app.click(ids[1], .plain, in: store)
+
+        // The first half of a double-click on the open task closes nothing yet; the second half keeps it open.
+        app.click(ids[1], .plain, in: store, closeDelay: 0.2)
+        XCTAssertEqual(app.selectedTaskID, ids[1])
+        app.click(ids[1], .open, in: store)
+        spin(0.3)
+        XCTAssertEqual(app.selectedTaskID, ids[1], "a double-click never shuts the panel, even for a moment")
+
+        // A single click closes it once the double-click time has passed.
+        app.click(ids[1], .plain, in: store, closeDelay: 0.05)
+        XCTAssertEqual(app.selectedTaskID, ids[1])
+        spin(5) { app.selectedTaskID == nil }
+        XCTAssertNil(app.selectedTaskID)
+
+        // Picking something else in the meantime wins, even when it comes back to the same task.
+        app.click(ids[2], .plain, in: store)
+        app.click(ids[2], .plain, in: store, closeDelay: 0.05)
+        app.moveSelection(by: 1, in: store)
+        app.moveSelection(by: -1, in: store)
+        spin(0.2)
+        XCTAssertEqual(app.selectedTaskID, ids[2])
+    }
+
+    func testATaskPickedFromElsewhereIsWhereTheNextRangeStarts() {
+        let (store, app, ids) = makeInbox()
+        app.click(ids[0], .plain, in: store)
+        // Opened some other way than its row (the search field's ↓, a notification, a reveal).
+        app.selectedTaskID = ids[2]
+        app.click(ids[4], .range, in: store)
+        XCTAssertEqual(app.selectedTaskIDs, Set(ids[2...4]))
+    }
+
+    /// Lets the run loop turn for `seconds`, or until `done` holds.
+    private func spin(_ seconds: TimeInterval, until done: () -> Bool = { false }) {
+        let end = Date().addingTimeInterval(seconds)
+        while !done(), Date() < end {
+            RunLoop.current.run(until: min(end, Date().addingTimeInterval(0.01)))
+        }
+    }
+
     func testShiftClickSelectsTheRangeFromTheAnchor() {
         let (store, app, ids) = makeInbox()
         app.click(ids[1], .plain, in: store)
@@ -392,6 +475,48 @@ final class TaskSelectionTests: XCTestCase {
 
         app.selection = .important
         XCTAssertFalse(app.selectAllVisible(in: store), "nothing to select")
+
+        store.setCompleted(ids[0], false)
+        app.selection = .calendar
+        app.calendarMode = .month
+        XCTAssertFalse(app.selectAllVisible(in: store), "the month grid has no rows to select")
+        app.calendarMode = .agenda
+        XCTAssertTrue(app.selectAllVisible(in: store))
+        XCTAssertEqual(app.selectedTaskIDs, [ids[0], ids[2]])
+    }
+
+    func testTriageSaysWhatItDidWithTheRealDate() {
+        let (store, app, ids) = makeInbox()
+        let tomorrow = Fmt.absoluteDay(QuickDay.tomorrow.date())
+        app.click(ids[0], .plain, in: store)
+        app.click(ids[1], .toggle, in: store)
+        XCTAssertTrue(app.triage(.move(.tomorrow), in: store))
+        XCTAssertEqual(app.toast, "Moved 2 tasks to \(tomorrow)")
+        XCTAssertTrue(app.triage(.move(.tomorrow), in: store))
+        XCTAssertEqual(app.toast, "They're all on \(tomorrow) already")
+
+        // One task (due in five days, so never on today already).
+        app.click(ids[4], .plain, in: store)
+        XCTAssertTrue(app.triage(.move(.today), in: store))
+        XCTAssertEqual(app.toast, "Moved to \(Fmt.absoluteDay(Date()))")
+        XCTAssertFalse(app.toast?.contains("Today") == true, "a real date, never “Today”")
+    }
+
+    func testMovingLeavesFinishedTasksWhereTheyWere() {
+        let (store, app, ids) = makeInbox(["A", "B", "C"])
+        let due = store.task(ids[0])!.dueDate
+        store.setCompleted(ids[0], true)
+        app.selection = .completed
+        app.click(ids[0], .plain, in: store)
+        XCTAssertTrue(app.triage(.move(.today), in: store))
+        XCTAssertEqual(app.toast, "It's done already")
+        XCTAssertEqual(store.task(ids[0])!.dueDate, due)
+
+        // A mix: only the open ones move, and the toast counts those.
+        app.selection = .all
+        app.move(ids, toDay: Date(), in: store)
+        XCTAssertEqual(app.toast, "Moved 2 tasks to \(Fmt.absoluteDay(Date()))")
+        XCTAssertEqual(store.task(ids[0])!.dueDate, due)
     }
 
     func testEscDropsTheOthersAndReturnOpensAndCloses() {
@@ -502,9 +627,10 @@ final class TaskSelectionTests: XCTestCase {
     }
 }
 
-/// Compact rows measured off screen: one short line no matter how much the task carries.
+/// Rows and the bulk edit panel laid out off screen: compact rows stay one short line no matter how much
+/// the task carries, and the panel builds for a real mixed selection.
 @MainActor
-final class CompactRowLayoutTests: XCTestCase {
+final class ListLayoutTests: XCTestCase {
     var dir: URL!
 
     override func setUp() async throws {
@@ -551,5 +677,39 @@ final class CompactRowLayoutTests: XCTestCase {
         XCTAssertEqual(height(of: busy, compact: true, store: store, width: 340), compact, accuracy: 0.5,
                        "a narrow list truncates the title instead of wrapping it")
         XCTAssertGreaterThan(height(of: busy, compact: false, store: store), compact + 20, "the roomy row is much taller")
+    }
+
+    func testBulkEditPanelBuildsForAMixedSelection() {
+        let store = Store(persistence: Persistence(directory: dir), seedIfEmpty: false)
+        let list = store.addList(name: "Board", color: .blue, icon: "briefcase")
+        var deck = TaskItem(title: "Prepare the quarterly board update with the revenue bridge and the hiring plan")
+        deck.listID = list.id
+        deck.dueDate = Calendar.current.date(byAdding: .day, value: 2, to: Calendar.current.startOfDay(for: Date()))
+        deck.estimateMinutes = 90
+        deck.tags = ["board", "finance"]
+        deck.waitingOn = "Sam Lee"
+        var call = TaskItem(title: "Call Northwind")
+        call.priority = .urgent
+        call.tags = ["Board"]
+        var invoice = TaskItem(title: "Send the invoice")
+        invoice.completedAt = Date()
+        let ids = [deck, call, invoice].map { store.addTask($0).id }
+
+        let app = AppState()
+        app.selection = .all
+        app.click(ids[0], .plain, in: store)
+        app.click(ids[1], .toggle, in: store)
+        app.click(ids[2], .toggle, in: store)
+        XCTAssertTrue(app.isMultiSelecting)
+        XCTAssertEqual(app.actionTargets(in: store), [ids[1], ids[0], ids[2]],
+                       "in list order (Inbox, then Board), then the ones the view doesn't show")
+
+        let panel = BulkEditPanel()
+            .environmentObject(store)
+            .environmentObject(app)
+            .frame(width: 370, height: 1200)
+        let host = NSHostingView(rootView: panel)
+        host.layoutSubtreeIfNeeded()
+        XCTAssertEqual(host.fittingSize.width, 370, accuracy: 0.5)
     }
 }

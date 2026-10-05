@@ -291,6 +291,64 @@ final class AddOptionsTests: XCTestCase {
         XCTAssertEqual(saturday[3].day, plus(8), "next week starts on Monday")
     }
 
+    func testOnlyTheFirstShortcutForADayIsTicked() {
+        let sunday = cal.startOfDay(for: cal.nextDate(after: now, matching: DateComponents(weekday: 1), matchingPolicy: .nextTime)!)
+        func plus(_ n: Int) -> Date { cal.date(byAdding: .day, value: n, to: sunday)! }
+        let picks = AddOptions.quickDays(now: sunday, calendar: cal)
+
+        // On a Sunday, Tomorrow and Next week are both Monday: the menu keeps both and ticks one.
+        XCTAssertEqual(AddOptions.tickedQuickDay(plus(1), in: picks)?.label, "Tomorrow")
+        XCTAssertEqual(AddOptions.tickedQuickDay(plus(6), in: picks)?.label, "This weekend")
+        XCTAssertNil(AddOptions.tickedQuickDay(plus(3), in: picks), "not a shortcut: the menu ticks the day itself")
+        XCTAssertNil(AddOptions.tickedQuickDay(nil, in: picks))
+    }
+
+    func testShortDateLabelsAreRealDates() {
+        let year = cal.component(.year, from: now)
+        let june1 = cal.date(from: DateComponents(year: year, month: 6, day: 1))!
+        let june15 = cal.date(from: DateComponents(year: year, month: 6, day: 15))!
+        let nextFeb = cal.date(from: DateComponents(year: year + 1, month: 2, day: 3))!
+
+        XCTAssertEqual(AddOptions.shortDateLabel(june15, now: june1, calendar: cal), Fmt.dayMonth(june15))
+        XCTAssertTrue(AddOptions.shortDateLabel(nextFeb, now: june1, calendar: cal).contains(String(year + 1)),
+                      "another year keeps its year")
+        XCTAssertFalse(AddOptions.shortDateLabel(june1, now: june1, calendar: cal).contains("Today"))
+    }
+
+    func testExtrasAreTheRepeatThenTheTags() {
+        var t = TaskItem(title: "Board prep")
+        XCTAssertTrue(AddOptions.extras(t).isEmpty)
+        t.tags = ["board", "q4"]
+        t.recurrence = .weekly
+        let extras = AddOptions.extras(t)
+        XCTAssertEqual(extras.map(\.icon), ["repeat", "number", "number"])
+        XCTAssertEqual(extras.map(\.spoken), [Recurrence.weekly.summary, "#board", "#q4"])
+
+        // A tag page's tag shows up there too, as the task will get it.
+        let onTagPage = make(AddOptions(), ParsedTask(title: "Deck"), AddContext(tag: "board"))
+        XCTAssertEqual(AddOptions.extras(onTagPage).map(\.spoken), ["#board"])
+    }
+
+    func testChipDensityOnlyEverGivesThingsUp() {
+        let levels = AddChipDensity.all
+        let full = AddChipDensity.full
+        XCTAssertEqual(levels.first, full)
+        XCTAssertFalse(full.terse || full.plainValues || full.quietList || full.short || full.minimal)
+        XCTAssertTrue(full.chevrons)
+        for (a, b) in zip(levels, levels.dropFirst()) {
+            XCTAssertLessThan(a, b)
+            // Whatever a step gives up stays given up at every tighter step.
+            XCTAssertTrue(!a.terse || b.terse)
+            XCTAssertTrue(!a.plainValues || b.plainValues)
+            XCTAssertTrue(!a.quietList || b.quietList)
+            XCTAssertTrue(a.chevrons || !b.chevrons)
+            XCTAssertTrue(!a.short || b.short)
+            XCTAssertTrue(!a.minimal || b.minimal)
+        }
+        let tightest = levels[levels.count - 1]
+        XCTAssertTrue(tightest.minimal && tightest.short && !tightest.chevrons)
+    }
+
     func testChipLabelsUseRealDates() {
         var t = TaskItem(title: "Call Sam")
         XCTAssertEqual(AddOptions.dateLabel(t, now: now), "No date")

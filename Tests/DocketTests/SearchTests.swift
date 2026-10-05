@@ -114,6 +114,19 @@ final class SearchTests: XCTestCase {
         XCTAssertEqual(store.search("board deck").tasks.count, 2, "without quotes the words can be anywhere")
     }
 
+    func testCurlyApostrophesMatchStraightOnes() {
+        let store = makeStore(tasks: [task("Review Sam’s deck"), task("Book Sam's flight")],
+                              notes: [note("# Prep\nSend Priya’s numbers to the board")])
+        XCTAssertEqual(Set(titles(store.search("sam's"))), ["Review Sam’s deck", "Book Sam's flight"])
+        XCTAssertEqual(Set(titles(store.search("sam’s"))), ["Review Sam’s deck", "Book Sam's flight"], "and the other way round")
+        XCTAssertEqual(titles(store.search(#""sam's deck""#)), ["Review Sam’s deck"])
+
+        XCTAssertEqual(store.search("priya's").notes.count, 1)
+        XCTAssertEqual(SearchQuery("priya's").snippet(in: store.notes[0].body), "Send Priya’s numbers to the board")
+        let line = "Send Priya’s numbers"
+        XCTAssertEqual(SearchQuery("priya's").highlights(in: line).map { String(line[$0]) }, ["Priya’s"])
+    }
+
     func testPhrasesDontRunAcrossFields() {
         let store = makeStore(tasks: [task("Plan") { $0.tags = ["board"]; $0.notes = "deck" }])
         XCTAssertTrue(store.search(#""board deck""#).isEmpty)
@@ -182,6 +195,31 @@ final class SearchTests: XCTestCase {
         XCTAssertEqual(titles(store.search("call", now: now)),
                        ["Call accountant", "Call printer", "Call investor", "Call landlord", "Call bank"],
                        "overdue first, then by the date on the row (deadline or plan), undated last by priority")
+    }
+
+    func testEqualMatchesFallBackToTitleOrder() {
+        let store = makeStore(tasks: [
+            task("Call Zoë"), task("Call investors re Q3 plan"), task("Call Émile"), task("call amy"), task("Call investors re Q2 plan"),
+        ])
+        XCTAssertEqual(titles(store.search("call")),
+                       ["call amy", "Call Émile", "Call investors re Q2 plan", "Call investors re Q3 plan", "Call Zoë"],
+                       "case and accents ignored, and titles told apart past their first few letters")
+    }
+
+    func testOverdueComesFirstAmongEqualMatches() throws {
+        let cal = Calendar.current
+        // Mid-afternoon, so two hours earlier and later are both today.
+        let now = try XCTUnwrap(cal.date(bySettingHour: 15, minute: 0, second: 0, of: Date()))
+        let today = cal.startOfDay(for: now)
+        let store = makeStore(tasks: [
+            task("Send deck today") { $0.dueDate = today },
+            task("Send deck at five") { $0.dueDate = now.addingTimeInterval(2 * 3600); $0.dueHasTime = true },
+            task("Send deck at one") { $0.dueDate = now.addingTimeInterval(-2 * 3600); $0.dueHasTime = true },
+            task("Send deck yesterday") { $0.dueDate = cal.date(byAdding: .day, value: -1, to: today) },
+        ])
+        XCTAssertEqual(titles(store.search("send deck", now: now)),
+                       ["Send deck yesterday", "Send deck at one", "Send deck at five", "Send deck today"],
+                       "overdue first (an earlier day, or a time that has passed); a timed deadline before the day's date-only ones")
     }
 
     func testOpenThenCompletedNewestFirstLimitedToFifty() {
@@ -304,9 +342,27 @@ final class SearchTests: XCTestCase {
         XCTAssertEqual(r.tasks.count + r.completedTotal, expected.count)
         XCTAssertTrue(r.tasks.allSatisfy { !$0.isCompleted })
 
+        // One letter matches nearly everything: the most results there are to put in order.
+        start = Date()
+        let broad = store.search("e")
+        let broadTime = Date().timeIntervalSince(start)
+        XCTAssertGreaterThan(broad.tasks.count, 5_000)
+
         // Generous limits for a debug build on a busy machine; release builds are far faster.
         XCTAssertLessThan(cold, 3, "first search, folding every task and note")
         XCTAssertLessThan(warm, 0.75, "later searches reuse the folded text")
+        XCTAssertLessThan(broadTime, 1.5, "ordering thousands of matches")
+    }
+
+    func testPreparingFoldsAheadWithoutChangingResults() {
+        let store = makeStore(tasks: [task("Draft board memo"), task("Board pack") { $0.completedAt = Date() }],
+                              notes: [note("# Board\nAgenda")])
+        let before = store.search("board")
+        store.prepareSearch()
+        let after = store.search("board", now: Date().addingTimeInterval(1))
+        XCTAssertEqual(after.tasks.map(\.id), before.tasks.map(\.id))
+        XCTAssertEqual(after.completed.map(\.id), before.completed.map(\.id))
+        XCTAssertEqual(after.notes.map(\.id), before.notes.map(\.id))
     }
 
     // MARK: Highlights and excerpts
@@ -334,6 +390,28 @@ final class SearchTests: XCTestCase {
         XCTAssertTrue(snippet.hasSuffix("…"), snippet)
         XCTAssertTrue(snippet.contains("renewal terms"), snippet)
         XCTAssertLessThanOrEqual(snippet.count, 82)
+    }
+
+    func testSnippetFindsMatchesAcrossMarkdownInLongNotes() {
+        let body = "# Plans\n" + String(repeating: "Nothing to look at on this line\n", count: 3_000)
+            + "See **board** deck and ![Offsite venue](attachments/venue.jpg)\nRename snake_case_name"
+        XCTAssertEqual(SearchQuery(#""board deck""#).snippet(in: body), "See board deck and Photo: Offsite venue",
+                       "a phrase across emphasis marks")
+        XCTAssertEqual(SearchQuery("photo").snippet(in: body), "See board deck and Photo: Offsite venue", "photos by what they show")
+        XCTAssertEqual(SearchQuery("snake_case").snippet(in: body), "Rename snake_case_name", "underscores inside words stay")
+        XCTAssertNil(SearchQuery("plans").snippet(in: body), "only the title matches")
+    }
+
+    func testNoteExcerptFollowsEdits() {
+        let store = makeStore(notes: [note("# Weekly\nSend the board pack")])
+        let id = store.notes[0].id
+        XCTAssertEqual(SearchQuery("board").excerpt(for: store.notes[0]), "Send the board pack")
+        store.updateNoteBody(id, "# Weekly\nAgenda\nBoard review moved to Friday")
+        XCTAssertEqual(SearchQuery("board").excerpt(for: store.notes[0]), "Board review moved to Friday",
+                       "an edited note shows its new matching line")
+        XCTAssertEqual(SearchQuery("agenda").excerpt(for: store.notes[0]), "Agenda", "each query gets its own line")
+        XCTAssertEqual(SearchQuery("weekly").excerpt(for: store.notes[0]), store.notes[0].preview,
+                       "a match in the title shows the opening lines")
     }
 
     // MARK: Navigation
@@ -374,5 +452,77 @@ final class SearchTests: XCTestCase {
         app.endSearch(in: store)
         XCTAssertEqual(app.searchText, "")
         XCTAssertEqual(app.selection, .important)
+    }
+
+    func testEndingSearchFromATagNoOpenTaskHasGoesToTheInbox() {
+        let store = makeStore()
+        let tagged = store.addTask(task("Screen candidates") { $0.tags = ["hiring"] })
+        let app = AppState()
+        app.selection = .tag("hiring")
+        app.searchText = "screen"
+        app.enterSearch()
+        store.mutateTask(tagged.id) { $0.tags = [] }
+        app.endSearch(in: store)
+        XCTAssertEqual(app.selection, .inbox)
+
+        app.selection = .tag("ops")
+        store.mutateTask(tagged.id) { $0.tags = ["Ops"] }
+        app.searchText = "screen"
+        app.enterSearch()
+        app.endSearch(in: store)
+        XCTAssertEqual(app.selection, .tag("ops"), "a tag still in use is where you go back to, whatever its case")
+    }
+
+    func testEachAppStateRemembersItsOwnOpenTask() {
+        let store = makeStore()
+        let t = store.addTask(task("Prep deck"))
+        let first = AppState(), second = AppState()
+        first.selection = .inbox
+        first.selectedTaskID = t.id
+        first.searchText = "deck"
+        first.enterSearch()
+        second.selection = .inbox
+        second.searchText = "deck"
+        second.enterSearch()
+
+        second.endSearch(in: store)
+        XCTAssertNil(second.selectedTaskID, "nothing was open in this one")
+        first.endSearch(in: store)
+        XCTAssertEqual(first.selectedTaskID, t.id)
+    }
+
+    /// Search lists its own rows, so arrows, ⇧-click ranges and ⌘A go through `searchResultIDs`, which the
+    /// Search view keeps equal to the task results in on-screen order (open, then completed).
+    func testArrowsRangesAndSelectAllFollowTheResultsOnScreen() {
+        let deck = task("Board deck")
+        let offsite = task("Plan board offsite")
+        let minutes = task("Board minutes") { $0.completedAt = Date() }
+        let store = makeStore(tasks: [offsite, task("Lunch with Sam"), minutes, deck])
+        let app = AppState()
+        app.searchText = "board"
+        app.enterSearch()
+        // What the Search view does whenever its results change.
+        app.searchResultIDs = app.searchTaskOrder(in: store)
+        XCTAssertEqual(app.visibleTaskOrder(in: store), [deck.id, offsite.id, minutes.id], "open by rank, then completed")
+
+        XCTAssertTrue(app.moveSelection(by: 1, in: store))
+        XCTAssertEqual(app.selectedTaskID, deck.id)
+        app.moveSelection(by: 1, in: store)
+        app.moveSelection(by: 1, in: store)
+        XCTAssertEqual(app.selectedTaskID, minutes.id, "down into the completed ones")
+
+        app.click(deck.id, .plain, in: store)
+        app.click(minutes.id, .range, in: store)
+        XCTAssertEqual(app.selectedTaskIDs, [deck.id, offsite.id, minutes.id], "⇧-click takes the rows in between")
+
+        XCTAssertTrue(app.selectAllVisible(in: store))
+        XCTAssertEqual(app.selectedTaskIDs, [deck.id, offsite.id], "⌘A takes the open results")
+
+        app.searchText = "offsite"
+        app.searchResultIDs = app.searchTaskOrder(in: store)
+        XCTAssertEqual(app.visibleTaskOrder(in: store), [offsite.id], "a new query, new rows")
+
+        app.endSearch(in: store)
+        XCTAssertTrue(app.searchResultIDs.isEmpty, "nothing left over for the next search")
     }
 }

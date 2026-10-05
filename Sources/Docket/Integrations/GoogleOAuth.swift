@@ -150,6 +150,8 @@ enum GoogleOAuth {
         guard let url = authorizationURL(client: client, redirectURI: redirectURI, state: state, challenge: PKCE.challenge(for: verifier)) else {
             throw IntegrationError.unexpected(.google, "a bad sign-in address")
         }
+        // Cancelled while the listener started: don't send the browser to a page nobody waits for.
+        if Task.isCancelled { throw IntegrationError.signInCancelled }
         open(url)
         let redirect = try await withTaskCancellationHandler {
             try await server.waitForRedirect()

@@ -221,6 +221,8 @@ extension AddOptions {
     }
 
     /// Today, Tomorrow, This weekend, Next week (Monday) and In a week, as the date picker has them.
+    /// Two can land on the same day (on a Sunday, next week starts tomorrow); the menu keeps both, so
+    /// the items never move around, and ticks only the first (see `tickedQuickDay`).
     static func quickDays(now: Date = Date(), calendar cal: Calendar = .current) -> [QuickDay] {
         let today = cal.startOfDay(for: now)
         func plus(_ days: Int) -> Date { cal.date(byAdding: .day, value: days, to: today) ?? today }
@@ -233,6 +235,12 @@ extension AddOptions {
             QuickDay(label: "Next week", day: Recurrence(frequency: .weekly, weekdays: [2]).advance(today, calendar: cal)),
             QuickDay(label: "In a week", day: plus(7)),
         ]
+    }
+
+    /// The one shortcut the Date menu ticks for `day`: the first that lands on it.
+    static func tickedQuickDay(_ day: Date?, in picks: [QuickDay]) -> QuickDay? {
+        guard let day else { return nil }
+        return picks.first { $0.day == day }
     }
 
     static let timePresets = [9 * 60, 12 * 60, 15 * 60, 18 * 60]
@@ -285,6 +293,17 @@ extension AddOptions {
         day(of: t, calendar: cal).map { Fmt.absoluteDay($0, now: now, calendar: cal) } ?? "No date"
     }
 
+    /// The narrow chip's real date: "5 Oct", or "5 Oct 2027" outside this year. Never "Today".
+    static func shortDateLabel(_ day: Date, now: Date = Date(), calendar cal: Calendar = .current) -> String {
+        cal.isDate(day, equalTo: now, toGranularity: .year) ? Fmt.dayMonth(day) : shortDayYearFormatter.string(from: day)
+    }
+
+    private static let shortDayYearFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate("d MMM y")
+        return f
+    }()
+
     static func timeLabel(_ t: TaskItem) -> String {
         guard t.dueHasTime, let due = t.dueDate else { return "No time" }
         return Fmt.time(due)
@@ -331,6 +350,55 @@ extension AddOptions {
         guard t.reminders.count == 1, let r = t.reminders.first, case .beforeDue(let minutes) = r.trigger else { return nil }
         return AddReminder(minutesBefore: minutes, isAlarm: r.isAlarm)
     }
+
+    /// What quick add understood that has no dropdown of its own: the repeat rule, then the tags.
+    static func extras(_ t: TaskItem) -> [AddExtra] {
+        (t.recurrence.map { [AddExtra(icon: "repeat", text: $0.summary)] } ?? [])
+            + t.tags.map { AddExtra(icon: "number", text: $0) }
+    }
+}
+
+/// A repeat rule or a tag, shown as a quiet chip after (or under) the dropdowns.
+struct AddExtra: Hashable {
+    var icon: String
+    var text: String
+    /// "#board" or "Every week", for the "+2" chip's tooltip.
+    var spoken: String { icon == "number" ? "#\(text)" : text }
+}
+
+// MARK: - Chip density
+
+/// How compact the dropdown chips draw. Each step gives up the least useful thing still on show, so the
+/// chips stay on one line from Quick Capture (592pt) down to the narrowest list pane (312pt of field).
+/// Tooltips always carry the whole value.
+struct AddChipDensity: Hashable, Comparable {
+    let level: Int
+
+    static let full = AddChipDensity(level: 0)
+    /// Fullest first.
+    static let all = (0...6).map { AddChipDensity(level: $0) }
+
+    /// "No date" and "No time" become bare icons; More shows priority and reminder as icons ("⧗ 30m ⚑ 🔔").
+    var terse: Bool { level >= 1 }
+    /// The date, time and list drop their leading icons.
+    var plainValues: Bool { level >= 2 }
+    /// A list nobody chose (the page's, or the Inbox) is just its icon.
+    var quietList: Bool { level >= 3 }
+    var chevrons: Bool { level < 4 }
+    /// "5 Oct" and "10a" instead of "Mon 5 Oct" and "10:00 AM"; a chosen list's name is cut shorter.
+    var short: Bool { level >= 5 }
+    /// More keeps only the duration and a High or Urgent flag (or one icon), and every list is just its icon.
+    var minimal: Bool { level >= 6 }
+
+    /// The measuring copy's id when repeat and tags ride along (`.oneLine`), distinct from `level`.
+    var withExtrasID: String { "extras-\(level)" }
+
+    static func < (a: AddChipDensity, b: AddChipDensity) -> Bool { a.level < b.level }
+}
+
+private struct AddChipDensityKey: PreferenceKey {
+    static let defaultValue = 0
+    static func reduce(value: inout Int, nextValue: () -> Int) { value = max(value, nextValue()) }
 }
 
 // MARK: - The chip row
@@ -339,12 +407,14 @@ extension AddOptions {
 enum AddPicker: Hashable { case date, time }
 
 /// The Date, Time, List and More dropdowns under a quick-add field, each showing what the task will get,
-/// followed by what has no chip of its own (tags, repeat).
+/// then what has no dropdown of its own (repeat, tags). The chips never wrap: an invisible copy of their
+/// labels, laid out at every `AddChipDensity` by ViewThatFits, finds the fullest one that fits the width.
 struct AddOptionsBar: View {
     enum Arrangement {
-        /// Wraps onto a second line when narrow (main window, menu bar).
-        case wrap
-        /// One line; tags and the hint drop out when there's no room (Quick Capture's fixed-size panel).
+        /// Repeat and tags get a line of their own under the chips (main window, menu bar).
+        case stacked
+        /// One line: repeat and tags follow the chips and fold into "+2" when short of room, and the
+        /// hint shows while there's nothing to list (Quick Capture's fixed-size panel).
         case oneLine
     }
 
@@ -357,7 +427,7 @@ struct AddOptionsBar: View {
     /// "Pick a date" and the custom time are submenus instead.
     let usesPopovers: Bool
     let arrangement: Arrangement
-    /// Quiet text after the chips while nothing else is shown.
+    /// Quiet text after the chips while nothing else is shown (`.oneLine` only).
     let hint: String?
     @Binding var picker: AddPicker?
     /// After every pick, so the field can take the cursor back.
@@ -367,9 +437,10 @@ struct AddOptionsBar: View {
 
     private enum ChipSlot: Hashable { case date, time, list, more }
     @FocusState private var focusedChip: ChipSlot?
+    @State private var density = AddChipDensity.full
 
     init(options: Binding<AddOptions>, parsed: ParsedTask, context: AddContext, lists: [TaskList], now: Date = Date(),
-         usesPopovers: Bool = true, arrangement: Arrangement = .wrap, hint: String? = nil,
+         usesPopovers: Bool = true, arrangement: Arrangement = .stacked, hint: String? = nil,
          picker: Binding<AddPicker?> = .constant(nil), onPick: @escaping () -> Void = {},
          onFocusChange: @escaping (Bool) -> Void = { _ in }) {
         _options = options
@@ -387,79 +458,119 @@ struct AddOptionsBar: View {
 
     var body: some View {
         let task = options.makeTask(parsed: parsed, context: context, lists: lists, now: now)
-        Group {
-            switch arrangement {
-            case .wrap:
-                FlowLayout(spacing: 6, lineSpacing: 6) {
-                    chips(task)
-                    trailing(task)
-                }
-            case .oneLine:
-                HStack(spacing: 6) {
-                    chips(task)
-                    // All or nothing: half a tag row would read as clutter.
-                    ViewThatFits(in: .horizontal) {
-                        HStack(spacing: 6) { trailing(task) }
-                        Color.clear.frame(width: 0, height: 0)
-                    }
-                    .layoutPriority(-1)
-                    Spacer(minLength: 0)
+        let extras = AddOptions.extras(task)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                dateChip(task)
+                timeChip(task)
+                listChip(task)
+                moreChip(task)
+                if arrangement == .oneLine {
+                    AddExtrasLine(items: extras, hint: hint)
+                        .layoutPriority(-1)
                 }
             }
+            // Exactly the width on offer, never the chips' own: with only a maximum, a row of chips wider
+            // than the space would widen the frame, and the measuring copy would think they fit.
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+            .background(alignment: .leading) { densityProbe(task, extras: extras) }
+
+            if arrangement == .stacked, !extras.isEmpty {
+                AddExtrasLine(items: extras, hint: nil)
+                    .transition(.opacity)
+            }
         }
+        .onPreferenceChange(AddChipDensityKey.self) { density = AddChipDensity(level: $0) }
         .onChange(of: focusedChip) { onFocusChange($0 != nil) }
         .onChange(of: picker) { if $0 == nil { onPick() } }
     }
 
-    @ViewBuilder
-    private func chips(_ t: TaskItem) -> some View {
-        dateChip(t)
-        timeChip(t)
-        listChip(t)
-        moreChip(t)
-    }
-
-    /// Tags and repeat, which have no chip, or the hint when there's nothing to show.
-    @ViewBuilder
-    private func trailing(_ t: TaskItem) -> some View {
-        if t.tags.isEmpty && t.recurrence == nil {
-            if let hint {
-                Text(hint)
-                    .textStyle(.subhead)
-                    .foregroundStyle(Color.ink3)
-                    .lineLimit(1)
-                    .fixedSize()
-                    .frame(height: 26)
-                    .padding(.leading, 4)
+    /// The chip labels alone (no menus), at every density, fullest first. ViewThatFits keeps the first
+    /// copy that fits, and only that copy reports its density, which the real chips then draw at.
+    /// (ViewThatFits needs every candidate's id to be unique, hence the two id schemes.)
+    private func densityProbe(_ t: TaskItem, extras: [AddExtra]) -> some View {
+        ViewThatFits(in: .horizontal) {
+            // On one line, give up the More chip's words before folding repeat and tags into "+2".
+            if arrangement == .oneLine, !extras.isEmpty {
+                ForEach(AddChipDensity.all.prefix(2), id: \.withExtrasID) { d in
+                    HStack(spacing: 6) {
+                        labels(t, d)
+                        AddExtrasLine.chips(extras)
+                    }
+                    .preference(key: AddChipDensityKey.self, value: d.level)
+                }
             }
-        } else {
-            ForEach(t.tags, id: \.self) { tag in
-                Chip(icon: "number", text: tag)
-                    .fixedSize()
-                    .frame(height: 26)
-            }
-            if let rule = t.recurrence {
-                Chip(icon: "repeat", text: rule.summary)
-                    .fixedSize()
-                    .frame(height: 26)
+            ForEach(AddChipDensity.all, id: \.level) { d in
+                HStack(spacing: 6) { labels(t, d) }
+                    .preference(key: AddChipDensityKey.self, value: d.level)
             }
         }
+        .hidden()
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
+
+    @ViewBuilder
+    func labels(_ t: TaskItem, _ d: AddChipDensity) -> some View {
+        dateFace(t, d)
+        timeFace(t, d)
+        listFace(t, d)
+        moreFace(t, d)
+    }
+
+    // MARK: Faces (shared by the chips and the invisible copy that measures them)
+
+    func dateFace(_ t: TaskItem, _ d: AddChipDensity) -> AddChipFace {
+        guard let day = AddOptions.day(of: t) else {
+            return AddChipFace(icon: "calendar", text: d.terse ? nil : "No date", active: false, chevron: d.chevrons)
+        }
+        let text = d.short ? AddOptions.shortDateLabel(day, now: now) : Fmt.absoluteDay(day, now: now)
+        return AddChipFace(icon: d.plainValues ? nil : "calendar", text: text, active: t.dueDate != nil, chevron: d.chevrons)
+    }
+
+    func timeFace(_ t: TaskItem, _ d: AddChipDensity) -> AddChipFace {
+        guard t.dueHasTime, let due = t.dueDate else {
+            return AddChipFace(icon: "clock", text: d.terse ? nil : "No time", active: false, chevron: d.chevrons)
+        }
+        return AddChipFace(icon: d.plainValues ? nil : "clock", text: d.short ? Fmt.compactTime(due) : Fmt.time(due),
+                           active: true, chevron: d.chevrons)
+    }
+
+    func listFace(_ t: TaskItem, _ d: AddChipDensity) -> AddChipFace {
+        let list = lists.first { $0.id == t.listID }
+        let icon = list?.icon ?? "tray"
+        let chosen = listChosen
+        if d.minimal || (d.quietList && !chosen) {
+            return AddChipFace(icon: icon, text: nil, active: chosen, chevron: d.chevrons)
+        }
+        return AddChipFace(icon: d.plainValues ? nil : icon, text: list?.name ?? "Inbox", active: chosen, chevron: d.chevrons,
+                           maxTextWidth: d.short ? 80 : 140)
+    }
+
+    func moreFace(_ t: TaskItem, _ d: AddChipDensity) -> AddMoreFace {
+        AddMoreFace(items: AddOptions.moreItems(t), priority: t.priority, reminderNeedsDate: reminderNeedsDate(t), density: d)
+    }
+
+    /// Typed ("#board") or picked, rather than the page's list or the Inbox by default.
+    private var listChosen: Bool { options.list != .auto || parsed.listID != nil }
+
+    private func reminderNeedsDate(_ t: TaskItem) -> Bool { !t.reminders.isEmpty && t.dueDate == nil }
 
     // MARK: Date
 
     private func dateChip(_ t: TaskItem) -> some View {
         let day = AddOptions.day(of: t)
         let picks = AddOptions.quickDays(now: now)
+        let ticked = AddOptions.tickedQuickDay(day, in: picks)
         return Menu {
             ForEach(picks) { pick in
-                checkItem("\(pick.label) · \(Fmt.absoluteDay(pick.day, now: now))", on: day == pick.day) {
+                checkItem("\(pick.label) · \(Fmt.absoluteDay(pick.day, now: now))", on: pick == ticked) {
                     options.pickDate(pick.day)
                     onPick()
                 }
             }
             // A typed or picked day that isn't a shortcut still gets its tick.
-            if let day, !picks.contains(where: { $0.day == day }) {
+            if let day, ticked == nil {
                 checkItem(Fmt.absoluteDay(day, now: now), on: true) {}
             }
             Divider()
@@ -474,7 +585,7 @@ struct AddOptionsBar: View {
                 onPick()
             }
         } label: {
-            ChipFace(icon: "calendar", text: day.map { Fmt.absoluteDay($0, now: now) } ?? "No date", active: t.dueDate != nil)
+            dateFace(t, density)
         }
         .menuChrome(Capsule())
         .focused($focusedChip, equals: .date)
@@ -483,11 +594,16 @@ struct AddOptionsBar: View {
                         allowsTime: false, title: "Date", close: { picker = nil })
         }
         .help(dateHelp(t))
+        .accessibilityLabel("Date")
+        .accessibilityValue(day.map { Fmt.absoluteDay($0, now: now) } ?? "No date")
     }
 
+    /// Leads with the whole value, which a narrow chip may shorten.
     private func dateHelp(_ t: TaskItem) -> String {
-        if t.dueDate == nil, t.scheduledDate != nil { return "Planned for this day. Pick a date, or type one like “fri” or “dec 3”" }
-        return "Pick a date, or type one like “fri” or “dec 3”"
+        let how = "Pick a date, or type one like “fri” or “dec 3”"
+        guard let day = AddOptions.day(of: t) else { return "No date. \(how)" }
+        let value = Fmt.absoluteDay(day, now: now)
+        return t.dueDate == nil ? "Planned for \(value). \(how)" : "Due \(value). \(how)"
     }
 
     /// Floating panels: every day of the next six months, by month.
@@ -538,7 +654,7 @@ struct AddOptionsBar: View {
                 timeSubmenu(today: today)
             }
         } label: {
-            ChipFace(icon: "clock", text: AddOptions.timeLabel(t), active: minutes != nil)
+            timeFace(t, density)
         }
         .menuChrome(Capsule())
         .focused($focusedChip, equals: .time)
@@ -546,7 +662,9 @@ struct AddOptionsBar: View {
             AddTimePopover(minutes: minutes ?? AddOptions.nextWholeHour(after: now),
                            onSet: { options.pickTime($0) }, close: { picker = nil })
         }
-        .help("Pick a time, or type one like “3pm” or “10:30”")
+        .help("\(AddOptions.timeLabel(t)). Pick a time, or type one like “3pm” or “10:30”")
+        .accessibilityLabel("Time")
+        .accessibilityValue(AddOptions.timeLabel(t))
     }
 
     /// Floating panels: any quarter hour, by hour.
@@ -569,6 +687,7 @@ struct AddOptionsBar: View {
 
     private func listChip(_ t: TaskItem) -> some View {
         let list = lists.first { $0.id == t.listID }
+        let name = list?.name ?? "Inbox"
         return Menu {
             checkItem("Inbox", icon: "tray", on: list == nil) {
                 options.pickList(nil)
@@ -582,19 +701,22 @@ struct AddOptionsBar: View {
                 }
             }
         } label: {
-            ChipFace(icon: list?.icon ?? "tray", text: list?.name ?? "Inbox",
-                     active: options.list != .auto || parsed.listID != nil, maxTextWidth: 140)
+            listFace(t, density)
         }
         .menuChrome(Capsule())
         .focused($focusedChip, equals: .list)
-        .help("Pick a list, or type # and its name")
+        .help("\(name). Pick a list, or type # and its name")
+        .accessibilityLabel("List")
+        .accessibilityValue(name)
     }
 
     // MARK: More (duration, priority, reminder)
 
     private func moreChip(_ t: TaskItem) -> some View {
-        let items = AddOptions.moreItems(t)
-        let reminderNeedsDate = !t.reminders.isEmpty && t.dueDate == nil
+        let summary = AddOptions.moreItems(t).map(\.text).joined(separator: " · ")
+        let how = reminderNeedsDate(t)
+            ? "The reminder needs a date to ring. Pick one, or type “fri 3pm”"
+            : "Duration, priority and reminder. Or type “45m”, “!!” or “@alarm10”"
         return Menu {
             Menu {
                 durationItems(t)
@@ -617,13 +739,13 @@ struct AddOptionsBar: View {
                 Label(AddOptions.reminderSummary(t).map { "Reminder · \($0)" } ?? "Reminder", systemImage: t.hasAlarm ? "alarm" : "bell")
             }
         } label: {
-            MoreFace(items: items, priority: t.priority, reminderNeedsDate: reminderNeedsDate)
+            moreFace(t, density)
         }
         .menuChrome(Capsule())
         .focused($focusedChip, equals: .more)
-        .help(reminderNeedsDate
-              ? "The reminder needs a date and time to ring. Pick them, or type “fri 3pm”"
-              : "Duration, priority and reminder. Or type “45m”, “!!” or “@alarm10”")
+        .help(summary.isEmpty ? how : "\(summary). \(how)")
+        .accessibilityLabel("More options")
+        .accessibilityValue(summary.isEmpty ? "None" : summary)
     }
 
     @ViewBuilder
@@ -645,6 +767,10 @@ struct AddOptionsBar: View {
     @ViewBuilder
     private func reminderItems(_ t: TaskItem) -> some View {
         let current = AddOptions.currentReminder(t)
+        if t.dueDate == nil {
+            // A disabled line: reminders count back from the deadline.
+            Text("Needs a date to ring")
+        }
         checkItem("No reminder", on: t.reminders.isEmpty) {
             options.pickReminder(nil)
             onPick()
@@ -697,12 +823,15 @@ struct AddOptionsBar: View {
     }
 }
 
-/// A dropdown chip's face: icon, value and a small chevron on a 26pt capsule edged with a hairline.
+// MARK: - Chip faces
+
+/// A dropdown chip's face: icon and/or value and a small chevron on a 26pt capsule edged with a hairline.
 /// Quiet (ink2) while it shows a default; ink once it holds something typed or picked.
-private struct ChipFace: View {
+struct AddChipFace: View {
     var icon: String?
-    var text: String
+    var text: String?
     var active: Bool
+    var chevron = true
     var maxTextWidth: CGFloat = 160
 
     var body: some View {
@@ -710,38 +839,54 @@ private struct ChipFace: View {
             if let icon {
                 Image(systemName: icon).font(.system(size: 10.5, weight: .semibold))
             }
-            Text(text)
-                .lineLimit(1)
-                .frame(maxWidth: maxTextWidth)
-            ChipChevron()
+            if let text {
+                Text(text)
+                    .lineLimit(1)
+                    .frame(maxWidth: maxTextWidth)
+            }
+            if chevron { AddChipChevron() }
         }
-        .chipFace(active: active)
+        .addChipBody(active: active)
     }
 }
 
-/// The More chip: "More" until something is set, then each value with its icon ("45m", "High", "15m before").
-private struct MoreFace: View {
+/// The More chip: "More" until something is set, then each value with its icon ("45m", "High",
+/// "15m before"); narrower, priority and reminder keep only their icons.
+struct AddMoreFace: View {
     var items: [AddOptions.MoreItem]
     var priority: Priority
     /// A reminder with nothing to count from shows in the danger colour.
     var reminderNeedsDate: Bool
+    var density: AddChipDensity
 
     var body: some View {
+        // Narrowest: the duration and a High or Urgent flag (else whichever comes first).
+        let kept = items.filter { $0.kind == .duration || ($0.kind == .priority && priority >= .high) }
+        let shown = density.minimal ? (kept.isEmpty ? Array(items.prefix(1)) : kept) : items
         HStack(spacing: 4) {
-            if items.isEmpty {
-                Text("More")
+            if shown.isEmpty {
+                if density.minimal {
+                    Image(systemName: "ellipsis").font(.system(size: 10.5, weight: .bold))
+                } else {
+                    Text("More")
+                }
             }
-            ForEach(Array(items.enumerated()), id: \.offset) { i, item in
+            ForEach(Array(shown.enumerated()), id: \.offset) { i, item in
+                let words = item.kind == .duration || !density.terse
                 HStack(spacing: 3) {
-                    Image(systemName: item.icon).font(.system(size: 10, weight: .semibold))
-                    Text(item.text).lineLimit(1)
+                    if !(density.minimal && words) {
+                        Image(systemName: item.icon).font(.system(size: 10, weight: .semibold))
+                    }
+                    if words {
+                        Text(item.text).lineLimit(1)
+                    }
                 }
                 .foregroundStyle(tint(item))
-                .padding(.leading, i == 0 ? 0 : 4)
+                .padding(.leading, i == 0 ? 0 : (density.terse ? 1 : 4))
             }
-            ChipChevron()
+            if density.chevrons { AddChipChevron() }
         }
-        .chipFace(active: !items.isEmpty)
+        .addChipBody(active: !items.isEmpty)
     }
 
     private func tint(_ item: AddOptions.MoreItem) -> Color {
@@ -753,7 +898,7 @@ private struct MoreFace: View {
     }
 }
 
-private struct ChipChevron: View {
+private struct AddChipChevron: View {
     var body: some View {
         Image(systemName: "chevron.down")
             .font(.system(size: 7.5, weight: .heavy))
@@ -764,7 +909,7 @@ private struct ChipChevron: View {
 
 extension View {
     /// Badge-like body of an add-option chip (the Menu's capsule fill sits behind it).
-    fileprivate func chipFace(active: Bool) -> some View {
+    fileprivate func addChipBody(active: Bool) -> some View {
         font(.system(size: 12, weight: .semibold))
             .monospacedDigit()
             .foregroundStyle(active ? Color.ink : Color.ink2)
@@ -772,6 +917,50 @@ extension View {
             .frame(height: 26)
             .overlay(Capsule().strokeBorder(Color.hair, lineWidth: 1))
             .contentShape(Capsule())
+    }
+}
+
+/// Repeat and tags as quiet chips on one line. Whatever doesn't fit folds into a "+2" chip (its tooltip
+/// lists them); with nothing to list it shows the hint, if there's room for all of it.
+struct AddExtrasLine: View {
+    let items: [AddExtra]
+    let hint: String?
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            if items.isEmpty {
+                if let hint {
+                    Text(hint)
+                        .textStyle(.subhead)
+                        .foregroundStyle(Color.ink3)
+                        .lineLimit(1)
+                        .fixedSize()
+                        .padding(.leading, 4)
+                }
+            } else {
+                ForEach((0...items.count).reversed(), id: \.self) { shown in
+                    HStack(spacing: 6) {
+                        Self.chips(Array(items.prefix(shown)))
+                        if shown < items.count {
+                            Chip(text: "+\(items.count - shown)")
+                                .fixedSize()
+                                .help(items.dropFirst(shown).map(\.spoken).joined(separator: ", "))
+                        }
+                    }
+                }
+            }
+            Color.clear.frame(width: 0, height: 0)
+        }
+    }
+
+    /// Long tags are cut short rather than pushing the line wider. (Fixed size outside the frame, so a
+    /// short chip keeps its own width instead of growing to the maximum.)
+    static func chips(_ items: [AddExtra]) -> some View {
+        ForEach(items, id: \.self) { item in
+            Chip(icon: item.icon, text: item.text)
+                .frame(maxWidth: 180)
+                .fixedSize(horizontal: true, vertical: false)
+        }
     }
 }
 

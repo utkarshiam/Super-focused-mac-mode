@@ -98,6 +98,29 @@ extension TaskDraft {
             $0.name.trimmingCharacters(in: .whitespacesAndNewlines).compare(wanted, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
         }
     }
+
+    /// The draft with the defaults of the page it was planned on, as quick add gives them: a list's page
+    /// files drafts without a (known) list of their own there, a tag's page adds its tag, and Important
+    /// makes them at least High. The Calendar's day isn't applied: dates come from what was written.
+    func filed(in page: SidebarItem?, lists: [TaskList]) -> TaskDraft {
+        var d = self
+        switch page {
+        case .list(let id)?:
+            if Self.list(named: d.listName, in: lists) == nil, let list = lists.first(where: { $0.id == id }) {
+                d.listName = list.name
+            }
+        case .tag(let raw)?:
+            let tag = raw.trimmingCharacters(in: CharacterSet(charactersIn: "#").union(.whitespacesAndNewlines))
+            if !tag.isEmpty, !d.tags.contains(where: { $0.caseInsensitiveCompare(tag) == .orderedSame }) {
+                d.tags.append(tag)
+            }
+        case .important?:
+            d.priority = max(d.priority, .high)
+        default:
+            break
+        }
+        return d
+    }
 }
 
 // MARK: - Messages to triage
@@ -114,15 +137,24 @@ struct IncomingMessage: Hashable {
 // MARK: - Errors
 
 enum AIError: LocalizedError {
-    case notConfigured, badKey, rateLimited, network(String), badResponse(String)
+    /// No key yet, or AI is switched off.
+    case notConfigured
+    /// Google refused the key (wrong, revoked or restricted).
+    case badKey
+    /// Too many requests, or Google is overloaded.
+    case rateLimited
+    /// Offline, timed out, no route to Google. The text says which, in a sentence.
+    case network(String)
+    /// Google answered, but not with something usable. The text is a full sentence for the user.
+    case badResponse(String)
 
     var errorDescription: String? {
         switch self {
         case .notConfigured: "Add a Google Gemini API key in Settings → AI to use this."
         case .badKey: "Google Gemini didn't accept the API key. Check it in Settings → AI."
         case .rateLimited: "Gemini is busy or the key has hit its limit. Try again in a minute."
-        case .network(let detail): "Couldn't reach Gemini. \(detail)"
-        case .badResponse(let detail): "Gemini sent back something unexpected. \(detail)"
+        case .network(let detail): detail.isEmpty ? "Couldn't reach Gemini." : "Couldn't reach Gemini. \(detail)"
+        case .badResponse(let detail): detail.isEmpty ? "Gemini sent back something unexpected. Try again." : detail
         }
     }
 
@@ -131,10 +163,13 @@ enum AIError: LocalizedError {
     var needsSettings: Bool {
         switch self {
         case .notConfigured, .badKey: true
-        case .badResponse(let detail): detail.contains("Settings")
+        case .badResponse(let detail): detail.contains(Self.settingsHint)
         case .rateLimited, .network: false
         }
     }
+
+    /// Ends the messages whose fix is in Settings (an unknown model name).
+    static let settingsHint = "Check the model in Settings → AI."
 }
 
 // MARK: - Settings
@@ -172,7 +207,7 @@ final class AIService: ObservableObject {
     private let enabled: @MainActor () -> Bool
 
     /// Tests pass a fake transport and their own key, so nothing touches the network or the keychain.
-    init(transport: @escaping GeminiClient.Transport = GeminiClient.liveTransport,
+    init(transport: @escaping GeminiClient.Transport = GeminiClient.defaultTransport,
          apiKey: @escaping () -> String? = { Secrets.geminiAPIKey },
          model: @escaping () -> String = { Secrets.geminiModel },
          enabled: @escaping @MainActor () -> Bool = { Prefs.aiEnabled && !DebugSnapshot.isActive }) {
@@ -240,7 +275,7 @@ final class AIService: ObservableObject {
                                                prompt: AIPrompts.orderDayInput(considered, calendar: calendar),
                                                schema: AIPrompts.orderSchema)
         let picks = try AIAnswers.order(answer, count: considered.count)
-        guard !picks.isEmpty else { throw AIError.badResponse("It didn't suggest an order. Try again.") }
+        guard !picks.isEmpty else { throw AIError.badResponse("Gemini didn't suggest an order. Try again.") }
         var result = picks.map { (id: considered[$0.index].id, reason: $0.reason) }
         let placed = Set(result.map(\.id))
         result += tasks.filter { !placed.contains($0.id) }.map { (id: $0.id, reason: "") }
@@ -277,7 +312,7 @@ final class AIService: ObservableObject {
         let started = Date()
         let answer = try await client.generate(system: AIPrompts.pingSystem, prompt: AIPrompts.pingInput, schema: AIPrompts.pingSchema)
         guard try AIAnswers.object(answer)["ok"] as? Bool == true else {
-            throw AIError.badResponse("Its test answer wasn't what Docket expected.")
+            throw AIError.badResponse("Gemini answered, but not the way Docket expected. Try again.")
         }
         let seconds = String(format: "%.1f", Date().timeIntervalSince(started))
         return "Connected. \(client.modelID) answered in \(seconds) s."
@@ -291,14 +326,14 @@ final class AIService: ObservableObject {
 enum AIAnswers {
     static func object(_ data: Data) throws -> [String: Any] {
         guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-            throw AIError.badResponse("Its answer wasn't in the expected format. Try again.")
+            throw AIError.badResponse(GeminiClient.unexpectedFormat)
         }
         return object
     }
 
     private static func items(_ data: Data, key: String) throws -> [[String: Any]] {
         guard let list = try object(data)[key] as? [Any] else {
-            throw AIError.badResponse("Its answer wasn't in the expected format. Try again.")
+            throw AIError.badResponse(GeminiClient.unexpectedFormat)
         }
         return list.compactMap { $0 as? [String: Any] }
     }
@@ -478,14 +513,18 @@ private extension Dictionary where Key == String, Value == Any {
 // MARK: - Adding planned tasks
 
 extension Store {
-    /// Adds the tasks the planner made as one undo step ("Add Tasks").
+    /// Adds the tasks the planner made as one undo step ("Add Tasks"): one ⌘Z takes them all back.
+    /// A group around each task's own step (rather than one snapshot with undo switched off), so
+    /// whatever joins the step as the tasks appear is undone with them too: the Slack or Gmail card
+    /// a task made through Edit… retires comes back on ⌘Z.
     @discardableResult
     func addPlannedTasks(_ items: [TaskItem]) -> [TaskItem] {
         guard !items.isEmpty else { return [] }
-        undoManager?.beginUndoGrouping()
+        let manager = undoManager
+        manager?.beginUndoGrouping()
         let added = items.map { addTask($0) }
-        undoManager?.setActionName(added.count == 1 ? "New Task" : "Add Tasks")
-        undoManager?.endUndoGrouping()
+        manager?.setActionName(items.count == 1 ? "New Task" : "Add Tasks")
+        manager?.endUndoGrouping()
         return added
     }
 }

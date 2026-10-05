@@ -210,6 +210,8 @@ final class Store: ObservableObject {
         copy.reminders = copy.reminders.filter { !$0.isSnooze }.map { var r = $0; r.id = UUID(); return r }
         copy.linkedNoteID = nil
         copy.noteLine = nil
+        // A copy hasn't been pushed back yet, so it doesn't inherit the original's slipping.
+        copy.postponeCount = 0
         return addTask(copy)
     }
 

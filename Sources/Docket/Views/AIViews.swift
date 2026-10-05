@@ -25,15 +25,24 @@ struct AIPlanSheet: View {
     @State private var items: [PlanItem]
     @State private var problem: PlanProblem?
     @State private var work: Task<Void, Never>?
-    /// The view the planner was opened from: planning inside a list puts tasks in that list.
+    /// The page the planner was opened from: like quick add, planning on a list's page files the tasks
+    /// there, a tag's page tags them, and Important makes them High (see `TaskDraft.filed(in:lists:)`).
     @State private var openedFrom: SidebarItem?
+    /// Set once the tasks are added, so a second click while the sheet closes can't add them twice.
+    @State private var didAdd = false
     @FocusState private var editorFocused: Bool
 
     init(request: AIPlannerRequest) {
         self.request = request
         _step = State(initialValue: request.drafts.isEmpty ? .prompt : .review)
         _text = State(initialValue: request.text)
-        _items = State(initialValue: request.drafts.map { PlanItem(draft: $0) })
+        // Each card needs its own id, even if the same draft was handed in twice.
+        var seen = Set<UUID>()
+        _items = State(initialValue: request.drafts.map { draft in
+            var d = draft
+            if !seen.insert(d.id).inserted { d.id = UUID() }
+            return PlanItem(draft: d)
+        })
     }
 
     private var isNote: Bool { request.noteID != nil }
@@ -185,6 +194,7 @@ struct AIPlanSheet: View {
 
     private var reviewStep: some View {
         let count = includedCount
+        let allChecked = items.allSatisfy(\.included)
         return VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top, spacing: Space.md) {
                 SheetHeader(title: items.count == 1 ? "Review the task" : "Review \(items.count) tasks",
@@ -193,12 +203,11 @@ struct AIPlanSheet: View {
                                 : "Uncheck any you don't want. Click a title or a chip to change it.")
                 Spacer(minLength: Space.md)
                 if items.count > 1 {
-                    Button(count == items.count ? "Select none" : "Select all") {
-                        let all = count != items.count
-                        withAnimation(Motion.snappy) { for i in items.indices { items[i].included = all } }
+                    Button(allChecked ? "Select none" : "Select all") {
+                        withAnimation(Motion.snappy) { for i in items.indices { items[i].included = !allChecked } }
                     }
                     .buttonStyle(SecondaryPill(height: 30))
-                    .help(count == items.count ? "Uncheck every task" : "Check every task")
+                    .help(allChecked ? "Uncheck every task" : "Check every task")
                 }
             }
             .padding(.horizontal, Space.xxl)
@@ -225,7 +234,7 @@ struct AIPlanSheet: View {
                 Button("Add \(Fmt.plural(count, "task"))", action: add)
                     .buttonStyle(PrimaryPill())
                     .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(count == 0)
+                    .disabled(count == 0 || didAdd)
                     .help("Add the checked tasks (⌘↩)")
             }
         }
@@ -254,7 +263,7 @@ struct AIPlanSheet: View {
                         problem = .nothingFound
                         step = .prompt
                     } else {
-                        items = drafts.map { PlanItem(draft: inViewList($0)) }
+                        items = drafts.map { PlanItem(draft: $0.filed(in: openedFrom, lists: store.lists)) }
                         step = .review
                     }
                 }
@@ -286,7 +295,8 @@ struct AIPlanSheet: View {
 
     private func add() {
         let chosen = items.filter { $0.included && !$0.draft.title.trimmingCharacters(in: .whitespaces).isEmpty }
-        guard !chosen.isEmpty else { return }
+        guard !didAdd, !chosen.isEmpty else { return }
+        didAdd = true
         // Tasks found in a note link back to it (no checklist line of their own, so no two-way sync).
         let noteID = request.noteID.flatMap { store.note($0) == nil ? nil : $0 }
         let tasks = chosen.map { item -> TaskItem in
@@ -299,16 +309,17 @@ struct AIPlanSheet: View {
         dismiss()
         app.showToast("Added \(Fmt.plural(added.count, "task"))")
         // From a suggestion, stay in the list being worked through; otherwise show where they went.
-        if !startedFromDrafts, let first = added.first { app.reveal(task: first.id, in: store) }
+        if !startedFromDrafts, let first = added.first { show(first.id) }
     }
 
-    /// Like quick add: planning inside a list puts tasks that have no (known) list of their own there.
-    private func inViewList(_ draft: TaskDraft) -> TaskDraft {
-        guard case .list(let id)? = openedFrom, let list = store.list(id),
-              TaskDraft.list(named: draft.listName, in: store.lists) == nil else { return draft }
-        var d = draft
-        d.listName = list.name
-        return d
+    /// Selects the first new task: right here when this list page shows it, otherwise where it lives
+    /// (the Calendar scrolls to its day).
+    private func show(_ id: UUID) {
+        let here = app.selection.isTaskView && app.selection != .calendar && app.selection != .search
+            && app.visibleTaskOrder(in: store).contains(id)
+        guard here else { return app.reveal(task: id, in: store) }
+        app.selectedTaskIDs = []
+        withAnimation(Motion.sheet) { app.selectedTaskID = id }
     }
 }
 
@@ -352,6 +363,7 @@ private struct DraftCard: View {
                     .tracking(-0.2)
                     .foregroundStyle(Color.ink)
                     .lineLimit(1...3)
+                    .help("The task's title. Click to change it")
                 FlowLayout(spacing: 6, lineSpacing: 6) {
                     dateChip
                     estimateChip
@@ -408,11 +420,19 @@ private struct DraftCard: View {
     }
 
     private var estimateChip: some View {
-        Menu {
-            Button("No estimate") { item.draft.estimateMinutes = nil }
+        let current = draft.estimateMinutes
+        var choices = [5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 360, 480]
+        // An estimate the model gave that isn't one of the usual steps still shows, checked.
+        if let current, !choices.contains(current) { choices = (choices + [current]).sorted() }
+        return Menu {
+            Button { item.draft.estimateMinutes = nil } label: {
+                if current == nil { Label("No estimate", systemImage: "checkmark") } else { Text("No estimate") }
+            }
             Divider()
-            ForEach([5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 360, 480], id: \.self) { m in
-                Button(Fmt.duration(minutes: m)) { item.draft.estimateMinutes = m }
+            ForEach(choices, id: \.self) { m in
+                Button { item.draft.estimateMinutes = m } label: {
+                    if m == current { Label(Fmt.duration(minutes: m), systemImage: "checkmark") } else { Text(Fmt.duration(minutes: m)) }
+                }
             }
         } label: {
             ChipLabel(icon: "hourglass", text: draft.estimateMinutes.map { Fmt.duration(minutes: $0) } ?? "Estimate",
@@ -452,7 +472,8 @@ private struct DraftCard: View {
         } label: {
             ChipLabel(icon: list?.icon ?? "tray", text: list?.name ?? "Inbox")
         }
-        .menuChrome(Capsule())
+        // A long list name shortens with "…" rather than pushing past the card.
+        .menuChrome(Capsule(), truncates: true)
         .help("List")
     }
 
@@ -493,6 +514,7 @@ private struct DraftCard: View {
                                 .textFieldStyle(.plain)
                                 .font(.system(size: 13.5, weight: .medium))
                                 .foregroundStyle(Color.ink)
+                                .help("A step on the task's checklist. Click to change it")
                             Button {
                                 withAnimation(Motion.base) {
                                     if item.draft.subtasks.indices.contains(i) { item.draft.subtasks.remove(at: i) }
@@ -500,6 +522,7 @@ private struct DraftCard: View {
                             } label: { Image(systemName: "minus") }
                                 .buttonStyle(IconButtonStyle(size: 22))
                                 .help("Remove this step")
+                                .accessibilityLabel("Remove this step")
                         }
                         .frame(minHeight: 28)
                     }
@@ -511,6 +534,7 @@ private struct DraftCard: View {
                         TextField("Add a step", text: $newStep)
                             .textFieldStyle(.plain)
                             .font(.system(size: 13.5, weight: .medium))
+                            .help("Type a step and press Return")
                             .onSubmit {
                                 let title = newStep.trimmingCharacters(in: .whitespaces)
                                 guard !title.isEmpty else { return }
@@ -562,6 +586,8 @@ private struct IncludeBox: View {
         .buttonStyle(PressScale(scale: 0.9))
         .onHover { h in withAnimation(Motion.fast) { hovering = h } }
         .help(on ? "Don't add this task" : "Add this task")
+        .accessibilityLabel("Add this task")
+        .accessibilityValue(on ? "Checked" : "Unchecked")
     }
 }
 
@@ -604,6 +630,7 @@ private struct RemovableChip: View {
             }
             .buttonStyle(.plain)
             .help(help)
+            .accessibilityLabel(help)
         }
         .font(.system(size: 12.5, weight: .semibold))
         .foregroundStyle(Color.ink)
@@ -698,25 +725,33 @@ private struct AINotice: View {
 }
 
 /// Three dots breathing in turn while Gemini thinks. Still (and half-lit) with Reduce Motion.
+/// Driven by the clock rather than a repeating animation, so it can never sway the layout around it.
 private struct ThinkingDots: View {
     var size: CGFloat = 8
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var lit = false
 
     var body: some View {
-        HStack(spacing: size * 0.75) {
-            ForEach(0..<3, id: \.self) { i in
-                Circle()
-                    .fill(Color.ink)
-                    .frame(width: size, height: size)
-                    .opacity(reduceMotion ? 0.5 : (lit ? 0.85 : 0.2))
-                    .animation(reduceMotion ? nil : .easeInOut(duration: 0.6).repeatForever(autoreverses: true).delay(Double(i) * 0.2),
-                               value: lit)
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion)) { context in
+            let time = context.date.timeIntervalSinceReferenceDate
+            HStack(spacing: size * 0.75) {
+                ForEach(0..<3, id: \.self) { i in
+                    Circle()
+                        .fill(Color.ink)
+                        .frame(width: size, height: size)
+                        .opacity(reduceMotion ? 0.5 : Self.brightness(at: time, dot: i))
+                }
             }
         }
-        .onAppear { lit = true }
         .accessibilityElement()
         .accessibilityLabel("Thinking")
+    }
+
+    /// 0.2…0.85 on a 1.2 s breath, each dot 0.2 s behind the one before it.
+    static func brightness(at time: TimeInterval, dot: Int) -> Double {
+        let period = 1.2
+        var phase = (time - Double(dot) * 0.2).truncatingRemainder(dividingBy: period) / period
+        if phase < 0 { phase += 1 }
+        return 0.2 + 0.65 * (0.5 - 0.5 * cos(phase * 2 * .pi))
     }
 }
 
@@ -810,6 +845,8 @@ struct AIBreakdownRow: View {
                 .transition(.opacity)
             }
             .animation(Motion.base, value: phase)
+            // A proposal belongs to one task: never offer it on another one shown in the same place.
+            .onChange(of: taskID) { _ in stop() }
             .onDisappear { work?.cancel() }
         }
     }
@@ -843,6 +880,7 @@ struct AIBreakdownRow: View {
             Button(action: stop) { Image(systemName: "xmark") }
                 .buttonStyle(IconButtonStyle(size: 24))
                 .help("Stop")
+                .accessibilityLabel("Stop")
         }
         .padding(.horizontal, Space.md)
         .frame(height: 44)
@@ -877,6 +915,7 @@ struct AIBreakdownRow: View {
                         } label: { Image(systemName: "minus") }
                             .buttonStyle(IconButtonStyle(size: 22))
                             .help("Leave this step out")
+                            .accessibilityLabel("Leave this step out")
                     }
                     .frame(minHeight: 26)
                 }
@@ -903,7 +942,7 @@ struct AIBreakdownRow: View {
     private func singleStep(estimate: Int?) -> some View {
         HStack(spacing: Space.md) {
             sparkle
-            Text("This already reads as a single step.")
+            Text("Already a single step.")
                 .font(.system(size: 13.5, weight: .medium))
                 .foregroundStyle(Color.ink2)
                 .fixedSize(horizontal: false, vertical: true)
@@ -916,6 +955,7 @@ struct AIBreakdownRow: View {
             Button { phase = .idle } label: { Image(systemName: "xmark") }
                 .buttonStyle(IconButtonStyle(size: 24))
                 .help("Dismiss")
+                .accessibilityLabel("Dismiss")
         }
         .padding(.horizontal, Space.md)
         .padding(.vertical, 8)
@@ -946,6 +986,7 @@ struct AIBreakdownRow: View {
                 Button { phase = .idle } label: { Image(systemName: "xmark") }
                     .buttonStyle(IconButtonStyle(size: 24))
                     .help("Dismiss")
+                    .accessibilityLabel("Dismiss")
             }
             .padding(.leading, 18 + Space.md)
         }
@@ -986,20 +1027,36 @@ struct AIBreakdownRow: View {
         phase = .idle
     }
 
-    /// Appends the steps and fills in the estimate if the task has none: one undo step.
+    /// Appends the steps (skipping any the checklist already has, say typed while Gemini was thinking)
+    /// and fills in the estimate if the task has none: one undo step.
     private func add(_ steps: [String], estimate: Int?) {
+        // Only from a proposal on screen: a second click as it closes adds nothing more.
+        guard phase != .idle, phase != .thinking else { return }
+        guard let task = store.task(taskID) else { return stop() }
+        let fold = { (s: String) in s.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil) }
+        var seen = Set(task.subtasks.map { fold($0.title) })
+        let fresh = steps.filter { seen.insert(fold($0)).inserted }
+        let setsEstimate = task.estimateMinutes == nil ? estimate : nil
         withAnimation(Motion.base) {
-            store.mutateTask(taskID, undo: steps.isEmpty ? "Set Estimate" : "Add Steps") { t in
-                t.subtasks += steps.map { Subtask(title: $0) }
-                if t.estimateMinutes == nil, let estimate { t.estimateMinutes = estimate }
-            }
             phase = .idle
+            guard !fresh.isEmpty || setsEstimate != nil else { return }
+            store.mutateTask(taskID, undo: fresh.isEmpty ? "Set Estimate" : "Add Steps") { t in
+                t.subtasks += fresh.map { Subtask(title: $0) }
+                if t.estimateMinutes == nil, let setsEstimate { t.estimateMinutes = setsEstimate }
+            }
         }
-        Haptics.success()
-        if steps.isEmpty {
-            app.showToast("Estimate set to \(Fmt.duration(minutes: estimate ?? 0))")
-        } else {
-            app.showToast("Added \(Fmt.plural(steps.count, "step"))")
+        switch (fresh.count, setsEstimate) {
+        case (0, nil):
+            app.showToast("The checklist already has those steps")
+        case (0, let minutes?):
+            Haptics.success()
+            app.showToast("Estimate set to \(Fmt.duration(minutes: minutes))")
+        case (let n, let minutes?):
+            Haptics.success()
+            app.showToast("Added \(Fmt.plural(n, "step")) · estimate \(Fmt.duration(minutes: minutes))")
+        case (let n, nil):
+            Haptics.success()
+            app.showToast("Added \(Fmt.plural(n, "step"))")
         }
     }
 }
@@ -1016,7 +1073,7 @@ struct OrderMyDayButton: View {
 
     var body: some View {
         if aiEnabled {
-            let count = AIActions.dayToOrder(in: store, now: app.clock).count
+            let count = AIActions.untimedToday(in: store, now: app.clock).count
             Button { open = true } label: { Image(systemName: "sparkles") }
                 .buttonStyle(IconButtonStyle(filled: true))
                 .disabled(count < 2)
@@ -1052,10 +1109,12 @@ private struct OrderDayPopover: View {
 
     @State private var phase: Phase = .thinking
     @State private var attempt = 0
+    /// Set once the order is applied, so a second click as the popover closes records nothing more.
+    @State private var applied = false
 
     var body: some View {
         let today = Calendar.current.startOfDay(for: app.clock)
-        let count = AIActions.dayToOrder(in: store, now: app.clock).count
+        let count = AIActions.untimedToday(in: store, now: app.clock).count
         VStack(alignment: .leading, spacing: Space.md) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Order my day")
@@ -1118,7 +1177,7 @@ private struct OrderDayPopover: View {
     }
 
     private var canApply: Bool {
-        if case .ready(let picks, let unchanged) = phase { return !unchanged && picks.count > 1 }
+        if !applied, case .ready(let picks, let unchanged) = phase { return !unchanged && picks.count > 1 }
         return false
     }
 
@@ -1183,6 +1242,8 @@ private struct OrderDayPopover: View {
     /// Ranks today's untimed tasks 1…n in the suggested order (anything added since keeps its place
     /// after them). Ranks only: no date changes.
     private func apply(_ picks: [Pick]) {
+        guard !applied else { return }
+        applied = true
         let current = AIActions.dayToOrder(in: store, now: app.clock).map(\.id)
         let stillToday = Set(current)
         var ids = picks.map(\.id).filter { stillToday.contains($0) }
@@ -1227,6 +1288,8 @@ struct AISettingsPage: View {
                               ai.settingsChanged()
                           }),
                           divider: false)
+                    .help(aiEnabled ? "Turn off every AI feature. Nothing is sent to Gemini while it's off"
+                                    : "Turn on the AI features")
             }
 
             SettingsSection(title: "API key", footer: keyFooter(source)) {
@@ -1379,7 +1442,9 @@ struct AISettingsPage: View {
                 // Left the page.
             } catch {
                 guard !Task.isCancelled else { return }
-                withAnimation(Motion.base) { test = .failed(error.localizedDescription) }
+                // The messages point to "Settings → AI", which is this page.
+                let message = error.localizedDescription.replacingOccurrences(of: " in Settings → AI", with: " above")
+                withAnimation(Motion.base) { test = .failed(message) }
             }
         }
     }
@@ -1389,27 +1454,35 @@ struct AISettingsPage: View {
 
 enum AIActions {
     /// Opens the planner with the note's text; the tasks it creates link back to the note.
+    /// The text is what will be sent, so it's what the user reviews: photos and videos appear as
+    /// "Photo: Whiteboard" (no file paths), and a very long note shows where it was cut.
     @MainActor
     static func findTasks(inNote noteID: UUID, app: AppState, store: Store) {
         guard let note = store.note(noteID) else { return }
-        guard !note.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        let text = AIPrompts.noteInput(note)
+        guard !text.isEmpty else {
             app.showToast("This note is empty")
             return
         }
-        app.aiPlanner = AIPlannerRequest(text: note.body, noteID: noteID)
+        app.aiPlanner = AIPlannerRequest(text: text, noteID: noteID)
     }
 
     /// Today's open tasks without a set time, in their current order: what "Order my day" rearranges.
     /// Overdue and timed tasks keep their own places (as in `Store.dayList`).
     @MainActor
     static func dayToOrder(in store: Store, now: Date) -> [TaskItem] {
+        store.dayOrdered(untimedToday(in: store, now: now))
+    }
+
+    /// The same tasks in no particular order: enough to count them.
+    @MainActor
+    static func untimedToday(in store: Store, now: Date) -> [TaskItem] {
         let cal = store.calendar
         let today = cal.startOfDay(for: now)
-        let tasks = store.tasks.filter { t in
+        return store.tasks.filter { t in
             guard !t.isCompleted, !store.isOverdueByDay(t, today: today), store.calendarDay(of: t, today: today) == today else { return false }
             if t.dueHasTime, let due = t.dueDate, cal.isDate(due, inSameDayAs: today) { return false }
             return true
         }
-        return store.dayOrdered(tasks)
     }
 }

@@ -67,12 +67,13 @@ struct BulkEditPanel: View {
 
     // MARK: When (the one Panel)
 
-    /// When the selected tasks are and how long they take. Click it to move them all to a date.
+    /// When the selected tasks are (the days the Calendar lists them on) and how long they take.
+    /// Click it to move them all to a date.
     private func whenHero(_ tasks: [TaskItem]) -> some View {
         let now = app.clock
-        let cal = Calendar.current
+        let today = store.calendar.startOfDay(for: now)
         let open = tasks.filter { !$0.isCompleted }
-        let days = open.compactMap { t in (t.dueDate ?? t.scheduledDate).map { cal.startOfDay(for: $0) } }
+        let days = open.compactMap { calendarDay(of: $0, today: today) }
         let overdue = open.filter { $0.isOverdue(now: now) }.count
         let minutes = open.reduce(0) { $0 + $1.remainingMinutes }
 
@@ -130,6 +131,13 @@ struct BulkEditPanel: View {
         .help("Move them all to a date")
     }
 
+    /// The day an open task sits on in the Calendar: an overdue deadline's own day, otherwise the day it's
+    /// listed on (a missed plan date rolls forward to today). Nil when it has no date at all.
+    private func calendarDay(of t: TaskItem, today: Date) -> Date? {
+        if store.isOverdueByDay(t, today: today) { return t.dueDate.map { store.calendar.startOfDay(for: $0) } }
+        return store.calendarDay(of: t, today: today)
+    }
+
     /// "3 open · 1 done · 2 without a date".
     private func statusLine(_ tasks: [TaskItem], open: Int, undated: Int) -> String {
         var parts: [String] = []
@@ -142,13 +150,15 @@ struct BulkEditPanel: View {
     // MARK: Done (the one primary button)
 
     private func doneRow(_ tasks: [TaskItem], _ ids: [UUID]) -> some View {
-        let anyOpen = tasks.contains { !$0.isCompleted }
+        // Ticks off the open ones; when they're all done it reopens them all.
+        let open = tasks.filter { !$0.isCompleted }.count
+        let anyOpen = open > 0
         return HStack(spacing: Space.sm) {
             Button {
                 app.toggleDone(ids, in: store)
                 app.deselectAll()
             } label: {
-                Label(anyOpen ? "Mark \(tasks.count) as done" : "Mark \(tasks.count) as not done",
+                Label(anyOpen ? "Mark \(open) as done" : "Mark \(tasks.count) as not done",
                       systemImage: anyOpen ? "checkmark" : "arrow.uturn.backward")
             }
             .buttonStyle(PrimaryPill())
@@ -160,14 +170,11 @@ struct BulkEditPanel: View {
 
     // MARK: Move to
 
+    /// Moves and clearing apply to the open tasks; finished ones keep their dates.
     private func moveSection(_ tasks: [TaskItem], _ ids: [UUID]) -> some View {
         let now = app.clock
-        let cal = Calendar.current
         let open = tasks.filter { !$0.isCompleted }
-        let days = Set(open.map { t in (t.dueDate ?? t.scheduledDate).map { cal.startOfDay(for: $0) } })
-        // All on the same day: that day's button shows as the current one.
-        let current: Date? = days.count == 1 ? days.first.flatMap { $0 } : nil
-        let hasDates = tasks.contains { $0.dueDate != nil || $0.scheduledDate != nil }
+        let hasDates = open.contains { $0.dueDate != nil || $0.scheduledDate != nil }
 
         return VStack(alignment: .leading, spacing: Space.sm) {
             Eyebrow(text: "Move to")
@@ -175,7 +182,9 @@ struct BulkEditPanel: View {
             LazyVGrid(columns: [GridItem(.flexible(), spacing: Space.sm), GridItem(.flexible(), spacing: Space.sm)], spacing: Space.sm) {
                 ForEach(QuickDay.allCases, id: \.self) { quick in
                     let day = quick.date(now: now)
-                    MoveTile(title: quick.label, detail: Fmt.absoluteDay(day, now: now), key: quick.key, selected: current == day) {
+                    // Lit when they're all on that day already, so pressing it would change nothing.
+                    let current = !open.isEmpty && open.allSatisfy { store.isPlaced($0, on: day) }
+                    MoveTile(title: quick.label, detail: Fmt.absoluteDay(day, now: now), key: quick.key, selected: current) {
                         app.move(ids, toDay: quick.date(), in: store)
                     }
                     .help("Move them all to \(Fmt.absoluteDay(day, now: now)) (\(quick.key) in the list)")
@@ -191,7 +200,7 @@ struct BulkEditPanel: View {
             }
             .buttonStyle(SecondaryPill(height: 32))
             .disabled(!hasDates)
-            .help("Take the plan dates and deadlines off all of them")
+            .help("Take the plan dates and deadlines off them (done tasks keep theirs)")
         }
     }
 
@@ -402,15 +411,23 @@ struct BulkEditPanel: View {
         VStack(alignment: .leading, spacing: Space.sm) {
             Eyebrow(text: "Share")
                 .padding(.leading, 4)
-            HStack(spacing: Space.sm) {
-                Button { app.copyChecklist(ids, in: store) } label: {
-                    Label("Copy as checklist", systemImage: "checklist")
-                }
-                .buttonStyle(SecondaryPill(height: 32))
-                .help("Copy them as a Markdown checklist with dates and estimates")
-                ShareToSlackButton(taskIDs: ids)
+            // Side by side when both fit the panel; with Slack connected they usually don't, so they stack.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: Space.sm) { shareButtons(ids) }
+                VStack(alignment: .leading, spacing: Space.sm) { shareButtons(ids) }
             }
         }
+    }
+
+    @ViewBuilder
+    private func shareButtons(_ ids: [UUID]) -> some View {
+        Button { app.copyChecklist(ids, in: store) } label: {
+            Label("Copy as checklist", systemImage: "checklist")
+        }
+        // The same height as the Slack button beside it.
+        .buttonStyle(SecondaryPill())
+        .help("Copy them as a Markdown checklist with dates and estimates")
+        ShareToSlackButton(taskIDs: ids)
     }
 
     // MARK: Footer

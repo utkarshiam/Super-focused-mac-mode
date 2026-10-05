@@ -127,6 +127,21 @@ enum DayClear {
     static func shouldCelebrate(lastCelebrated dayKey: String?, now: Date) -> Bool {
         dayKey != Fmt.dayKey(now)
     }
+
+    /// The tasks a change from `old` to `new` ticked off just now, wherever it came from (a checkbox, a focus
+    /// session's Done, an alarm or a notification, a box ticked in a note). Tasks that come back already
+    /// done (an import, or an undo long after) don't count, and neither do repeating tasks: they move on
+    /// to their next date instead of being done.
+    static func justFinished(from old: [TaskItem], to new: [TaskItem], now: Date) -> [UUID] {
+        // Ticking a task off changes it in place, so the two lists line up.
+        var ids: [UUID] = []
+        for i in 0..<min(old.count, new.count) {
+            guard old[i].completedAt == nil, let done = new[i].completedAt, old[i].id == new[i].id,
+                  abs(now.timeIntervalSince(done)) < 10 else { continue }
+            ids.append(new[i].id)
+        }
+        return ids
+    }
 }
 
 // MARK: - Overdue rollover

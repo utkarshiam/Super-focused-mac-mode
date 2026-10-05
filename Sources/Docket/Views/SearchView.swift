@@ -4,7 +4,8 @@ import SwiftUI
 // MARK: - Search view
 
 /// Search results across every task and note. Shown while the sidebar search field has text.
-/// Same two panes as a task list: results on the left, the selected task's details on the right.
+/// Same two panes as a task list: results on the left; on the right the selected task's details, or the
+/// bulk edit panel when several tasks are selected.
 struct SearchView: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var app: AppState
@@ -15,27 +16,42 @@ struct SearchView: View {
             SearchResultsPane()
                 .frame(minWidth: 368, maxWidth: .infinity, alignment: .leading)
 
-            if let id = app.selectedTaskID, store.task(id) != nil {
+            // Several tasks selected: edit them together. One task: its details.
+            let bulk = showsBulkPanel
+            let detailID = app.selectedTaskID.flatMap { store.task($0) != nil ? $0 : nil }
+            if bulk || detailID != nil {
                 Rectangle().fill(Color.hair).frame(width: 1).ignoresSafeArea()
-                TaskDetailView(taskID: id)
-                    .frame(width: 370)
-                    .id(id)
-                    .transition(.asymmetric(insertion: .opacity.combined(with: .offset(x: 16)), removal: .opacity))
+                if bulk {
+                    BulkEditPanel()
+                        .frame(width: 370)
+                        .transition(.asymmetric(insertion: .opacity.combined(with: .offset(x: 16)), removal: .opacity))
+                } else if let detailID {
+                    TaskDetailView(taskID: detailID)
+                        .frame(width: 370)
+                        .id(detailID)
+                        .transition(.asymmetric(insertion: .opacity.combined(with: .offset(x: 16)), removal: .opacity))
+                }
             }
         }
         .onAppear(perform: watchEscape)
         .onDisappear(perform: stopWatchingEscape)
     }
 
+    /// At least two of the selected tasks still exist.
+    private var showsBulkPanel: Bool {
+        app.isMultiSelecting && store.tasks.lazy.filter { app.selectedTaskIDs.contains($0.id) }.prefix(2).count == 2
+    }
+
     /// Esc in the results, once there's no selection or open task left for it to close, ends the search.
+    /// (This runs before the app's own Esc handling, which closes the details and drops a multi-selection.)
     private func watchEscape() {
         guard escapeMonitor == nil else { return }
         escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             guard event.keyCode == 53, event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
                   let window = event.window, window === NSApp.docketMainWindow, window.attachedSheet == nil,
                   !(window.firstResponder is NSText), !app.showPalette, app.selection == .search,
-                  app.selectedTaskID == nil, app.selectedTaskIDs.isEmpty else { return event }
-            app.endSearch(in: store)
+                  !app.isMultiSelecting, app.selectedTaskID.flatMap({ store.task($0) }) == nil else { return event }
+            withAnimation(Motion.fast) { app.endSearch(in: store) }
             return nil
         }
     }
@@ -57,9 +73,7 @@ private struct SearchResultsPane: View {
         let results = store.search(app.searchText, keeping: app.recentlyCompleted, now: app.clock)
 
         VStack(alignment: .leading, spacing: 0) {
-            PageHeader(title: "Search", subtitle: subtitle(results)) {
-                SearchCompactToggle()
-            }
+            SearchHeader(subtitle: subtitle(results))
 
             if results.query.isEmpty {
                 SearchHint()
@@ -71,13 +85,17 @@ private struct SearchResultsPane: View {
             }
         }
         .background(Color.paper)
+        // ↑/↓, ⇧-click ranges and ⌘A go through `searchResultIDs` here, so it follows the rows on screen
+        // whenever they change: a new query, an edit, a task ticked off.
+        .onAppear { app.searchResultIDs = results.taskOrder }
+        .onChange(of: results.taskOrder) { app.searchResultIDs = $0 }
     }
 
     private func list(_ results: SearchResults) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
                 EnterUpWindow {
-                    LazyVStack(alignment: .leading, spacing: app.compactRows ? 0 : 2) {
+                    LazyVStack(alignment: .leading, spacing: app.compactRows ? 1 : 2) {
                         Color.clear.frame(height: 0).id(Self.top)
                         if !results.tasks.isEmpty {
                             sectionHeader("Tasks", TaskSection(id: "search", title: "Tasks", tasks: results.tasks).subtitle, first: true)
@@ -112,15 +130,16 @@ private struct SearchResultsPane: View {
         }
     }
 
+    /// Spaced like the task lists' section headers; the first one sits close under the page header.
     private func sectionHeader(_ title: String, _ detail: String, first: Bool) -> some View {
         HStack(alignment: .firstTextBaseline) {
             Eyebrow(text: title)
             Spacer()
-            Text(detail).textStyle(.caption).foregroundStyle(Color.ink3)
+            Text(detail).textStyle(.caption).foregroundStyle(Color.ink3).lineLimit(1)
         }
         .padding(.horizontal, 14)
-        .padding(.top, first ? Space.xs : Space.xl)
-        .padding(.bottom, Space.sm)
+        .padding(.top, first ? Space.xs : (app.compactRows ? Space.md : Space.xl))
+        .padding(.bottom, app.compactRows ? Space.xs : Space.sm)
     }
 
     /// "3 tasks · 1 note for “board”".
@@ -141,18 +160,33 @@ private struct SearchResultsPane: View {
     }
 }
 
-/// Dense one-line rows on or off, as in the task lists.
-private struct SearchCompactToggle: View {
-    @EnvironmentObject var app: AppState
+/// "Search" and what was found, laid out like the other pages' headers. Unlike theirs it never moves the
+/// compact-rows button onto a line of its own when the summary is long: the summary is cut short instead,
+/// so the results don't jump around while you type.
+private struct SearchHeader: View {
+    var subtitle: String?
 
     var body: some View {
-        Button {
-            withAnimation(Motion.snappy) { app.compactRows.toggle() }
-        } label: {
-            Image(systemName: app.compactRows ? "list.dash" : "list.bullet")
+        HStack(alignment: .center, spacing: Space.md) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Search")
+                    .textStyle(.largeTitle)
+                    .foregroundStyle(Color.ink)
+                    .lineLimit(1)
+                // The line stays when there's nothing to say, so the page doesn't shift as results come and go.
+                Text(subtitle ?? " ")
+                    .textStyle(.callout)
+                    .foregroundStyle(Color.ink2)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .accessibilityHidden(subtitle == nil)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            CompactRowsToggle()
         }
-        .buttonStyle(IconButtonStyle(filled: true))
-        .help(app.compactRows ? "Roomy rows (⌥⌘C)" : "Compact rows (⌥⌘C)")
+        .padding(.horizontal, Space.gutter)
+        .padding(.top, Space.lg)
+        .padding(.bottom, Space.lg)
     }
 }
 
@@ -165,7 +199,7 @@ private struct SearchNoteRow: View {
     @State private var hovering = false
 
     var body: some View {
-        let excerpt = query.snippet(in: note.body) ?? note.preview
+        let excerpt = query.excerpt(for: note)
         Button { app.reveal(note: note.id) } label: {
             HStack(alignment: .center, spacing: 14) {
                 Image(systemName: note.dailyKey != nil ? "sun.max" : "doc.text")
@@ -324,6 +358,7 @@ struct SidebarSearchField: View {
                 .transition(.opacity)
             } else if !focused {
                 KeyCap(text: "⌘F")
+                    .onTapGesture { focused = true }
                     .transition(.opacity)
             }
         }
@@ -339,12 +374,21 @@ struct SidebarSearchField: View {
         .help("Search all tasks and notes (⌘F)")
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Search")
-        .onChange(of: app.focusSearch) { _ in focused = true }
+        .onChange(of: app.focusSearch) { _ in
+            // ⌘F again with the cursor already here selects what's typed, ready to type over (focusing does that too).
+            if focused, let editor = NSApp.docketMainWindow?.firstResponder as? NSTextView, editor.isFieldEditor {
+                editor.selectAll(nil)
+            } else {
+                focused = true
+            }
+        }
         .onChange(of: focused) { isFocused in
             if isFocused {
                 watchKeys()
                 // Back in the field with a search still in it: show its results again.
                 if hasQuery(app.searchText) { app.enterSearch() }
+                // Get every task ready to search while the cursor settles in, not on the first letter typed.
+                DispatchQueue.main.async { store.prepareSearch() }
             } else {
                 stopWatchingKeys()
             }
@@ -369,19 +413,22 @@ struct SidebarSearchField: View {
     }
 
     private func escape() {
-        if !app.searchText.isEmpty || app.selection == .search { app.endSearch(in: store) }
+        if !app.searchText.isEmpty || app.selection == .search {
+            withAnimation(Motion.fast) { app.endSearch(in: store) }
+        }
         // Hand the keyboard back to the list, so the arrow keys work there again.
         focused = false
     }
 
-    /// ↓: select the first result (unless one already is) and give the keyboard to the list.
+    /// ↓: select the first result (unless one already is) and give the keyboard to the list, where ↑/↓,
+    /// ⇧↑/⇧↓, Return and t / m / w / x carry on from it.
     private func moveIntoResults() -> Bool {
         guard app.selection == .search else { return false }
         let order = app.searchTaskOrder(in: store)
         guard let first = order.first else { return false }
         focused = false
         if let current = app.selectedTaskID, order.contains(current) { return true }
-        withAnimation(Motion.sheet) { app.selectedTaskID = first }
+        app.selectOnly(first)
         return true
     }
 
@@ -435,37 +482,47 @@ extension AppState {
     func enterSearch() {
         guard selection != .search else { return }
         selectionBeforeSearch = selection
-        SearchMemory.taskBeforeSearch = selectedTaskID
+        SearchMemory.remember(selectedTaskID, for: self)
         selection = .search
     }
 
     /// Clears the search; if the Search view is showing, goes back to the view (and task) open before it.
+    /// A list deleted in the meantime, or a tag no open task has any more, goes back to the Inbox instead.
     func endSearch(in store: Store) {
         searchText = ""
+        searchResultIDs = []
+        let openBefore = SearchMemory.take(for: self)
         guard selection == .search else { return }
         var back = selectionBeforeSearch
         switch back {
-        case .search: back = .calendar
-        case .list(let id) where store.list(id) == nil: back = .inbox
-        default: break
+        case .search:
+            back = .calendar
+        case .list(let id) where store.list(id) == nil:
+            back = .inbox
+        case .tag(let tag) where !store.allTags.contains(where: { $0.caseInsensitiveCompare(tag) == .orderedSame }):
+            back = .inbox
+        default:
+            break
         }
         selection = back
-        if back.isTaskView, let id = SearchMemory.taskBeforeSearch, store.task(id) != nil {
-            selectedTaskID = id
-        }
-        SearchMemory.taskBeforeSearch = nil
+        if back.isTaskView, let id = openBefore, store.task(id) != nil { selectOnly(id) }
     }
 
-    /// Task ids in the order the Search view lists them, for ↑/↓, ⇧-click ranges and ⌘A.
+    /// Task ids in the order the Search view lists them (open, then completed): what `searchResultIDs` holds
+    /// while the Search view shows.
     func searchTaskOrder(in store: Store) -> [UUID] {
         store.search(searchText, keeping: recentlyCompleted, now: clock).taskOrder
     }
 }
 
+/// The task that was open when a search started, so it opens again when the search ends. Kept per
+/// `AppState`, as `AppState` can't hold it itself from here.
 @MainActor
 private enum SearchMemory {
-    /// The task that was open when the search started; it opens again when the search ends.
-    static var taskBeforeSearch: UUID?
+    private static var openTask: [ObjectIdentifier: UUID] = [:]
+
+    static func remember(_ id: UUID?, for app: AppState) { openTask[ObjectIdentifier(app)] = id }
+    static func take(for app: AppState) -> UUID? { openTask.removeValue(forKey: ObjectIdentifier(app)) }
 }
 
 extension NSApplication {

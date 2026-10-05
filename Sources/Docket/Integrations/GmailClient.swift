@@ -5,6 +5,8 @@ import Foundation
 struct GmailRef: Hashable, Sendable {
     var id: String
     var threadID: String
+
+    var externalID: String { GmailMessage.externalID(thread: threadID, message: id) }
 }
 
 /// As much of an email as Docket reads: who, subject, Gmail's snippet, when. Never the body.
@@ -17,9 +19,17 @@ struct GmailMessage: Hashable, Sendable {
     var date: Date
     var labels: Set<String>
 
-    /// One suggestion per conversation: "gmail:<threadId>".
-    var externalID: String { Self.externalID(thread: threadID) }
-    static func externalID(thread: String) -> String { "gmail:\(thread)" }
+    /// "gmail:<threadId>/<messageId>": one message, filed under its conversation.
+    var externalID: String { Self.externalID(thread: threadID, message: id) }
+
+    static func externalID(thread: String, message: String) -> String { "gmail:\(thread)/\(message)" }
+
+    /// The conversation an id from `externalID` belongs to; nil for anything else.
+    static func threadID(fromExternalID id: String) -> String? {
+        guard id.hasPrefix("gmail:"), let slash = id.firstIndex(of: "/") else { return nil }
+        let thread = id[id.index(id.startIndex, offsetBy: "gmail:".count)..<slash]
+        return thread.isEmpty ? nil : String(thread)
+    }
 }
 
 /// A From header: "Sam Lee <sam@example.com>".
@@ -242,7 +252,9 @@ private extension GmailMessage {
             headers[name] = value
         }
         let subject = headers["subject"].map { SlackText.collapsed(MailText.decodeEncodedWords($0)) }
-        let date = r.internalDate.flatMap(Double.init).map { Date(timeIntervalSince1970: $0 / 1000) }
+        // Milliseconds since 1970; anything that isn't a plausible time falls back to the Date header.
+        let date = r.internalDate.flatMap(Double.init).flatMap { $0.isFinite && $0 > 0 && $0 < 1e14 ? $0 : nil }
+            .map { Date(timeIntervalSince1970: $0 / 1000) }
             ?? headers["date"].flatMap(MailText.date(fromHeader:)) ?? Date()
         self.init(id: id, threadID: thread, sender: MailSender(header: headers["from"] ?? ""),
                   subject: subject?.isEmpty == false ? subject : nil,

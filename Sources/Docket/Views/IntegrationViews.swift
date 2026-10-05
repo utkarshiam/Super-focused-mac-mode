@@ -26,8 +26,12 @@ struct SuggestionsView: View {
         .sheet(isPresented: $showConnections) { ConnectionsSheet() }
     }
 
+    /// Each problem once (they're also the ForEach ids).
     private var problems: [String] {
-        [integrations.slackProblem, integrations.gmailProblem].compactMap { $0 }
+        var seen = Set<String>()
+        return [integrations.slackProblem, integrations.slackScopeWarning, integrations.gmailProblem, integrations.aiProblem]
+            .compactMap { $0 }
+            .filter { seen.insert($0).inserted }
     }
 
     private var sources: String? {
@@ -326,9 +330,9 @@ private struct SuggestionCard: View {
                 .help("Change the task before adding it")
             Button("Dismiss", action: dismiss)
                 .buttonStyle(SecondaryPill(height: 32))
-                .help("Don't suggest this message again")
+                .help("Don't suggest this message again (⌘Z brings it back)")
             Spacer(minLength: Space.sm)
-            if suggestion.source.url != nil {
+            if suggestion.source.url?.scheme == "https" {
                 Button(action: open) { Label(SourceStyle.openTitle(suggestion.source.kind), systemImage: "arrow.up.right") }
                     .buttonStyle(SecondaryPill(height: 32))
                     .help("See the original message")
@@ -377,7 +381,8 @@ private struct ConnectionsSheet: View {
             Rectangle().fill(Color.hair).frame(height: 1)
             ConnectionsSettingsPage()
         }
-        .frame(width: 620, height: 620)
+        // The Settings window's size; short enough for the smallest main window (600 pt).
+        .frame(width: 620, height: 540)
         .background(Color.paper)
         .tint(Color.ink)
     }
@@ -415,21 +420,26 @@ private struct SlackConnection: View {
         SettingsSection(title: "Slack", footer: "Docket uses a Slack app of your own, so messages go straight from Slack to this Mac. The token stays in your keychain.") {
             if let account = integrations.slackAccount, integrations.isSlackConnected {
                 if let issue = integrations.slackProblem { IssueRow(text: issue) }
-                SettingsRow(title: "Connected as @\(account.userName)", subtitle: account.teamName) {
+                if let warning = integrations.slackScopeWarning { IssueRow(text: warning) }
+                SettingsRow(title: "Connected as @\(account.userName) in \(account.teamName)",
+                            subtitle: account.teamURL?.host) {
                     Button("Disconnect") { withAnimation(Motion.base) { integrations.disconnectSlack() } }
                         .buttonStyle(SecondaryPill(height: 30))
-                        .help("Forget the Slack token")
+                        .help("Forget the Slack token and the Slack suggestions waiting")
                 }
-                SettingsRow(title: "Save with a reaction", subtitle: "React to any message with this and it shows up in From Slack & Gmail.") {
-                    ChoiceMenu(selection: $saveEmoji, options: SlackSaveEmoji.choices.map { ($0.name, "\($0.glyph)  \(SlackSaveEmoji.title($0.name))") })
+                SettingsRow(title: "Save with a reaction",
+                            subtitle: "React to a message (from the last 30 days) with this and it shows up in From Slack & Gmail.") {
+                    ChoiceMenu(selection: $saveEmoji, options: emojiOptions)
                         .help("The reaction that saves a message to Docket")
                 }
                 ToggleRow(title: "Mentions",
                           subtitle: aiOn ? "Messages that @mention you (last 3 days). AI keeps only the ones that need you."
                               : "Every message that @mentions you (last 3 days). Turn on AI to keep only the ones that need you.",
                           isOn: $mentions)
+                    .help("Suggest tasks from messages that mention you")
                 ToggleRow(title: "Focus status", subtitle: "During a focus session your status says “Heads down” 🎯 and notifications are paused.",
                           isOn: $focusStatus, divider: false)
+                    .help("Set your Slack status and pause notifications while you focus")
             } else {
                 if let issue = integrations.slackProblem { IssueRow(text: issue) }
                 StepRow(number: "1", title: "Create the Docket app in Slack",
@@ -445,6 +455,7 @@ private struct SlackConnection: View {
                     SecureField("xoxp-…", text: $token)
                         .connectionField()
                         .onSubmit(connect)
+                        .help("Paste the User OAuth Token from your Slack app")
                     Button(connecting ? "Connecting…" : "Connect", action: connect)
                         .buttonStyle(PrimaryPill(height: 32))
                         .disabled(token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || connecting)
@@ -467,6 +478,16 @@ private struct SlackConnection: View {
         }
         .onChange(of: saveEmoji) { _ in integrations.refresh() }
         .onChange(of: mentions) { _ in integrations.refresh() }
+    }
+
+    /// The standard choices, plus one set some other way (say, with `defaults write`) so the menu never reads blank.
+    private var emojiOptions: [(String, String)] {
+        var options = SlackSaveEmoji.choices.map { ($0.name, "\($0.glyph)  \(SlackSaveEmoji.title($0.name))") }
+        let current = SlackSaveEmoji.normalized(saveEmoji)
+        if !options.contains(where: { $0.0 == saveEmoji }) {
+            options.append((saveEmoji, ":\(current):"))
+        }
+        return options
     }
 
     private func connect() {
@@ -513,6 +534,7 @@ private struct GmailConnection: View {
                           subtitle: aiOn ? "Unread, important emails from the last 2 days. AI keeps only the ones that need you."
                               : "Unread, important emails from the last 2 days. Turn on AI to keep only the ones that need you.",
                           isOn: $needsReply, divider: false)
+                    .help("Suggest tasks from unread, important email")
             } else if let client, !changingClient {
                 if integrations.isSigningInToGmail {
                     SettingsRow(title: "Waiting for you in the browser…", subtitle: "Sign in with Google and allow Docket to read your email.") {
@@ -576,9 +598,11 @@ private struct GmailConnection: View {
         VStack(spacing: Space.sm) {
             TextField("Client ID", text: $clientID)
                 .connectionField()
+                .help("The client ID of your Desktop app OAuth client")
             SecureField("Client secret", text: $clientSecret)
                 .connectionField()
                 .onSubmit(saveClient)
+                .help("The client secret of the same OAuth client")
             HStack(spacing: Space.sm) {
                 Spacer()
                 if canCancel {
@@ -630,8 +654,9 @@ private struct SuggestionSettings: View {
 
     var body: some View {
         SettingsSection(title: "Suggestions",
-                        footer: aiOn ? "With AI on, the text of new mentions and emails goes to Google Gemini to decide which need a task. Turn AI off in Settings → AI to keep them on this Mac."
+                        footer: aiOn ? "With AI on, new messages Docket finds (a Slack message with its channel and sender; an email's sender, subject and preview) go to Google Gemini to pick out what needs a task and write it. Turn AI off in Settings → AI to keep them on this Mac."
                             : "Everything stays on this Mac.") {
+            if let issue = integrations.aiProblem { IssueRow(text: issue) }
             SettingsRow(title: "Check for new messages", subtitle: checkedSubtitle) {
                 Button(integrations.isRefreshing ? "Checking…" : "Check now") { integrations.refresh() }
                     .buttonStyle(SecondaryPill(height: 30))
@@ -639,7 +664,8 @@ private struct SuggestionSettings: View {
                     .help("Check Slack and Gmail now")
             }
             SettingsRow(title: "Sort with AI",
-                        subtitle: aiOn ? "Gemini picks out what needs you and writes the task." : "Add a Gemini API key in Settings → AI to turn this on.",
+                        subtitle: aiOn ? "Gemini picks out what needs you and writes the task."
+                            : "Turn on AI in Settings → AI (it needs a Gemini API key) to use this.",
                         divider: false) {
                 Badge(text: aiOn ? "On" : "Off", tone: aiOn ? .success : .neutral, icon: aiOn ? "sparkles" : nil)
             }
@@ -763,6 +789,8 @@ struct SourceBadge: View {
         .lineLimit(1)
         .fixedSize()
         .help(source.label.isEmpty ? "From \(name)" : "From \(name): \(source.label)")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("From \(name)")
     }
 }
 
@@ -790,24 +818,40 @@ struct SourceLinkButton: View {
 
 /// Posts the given tasks to a Slack channel. Hidden when Slack isn't connected.
 struct ShareToSlackButton: View {
+    @EnvironmentObject var store: Store
+    @EnvironmentObject var app: AppState
     @ObservedObject private var integrations = Integrations.shared
     let taskIDs: [UUID]
+    /// Matches the pills next to it (the bulk edit panel's are 32 pt).
+    var height: CGFloat = 32
     @State private var showing = false
 
-    init(taskIDs: [UUID]) {
+    init(taskIDs: [UUID], height: CGFloat = 32) {
         self.taskIDs = taskIDs
+        self.height = height
     }
 
     var body: some View {
         if integrations.isSlackConnected {
-            Button { showing = true } label: { Label("Share to Slack…", systemImage: "paperplane") }
-                .buttonStyle(SecondaryPill())
-                .disabled(taskIDs.isEmpty)
-                .help("Post these tasks to a Slack channel, as you")
-                .popover(isPresented: $showing, arrowEdge: .bottom) {
-                    ShareToSlackPopover(taskIDs: taskIDs) { showing = false }
-                }
+            // The full label where there's room; next to "Copy as checklist" in the 370 pt panel, the short one.
+            ViewThatFits(in: .horizontal) {
+                button("Share to Slack…")
+                button("Slack…")
+            }
+            .popover(isPresented: $showing, arrowEdge: .bottom) {
+                // Popovers don't always carry the window's environment objects.
+                ShareToSlackPopover(taskIDs: taskIDs) { showing = false }
+                    .environmentObject(store)
+                    .environmentObject(app)
+            }
         }
+    }
+
+    private func button(_ title: String) -> some View {
+        Button { showing = true } label: { Label(title, systemImage: "paperplane") }
+            .buttonStyle(SecondaryPill(height: height))
+            .disabled(taskIDs.isEmpty)
+            .help("Post these tasks to a Slack channel, as you")
     }
 }
 
@@ -833,9 +877,10 @@ private struct ShareToSlackPopover: View {
                     .font(.system(size: 17, weight: .bold))
                     .tracking(-0.2)
                     .foregroundStyle(Color.ink)
-                Text("Posts \(Fmt.plural(tasks.count, "task")) as you, in the channel you pick.")
+                Text("Posts \(Fmt.plural(tasks.count, "task")) as you, in \(selectedChannel.map { "#\($0.name)" } ?? "the channel you pick").")
                     .textStyle(.footnote)
                     .foregroundStyle(Color.ink2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             HStack(spacing: Space.sm) {
@@ -847,6 +892,7 @@ private struct ShareToSlackPopover: View {
                         .textFieldStyle(.plain)
                         .font(.system(size: 13.5, weight: .medium))
                         .onSubmit { if let first = visible.first, visible.count == 1 { selected = first.id } }
+                        .help("Type part of a channel's name")
                 }
                 .padding(.horizontal, 10)
                 .frame(height: 30)
@@ -885,11 +931,12 @@ private struct ShareToSlackPopover: View {
                     .buttonStyle(SecondaryPill(height: 32))
                     .keyboardShortcut(.cancelAction)
                     .help("Close (Esc)")
-                Button(postTitle) { post(count: tasks.count) }
+                // The channel is named in the line at the top, so the button stays short for any channel name.
+                Button(posting ? "Posting…" : "Post") { post(count: tasks.count) }
                     .buttonStyle(PrimaryPill(height: 32))
                     .keyboardShortcut(.defaultAction)
                     .disabled(selectedChannel == nil || posting || tasks.isEmpty)
-                    .help("Post the message (↩)")
+                    .help(selectedChannel.map { "Post the message in #\($0.name) (↩)" } ?? "Pick a channel first")
             }
         }
         .padding(Space.lg)
@@ -906,11 +953,6 @@ private struct ShareToSlackPopover: View {
 
     private var selectedChannel: SlackChannel? {
         channels.first { $0.id == selected }
-    }
-
-    private var postTitle: String {
-        if posting { return "Posting…" }
-        return selectedChannel.map { "Post to #\($0.name)" } ?? "Post"
     }
 
     @ViewBuilder

@@ -14,7 +14,7 @@ struct GeminiClient {
 
     var apiKey: String
     var model: String
-    var transport: Transport = GeminiClient.liveTransport
+    var transport: Transport = GeminiClient.defaultTransport
 
     /// No cache, cookies or stored credentials: nothing sent or received is written to disk.
     static let session: URLSession = {
@@ -28,6 +28,16 @@ struct GeminiClient {
     }()
 
     static let liveTransport: Transport = { request in try await session.data(for: request) }
+
+    /// What `AIService` uses unless told otherwise: the network, except inside unit tests, where nothing
+    /// may reach Gemini (not even with GEMINI_API_KEY set in the shell). Tests that need answers pass a fake.
+    static let defaultTransport: Transport = isUnitTesting ? offlineTransport : liveTransport
+
+    /// Fails at once, as if offline.
+    static let offlineTransport: Transport = { _ in throw URLError(.notConnectedToInternet) }
+
+    /// XCTest is loaded: the same check the keychain uses to keep tests away from real secrets.
+    static var isUnitTesting: Bool { NSClassFromString("XCTestCase") != nil }
 
     /// The model id as the URL wants it ("models/gemini-3.5-flash" → "gemini-3.5-flash").
     var modelID: String {
@@ -45,7 +55,7 @@ struct GeminiClient {
         let allowed = CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/?#:;"))
         guard let segment = modelID.addingPercentEncoding(withAllowedCharacters: allowed),
               let url = URL(string: Self.baseURL + segment + ":generateContent") else {
-            throw AIError.badResponse("“\(modelID)” isn't a model name Gemini knows. Check the model in Settings → AI.")
+            throw AIError.badResponse("“\(modelID)” isn't a Gemini model name. \(AIError.settingsHint)")
         }
         let body: JSON = [
             "systemInstruction": ["parts": [["text": .string(system)]]],
@@ -85,7 +95,7 @@ struct GeminiClient {
         }
         try Task.checkCancellation()
         guard let http = response as? HTTPURLResponse else {
-            throw AIError.badResponse("There was no answer.")
+            throw AIError.badResponse("Gemini didn't answer. Try again.")
         }
         guard (200..<300).contains(http.statusCode) else {
             throw Self.error(status: http.statusCode, body: data, model: modelID)
@@ -105,7 +115,7 @@ struct GeminiClient {
         case .notConnectedToInternet, .networkConnectionLost, .dataNotAllowed, .internationalRoamingOff:
             return AIError.network("You're offline. Check your connection and try again.")
         case .timedOut:
-            return AIError.network("It took too long to answer. Try again.")
+            return AIError.network("The request timed out. Try again.")
         case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed:
             return AIError.network("Google's servers can't be reached right now.")
         case .secureConnectionFailed, .serverCertificateUntrusted, .serverCertificateHasBadDate,
@@ -125,16 +135,18 @@ struct GeminiClient {
             return .badKey
         case 400:
             if google.isAboutTheKey { return .badKey }
-            return .badResponse(google.message ?? "It couldn't handle the request (HTTP 400).")
+            return .badResponse(google.message.map { "Gemini couldn't handle the request: \($0)" }
+                ?? "Gemini couldn't handle the request (HTTP 400).")
         case 404:
-            return .badResponse("There's no model called “\(model)”. Check the model in Settings → AI.")
+            return .badResponse("There's no Gemini model called “\(model)”. \(AIError.settingsHint)")
         case 429:
             return .rateLimited
         case 500...599:
             // Overloaded or a hiccup on Google's side: the advice is the same, wait and retry.
             return .rateLimited
         default:
-            return .badResponse(google.message ?? "HTTP \(status).")
+            return .badResponse(google.message.map { "Gemini answered with an error: \($0)" }
+                ?? "Gemini answered with an error (HTTP \(status)).")
         }
     }
 
@@ -166,13 +178,13 @@ struct GeminiClient {
     /// The JSON text in `candidates[0].content.parts[*].text` (thought summaries skipped), checked to parse.
     static func answer(from data: Data) throws -> Data {
         guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-            throw AIError.badResponse("Its reply wasn't readable.")
+            throw AIError.badResponse("Gemini's reply wasn't readable. Try again.")
         }
         guard let candidate = (root["candidates"] as? [Any])?.first as? [String: Any] else {
             if let feedback = root["promptFeedback"] as? [String: Any], feedback["blockReason"] != nil {
-                throw AIError.badResponse("It declined to answer this one. Try rewording it.")
+                throw AIError.badResponse(declined)
             }
-            throw AIError.badResponse("The answer was empty.")
+            throw AIError.badResponse(empty)
         }
         let parts = ((candidate["content"] as? [String: Any])?["parts"] as? [Any] ?? []).compactMap { $0 as? [String: Any] }
         let text = parts.filter { ($0["thought"] as? Bool) != true }.compactMap { $0["text"] as? String }.joined()
@@ -180,17 +192,23 @@ struct GeminiClient {
         let json = stripCodeFence(text)
 
         guard !json.isEmpty else {
-            if finish == "MAX_TOKENS" { throw AIError.badResponse("The answer got cut off. Try with less text.") }
-            if refusals.contains(finish) { throw AIError.badResponse("It declined to answer this one. Try rewording it.") }
-            throw AIError.badResponse("The answer was empty.")
+            if finish == "MAX_TOKENS" { throw AIError.badResponse(cutOff) }
+            if refusals.contains(finish) { throw AIError.badResponse(declined) }
+            throw AIError.badResponse(empty)
         }
         let payload = Data(json.utf8)
         guard (try? JSONSerialization.jsonObject(with: payload)) is [String: Any] else {
-            if finish == "MAX_TOKENS" { throw AIError.badResponse("The answer got cut off. Try with less text.") }
-            throw AIError.badResponse("Its answer wasn't in the expected format. Try again.")
+            if finish == "MAX_TOKENS" { throw AIError.badResponse(cutOff) }
+            throw AIError.badResponse(unexpectedFormat)
         }
         return payload
     }
+
+    private static let declined = "Gemini declined to answer this one. Try rewording it."
+    private static let empty = "Gemini's answer was empty. Try again."
+    private static let cutOff = "Gemini's answer got cut off. Try with less text."
+    /// Also used when the JSON parses but isn't the shape that was asked for.
+    static let unexpectedFormat = "Gemini's answer wasn't in the expected format. Try again."
 
     /// JSON mode answers are bare JSON, but tolerate a ```json fence around it.
     private static func stripCodeFence(_ text: String) -> String {

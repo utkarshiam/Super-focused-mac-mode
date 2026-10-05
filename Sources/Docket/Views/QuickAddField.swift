@@ -68,6 +68,11 @@ struct QuickAddField: View {
         .animation(Motion.base, value: trimmed.isEmpty)
         .animation(Motion.base, value: showsOptions)
         .onChange(of: app.focusQuickAdd) { _ in focused = true }
+        // The list pages share this field; picks made for one page's defaults don't carry over to the next.
+        .onChange(of: app.selection) { _ in
+            options.reset()
+            picker = nil
+        }
     }
 
     /// What this page gives a new task: the Calendar's day, a list, a tag, or High on Important.

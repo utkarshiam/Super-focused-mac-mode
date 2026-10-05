@@ -118,7 +118,7 @@ enum IntegrationError: LocalizedError, Equatable {
         case .missingPermission(_, let what):
             "Docket needs permission to \(what). Connect Gmail again and allow it."
         case .rateLimited(let s, let after):
-            "\(s.rawValue) asked Docket to slow down. It will try again in \(Fmt.duration(minutes: max(1, Int((after / 60).rounded(.up)))))."
+            "\(s.rawValue) asked Docket to slow down. It will try again in \(Fmt.duration(minutes: Self.minutes(after)))."
         case .offline(let s, let detail):
             "Couldn't reach \(s.rawValue). \(detail)"
         case .unexpected(let s, let detail):
@@ -134,6 +134,12 @@ enum IntegrationError: LocalizedError, Equatable {
         case .cancelled:
             "Cancelled."
         }
+    }
+
+    /// Whole minutes to wait, at least one (a bad value never traps).
+    private static func minutes(_ seconds: TimeInterval) -> Int {
+        guard seconds.isFinite, seconds > 0 else { return 1 }
+        return max(1, Int((min(seconds, 86_400) / 60).rounded(.up)))
     }
 
     /// Any error as an IntegrationError for `service` (network errors become `.offline`).
@@ -183,7 +189,8 @@ enum IntegrationHTTP {
     }
 
     static let sleep: @Sendable (TimeInterval) async throws -> Void = { seconds in
-        try await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+        let wait = seconds.isFinite ? min(max(0, seconds), 3600) : 0
+        try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
     }
 
     /// Characters that never need escaping (RFC 3986 "unreserved").
@@ -219,11 +226,11 @@ enum IntegrationHTTP {
         }
     }
 
-    /// Seconds from a Retry-After header, when there is one.
+    /// Seconds from a Retry-After header, when there is a sensible one (capped at an hour).
     static func retryAfter(_ response: HTTPURLResponse) -> TimeInterval? {
         guard let raw = response.value(forHTTPHeaderField: "Retry-After")?.trimmingCharacters(in: .whitespaces),
-              let seconds = Double(raw), seconds >= 0 else { return nil }
-        return seconds
+              let seconds = Double(raw), seconds.isFinite, seconds >= 0 else { return nil }
+        return min(seconds, 3600)
     }
 
     /// Runs `work` for every item, at most `limit` at a time; results keep the input order.
@@ -306,16 +313,22 @@ enum SuggestionInbox {
     /// Handled and skipped ids are kept this long: longer than any source looks back (30 days).
     static let memory: TimeInterval = 120 * 86_400
 
-    /// Ids that must not be suggested (again): handled, skipped, already waiting, or already on a task.
-    static func knownIDs(pending: [Suggestion], handled: [String: Date], skipped: [String: Date], taskSourceIDs: Set<String>) -> Set<String> {
-        Set(handled.keys).union(skipped.keys).union(pending.map(\.id)).union(taskSourceIDs)
+    /// Ids that are never suggested (again): added or dismissed, already waiting, or already on a task.
+    static func blockedIDs(pending: [Suggestion], handled: [String: Date], taskSourceIDs: Set<String>) -> Set<String> {
+        Set(handled.keys).union(pending.map(\.id)).union(taskSourceIDs)
     }
 
-    /// Adds what's new to what's waiting, newest first, without duplicates or known ids.
-    static func merge(_ incoming: [Suggestion], into pending: [Suggestion], known: Set<String>) -> [Suggestion] {
+    /// Whether a message found now may become a suggestion. One that AI passed over comes back only when
+    /// the user flags it on purpose afterwards (a reaction, a star).
+    static func isNew(_ id: String, trigger: SuggestionTrigger, blocked: Set<String>, skipped: [String: Date]) -> Bool {
+        !blocked.contains(id) && (trigger.isExplicit || skipped[id] == nil)
+    }
+
+    /// Adds what's new to what's waiting, newest first, without duplicates or blocked ids.
+    static func merge(_ incoming: [Suggestion], into pending: [Suggestion], blocked: Set<String>) -> [Suggestion] {
         var seen = Set(pending.map(\.id))
         var result = pending
-        for s in incoming where !known.contains(s.id) && seen.insert(s.id).inserted {
+        for s in incoming where !blocked.contains(s.id) && seen.insert(s.id).inserted {
             result.append(s)
         }
         return Array(result.sorted { $0.receivedAt > $1.receivedAt }.prefix(limit))
@@ -341,9 +354,12 @@ enum SuggestionDrafts {
         switch s.source.kind {
         case .gmail:
             return emailTitle(from: s.from, subject: s.subject, snippet: s.snippet)
-        case .slack, .ai:
+        case .slack:
             let line = SlackText.firstLine(s.snippet)
             return line.isEmpty ? "Slack: message from \(s.from)" : "Slack: \(line)"
+        case .ai:
+            let line = SlackText.firstLine(s.snippet)
+            return line.isEmpty ? "Follow up with \(s.from)" : line
         }
     }
 
@@ -376,6 +392,11 @@ enum SuggestionDrafts {
         if d.notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { d.notes = context(for: s) }
         return d
     }
+
+    /// The draft a suggestion would be added with: AI's when there is one, else the plain fallback.
+    static func draft(for s: Suggestion) -> TaskDraft {
+        prepared(s.draft ?? fallback(for: s), for: s)
+    }
 }
 
 /// The AI step that decides which mentions and emails need a task. Tests swap in a fake.
@@ -400,12 +421,43 @@ struct SuggestionCandidate {
     var message: IncomingMessage
 }
 
+/// What a refresh already knows when it starts, so the messages it has seen don't come back.
+struct SeenMessages {
+    var blocked: Set<String>
+    var skipped: [String: Date]
+    /// Email conversations with a card waiting: one card per conversation at a time.
+    var waitingThreads: Set<String>
+    /// Email conversations with an open task: unread mail in them isn't suggested again until it's done
+    /// (a newly starred message still is).
+    var openTaskThreads: Set<String>
+
+    init(blocked: Set<String>, skipped: [String: Date], pending: [Suggestion], tasks: [TaskItem]) {
+        self.blocked = blocked
+        self.skipped = skipped
+        waitingThreads = Set(pending.compactMap { GmailMessage.threadID(fromExternalID: $0.id) })
+        openTaskThreads = Set(tasks.lazy.filter { !$0.isCompleted }
+            .compactMap { $0.source?.externalID }.compactMap(GmailMessage.threadID(fromExternalID:)))
+    }
+
+    func isNew(_ id: String, _ trigger: SuggestionTrigger) -> Bool {
+        SuggestionInbox.isNew(id, trigger: trigger, blocked: blocked, skipped: skipped)
+    }
+
+    /// An email worth fetching: new, in a conversation without a card, and (unless flagged on purpose)
+    /// without an open task.
+    func isNewEmail(_ ref: GmailRef, _ trigger: SuggestionTrigger) -> Bool {
+        isNew(ref.externalID, trigger) && !waitingThreads.contains(ref.threadID)
+            && (trigger.isExplicit || !openTaskThreads.contains(ref.threadID))
+    }
+}
+
 // MARK: - Integrations
 
 /// Slack and Gmail: suggestions to turn into tasks, sharing a plan, and the Slack focus status.
 ///
 /// Network calls run in the background and never block the UI; problems become a status line
-/// (`slackProblem`, `gmailProblem`). Tokens live in the keychain only and are never logged.
+/// (`slackProblem`, `gmailProblem`, `aiProblem`). Tokens live in the keychain only and are never logged.
+/// Adding or dismissing a suggestion is part of the window's undo, like any task change.
 @MainActor
 final class Integrations: ObservableObject {
     static let shared = Integrations()
@@ -425,6 +477,14 @@ final class Integrations: ObservableObject {
     /// The last problem with each service, in plain words (nil when all is well).
     @Published private(set) var slackProblem: String?
     @Published private(set) var gmailProblem: String?
+    /// AI couldn't sort the newest messages (they're tried again next time).
+    @Published private(set) var aiProblem: String?
+
+    /// The Docket app in Slack lacks permissions some features need. Stays until Slack is connected again.
+    var slackScopeWarning: String? {
+        guard isSlackConnected, let missing = slackAccount?.missingScopes, !missing.isEmpty else { return nil }
+        return "The Docket app in Slack is missing \(missing.joined(separator: ", ")). Create it again from step 1 in Settings → Connections and paste the new token."
+    }
     /// Waiting for the user to finish signing in to Google in the browser.
     @Published private(set) var isSigningInToGmail = false
     /// Bumped when the Google OAuth client changes, so Settings re-reads it.
@@ -523,10 +583,10 @@ final class Integrations: ObservableObject {
         isGmailConnected = file.gmailAddress != nil
 
         cancellables = []
-        // A suggestion that became a task some other way (Edit… in the planner, undo/redo) is done.
-        store.objectWillChange
-            .debounce(for: .milliseconds(600), scheduler: RunLoop.main)
-            .sink { [weak self] _ in Task { @MainActor in self?.retireSuggestionsOnTasks() } }
+        // A message that becomes a task (Add task here, Edit… in the planner, redo, an import) is done.
+        // Watched as the change happens, so retiring it joins the undo step that made the task.
+        store.$tasks
+            .sink { [weak self] tasks in self?.retireSuggestions(onTasks: tasks) }
             .store(in: &cancellables)
     }
 
@@ -563,39 +623,60 @@ final class Integrations: ObservableObject {
         refresh()
     }
 
+    /// Waits for a refresh that's running (tests).
+    func waitForRefresh() async {
+        await refreshTask?.value
+    }
+
     /// One full check: collect new messages, let AI pick out the ones that need a task, merge, save.
     func refreshNow(now: Date = Date()) async {
         guard let store else { return }
         isRefreshing = true
         defer { isRefreshing = false }
         let settings = settings()
-        let known = SuggestionInbox.knownIDs(pending: suggestions, handled: handled, skipped: skipped,
-                                             taskSourceIDs: Set(store.tasks.compactMap { $0.source?.externalID }))
+        let seen = SeenMessages(blocked: blockedIDs(store), skipped: skipped, pending: suggestions, tasks: store.tasks)
 
-        async let fromSlack = collectSlack(settings: settings, known: known, now: now)
-        async let fromGmail = collectGmail(settings: settings, known: known, now: now)
-        let found = await fromSlack + fromGmail
+        async let fromSlack = collectSlack(settings: settings, seen: seen, now: now)
+        async let fromGmail = collectGmail(settings: settings, seen: seen, now: now)
+        let (slack, gmail) = await (fromSlack, fromGmail)
 
-        let sorted = await sort(found, store: store, now: now)
+        let sorted = await sort(slack.found + gmail.found, store: store, now: now)
         for id in sorted.skipped { skipped[id] = now }
-        // Recomputed: tasks may have been added while this check was waiting on the network.
-        let knownNow = SuggestionInbox.knownIDs(pending: suggestions, handled: handled, skipped: skipped,
-                                                taskSourceIDs: Set(store.tasks.compactMap { $0.source?.externalID }))
-        suggestions = SuggestionInbox.merge(sorted.accepted, into: suggestions, known: knownNow)
+        // Flagged on purpose after AI passed it over: it isn't "nothing to do" any more.
+        for s in sorted.accepted { skipped[s.id] = nil }
+        // A service disconnected while AI was reading keeps its cards cleared.
+        let accepted = sorted.accepted.filter { s in
+            switch s.source.kind {
+            case .slack: isSlackConnected
+            case .gmail: isGmailConnected
+            case .ai: true
+            }
+        }
+        // Recomputed: tasks may have been added (or cards handled) while this check waited on the network.
+        suggestions = SuggestionInbox.merge(accepted, into: suggestions, blocked: blockedIDs(store))
         handled = SuggestionInbox.pruned(handled, now: now)
         skipped = SuggestionInbox.pruned(skipped, now: now)
-        lastRefresh = now
+        // "Updated 10:42 AM" only when something was actually checked; otherwise coming back retries.
+        if slack.checked || gmail.checked { lastRefresh = now }
         save()
+    }
+
+    private func blockedIDs(_ store: Store) -> Set<String> {
+        SuggestionInbox.blockedIDs(pending: suggestions, handled: handled,
+                                   taskSourceIDs: Set(store.tasks.compactMap { $0.source?.externalID }))
     }
 
     /// Splits new messages into suggestions (with drafts) and ones AI found nothing to do for.
     private func sort(_ found: [SuggestionCandidate], store: Store, now: Date) async -> (accepted: [Suggestion], skipped: [String]) {
-        guard !found.isEmpty else { return ([], []) }
+        guard !found.isEmpty else {
+            aiProblem = nil
+            return ([], [])
+        }
         let newestFirst = found.sorted { $0.suggestion.receivedAt > $1.suggestion.receivedAt }
         let aiAvailable = triage.isAvailable()
         var drafts: [String: TaskDraft] = [:]
         var looked = Set<String>()
-        var aiProblem: String?
+        var failure: String?
         if aiAvailable {
             // Batches of 25: one failed batch doesn't lose what the others found.
             for start in stride(from: 0, to: newestFirst.count, by: 25) {
@@ -605,11 +686,14 @@ final class Integrations: ObservableObject {
                     drafts.merge(result) { first, _ in first }
                     looked.formUnion(batch.map(\.suggestion.id))
                 } catch {
-                    aiProblem = "AI couldn't sort the newest messages, so they'll be checked again later. \(error.localizedDescription)"
+                    if !(error is CancellationError) {
+                        failure = "AI couldn't sort the newest messages, so they'll be checked again later. \(error.localizedDescription)"
+                    }
                     break
                 }
             }
         }
+        aiProblem = failure
 
         var accepted: [Suggestion] = []
         var skipped: [String] = []
@@ -634,10 +718,6 @@ final class Integrations: ObservableObject {
             }
             // Otherwise AI is set up but failed this time: the message is looked at again next refresh.
         }
-        if let aiProblem {
-            if found.contains(where: { $0.suggestion.source.kind == .slack }) { slackProblem = slackProblem ?? aiProblem }
-            if found.contains(where: { $0.suggestion.source.kind == .gmail }) { gmailProblem = gmailProblem ?? aiProblem }
-        }
         return (accepted, skipped)
     }
 
@@ -651,12 +731,15 @@ final class Integrations: ObservableObject {
         SlackClient(token: token, transport: transport, sleep: sleep)
     }
 
-    private func collectSlack(settings: IntegrationSettings, known: Set<String>, now: Date) async -> [SuggestionCandidate] {
-        guard isSlackConnected, let account = slackAccount else { return [] }
-        if let until = slackPausedUntil, until > now { return [] }
+    /// New Slack messages to consider, and whether Slack could be checked at all.
+    private func collectSlack(settings: IntegrationSettings, seen: SeenMessages, now: Date) async -> (found: [SuggestionCandidate], checked: Bool) {
+        guard isSlackConnected, let account = slackAccount else { return ([], false) }
+        if let until = slackPausedUntil, until > now { return ([], false) }
+        // Unreadable isn't gone: the keychain may be locked, or access was refused this time. Only Slack
+        // turning the token down disconnects.
         guard let token = slackToken() else {
-            disconnectSlack(problem: "Slack was disconnected: its token is no longer in the keychain. Paste it again in Settings → Connections.")
-            return []
+            slackProblem = "Docket couldn't read the Slack token from your keychain. If it was removed, disconnect Slack and connect it again in Settings → Connections."
+            return ([], false)
         }
         let client = slackClient(token)
         do {
@@ -668,15 +751,17 @@ final class Integrations: ObservableObject {
                     .map { ($0, SuggestionTrigger.mention) }
             }
             // A saved message that also mentions you counts as saved (it's listed first).
-            var seen = Set<String>()
-            let fresh = found.filter { !known.contains($0.0.externalID) && seen.insert($0.0.externalID).inserted }
+            var ids = Set<String>()
+            let fresh = found.filter { seen.isNew($0.0.externalID, $0.1) && ids.insert($0.0.externalID).inserted }
             await learnNames(for: fresh.map { $0.0 }, client: client)
+            // The check may have outlived the connection (Disconnect while it ran).
+            guard isSlackConnected, slackAccount?.userID == account.userID else { return ([], false) }
             slackProblem = nil
             slackPausedUntil = nil
-            return fresh.map { slackCandidate($0.0, trigger: $0.1, account: account) }
+            return (fresh.map { slackCandidate($0.0, trigger: $0.1, account: account) }, true)
         } catch {
             handleSlack(error, now: now)
-            return []
+            return ([], false)
         }
     }
 
@@ -748,14 +833,16 @@ final class Integrations: ObservableObject {
                 : "That doesn't look like a Slack user token. It starts with xoxp-.")
         }
         guard !DebugSnapshot.isActive else { throw IntegrationError.notConnected(.slack) }
-        let (account, scopes) = try await slackClient(token).identity()
+        var (account, scopes) = try await slackClient(token).identity()
+        // Slack lists the token's permissions with each reply; unknown means fine.
+        let missing = SlackManifest.userScopes.filter { scope in scopes.map { !$0.contains(scope) } ?? false }
+        account.missingScopes = missing.isEmpty ? nil : missing
         Keychain.set(token, for: Keychain.Account.slackUserToken)
         slackAccount = account
         isSlackConnected = true
         slackPausedUntil = nil
-        let missing = SlackManifest.userScopes.filter { scope in scopes.map { !$0.contains(scope) } ?? false }
-        slackProblem = missing.isEmpty ? nil
-            : "Connected, but the Slack app is missing \(missing.joined(separator: ", ")). Create it again from step 1 and paste the new token."
+        slackProblem = nil
+        channelList = nil
         save()
         if refreshAfter { refresh() }
     }
@@ -829,14 +916,16 @@ final class Integrations: ObservableObject {
         return session
     }
 
-    private func collectGmail(settings: IntegrationSettings, known: Set<String>, now: Date) async -> [SuggestionCandidate] {
-        guard isGmailConnected, let address = gmailAddress else { return [] }
-        if let until = gmailPausedUntil, until > now { return [] }
+    /// New emails to consider, and whether Gmail could be checked at all.
+    private func collectGmail(settings: IntegrationSettings, seen: SeenMessages, now: Date) async -> (found: [SuggestionCandidate], checked: Bool) {
+        guard isGmailConnected, let address = gmailAddress else { return ([], false) }
+        if let until = gmailPausedUntil, until > now { return ([], false) }
+        // As for Slack: an unreadable keychain item doesn't disconnect; Google refusing the sign-in does.
         guard let session = googleSession() else {
-            disconnectGmail(problem: googleClient == nil
-                ? "Gmail was disconnected: the Google OAuth client is missing. Add it again in Settings → Connections."
-                : "Gmail was disconnected: its sign-in is no longer in the keychain. Connect it again in Settings → Connections.")
-            return []
+            gmailProblem = googleClient == nil
+                ? "Docket couldn't find your Google OAuth client. Disconnect Gmail in Settings → Connections, add the client again, then connect."
+                : "Docket couldn't read the Gmail sign-in from your keychain. If it was removed, disconnect Gmail and connect it again in Settings → Connections."
+            return ([], false)
         }
         let client = GmailClient(session: session, transport: transport)
         do {
@@ -844,17 +933,20 @@ final class Integrations: ObservableObject {
             if settings.needsReply {
                 refs += try await client.messageRefs(matching: GmailClient.needsReplyQuery, max: 25).map { ($0, SuggestionTrigger.needsReply) }
             }
-            // One suggestion per conversation: the newest message (lists come newest first); a star wins.
+            // One card per conversation: the newest message (lists come newest first), a star first.
             var threads = Set<String>()
-            let fresh = refs.filter { !known.contains(GmailMessage.externalID(thread: $0.0.threadID)) && threads.insert($0.0.threadID).inserted }
+            let fresh = refs.filter { ref, trigger in
+                seen.isNewEmail(ref, trigger) && threads.insert(ref.threadID).inserted
+            }
             let messages = try await client.messages(fresh.map { $0.0 })
+            guard isGmailConnected, gmailAddress == address else { return ([], false) }
             let triggers = Dictionary(fresh.map { ($0.0.id, $0.1) }, uniquingKeysWith: { first, _ in first })
             gmailProblem = nil
             gmailPausedUntil = nil
-            return messages.compactMap { m in triggers[m.id].map { gmailCandidate(m, trigger: $0, address: address) } }
+            return (messages.compactMap { m in triggers[m.id].map { gmailCandidate(m, trigger: $0, address: address) } }, true)
         } catch {
             handleGmail(error, now: now)
-            return []
+            return ([], false)
         }
     }
 
@@ -947,33 +1039,47 @@ final class Integrations: ObservableObject {
     // MARK: Acting on suggestions
 
     /// Adds the suggestion as a task (its draft, linked back to the message) and stops suggesting it.
+    /// One undo step takes the task away and brings the card back.
     @discardableResult
     func add(_ suggestion: Suggestion, toast: Bool = true) -> TaskItem? {
         guard let store else { return nil }
-        let draft = SuggestionDrafts.prepared(suggestion.draft ?? SuggestionDrafts.fallback(for: suggestion), for: suggestion)
-        let task = store.addTask(draft.makeTask(lists: store.lists, source: suggestion.source))
-        markHandled([suggestion.id])
-        if toast { app?.showToast("Added “\(task.title)”") }
+        let undo = store.undoManager
+        undo?.beginUndoGrouping()
+        let task = store.addTask(Self.task(for: suggestion, lists: store.lists))
+        retire([suggestion.id]) // usually done already, as the task appeared
+        undo?.setActionName("Add Task")
+        undo?.endUndoGrouping()
+        if toast { app?.showToast("Added “\(Self.shortTitle(task.title))”") }
         return task
     }
 
+    /// Adds every waiting suggestion as a task, as one undo step.
     func addAll() {
+        guard let store, !suggestions.isEmpty else { return }
         let all = suggestions
-        guard !all.isEmpty else { return }
-        for s in all { add(s, toast: false) }
-        app?.showToast("Added \(Fmt.plural(all.count, "task"))")
+        let undo = store.undoManager
+        undo?.beginUndoGrouping()
+        let added = all.map { store.addTask(Self.task(for: $0, lists: store.lists)) }
+        retire(Set(all.map(\.id)))
+        undo?.setActionName("Add Tasks")
+        undo?.endUndoGrouping()
+        app?.showToast("Added \(Fmt.plural(added.count, "task"))")
     }
 
     /// Opens the draft in "Plan with AI" to adjust before adding. The draft carries its source, so the task
-    /// it becomes links back, and the suggestion is retired once that task exists.
+    /// it becomes links back, and the card goes once that task exists (in the same undo step).
     func edit(_ suggestion: Suggestion) {
         guard let app else { return }
-        let draft = SuggestionDrafts.prepared(suggestion.draft ?? SuggestionDrafts.fallback(for: suggestion), for: suggestion)
-        app.aiPlanner = AIPlannerRequest(drafts: [draft])
+        app.aiPlanner = AIPlannerRequest(drafts: [SuggestionDrafts.draft(for: suggestion)])
     }
 
+    /// Stops suggesting the message. Undoable.
     func dismiss(_ suggestion: Suggestion) {
-        markHandled([suggestion.id])
+        let undo = store?.undoManager
+        undo?.beginUndoGrouping()
+        retire([suggestion.id])
+        undo?.setActionName("Dismiss Suggestion")
+        undo?.endUndoGrouping()
     }
 
     /// Opens the message in Slack or Gmail (https links only).
@@ -982,19 +1088,49 @@ final class Integrations: ObservableObject {
         openURL(url)
     }
 
-    private func markHandled(_ ids: Set<String>, at now: Date = Date()) {
-        guard !ids.isEmpty else { return }
-        for id in ids { handled[id] = now }
-        suggestions.removeAll { ids.contains($0.id) }
-        save()
+    static func task(for suggestion: Suggestion, lists: [TaskList]) -> TaskItem {
+        SuggestionDrafts.draft(for: suggestion).makeTask(lists: lists, source: suggestion.source)
     }
 
-    /// Suggestions whose message is already on a task are done (say, after Edit… in the planner).
-    func retireSuggestionsOnTasks() {
-        guard let store, !suggestions.isEmpty else { return }
-        let onTasks = Set(store.tasks.compactMap { $0.source?.externalID })
-        let done = Set(suggestions.map(\.id)).intersection(onTasks)
-        markHandled(done)
+    /// A title short enough for a toast.
+    static func shortTitle(_ title: String, limit: Int = 48) -> String {
+        guard title.count > limit else { return title }
+        return String(title.prefix(limit - 1)).trimmingCharacters(in: .whitespaces) + "…"
+    }
+
+    /// Takes the cards for these messages off the list and remembers them as handled. The window's undo
+    /// brings them back (redo takes them away again); it joins whatever undo step is being recorded.
+    private func retire(_ ids: Set<String>, at now: Date = Date()) {
+        let retired = suggestions.filter { ids.contains($0.id) }
+        guard !retired.isEmpty else { return }
+        for s in retired { handled[s.id] = now }
+        suggestions.removeAll { ids.contains($0.id) }
+        save()
+        store?.undoManager?.registerUndo(withTarget: self) { $0.bringBack(retired) }
+    }
+
+    private func bringBack(_ items: [Suggestion]) {
+        // Never next to a task that still has the message (undo only runs after the task is gone).
+        let onTasks = Set(store?.tasks.compactMap { $0.source?.externalID } ?? [])
+        let waiting = Set(suggestions.map(\.id))
+        let back = items.filter { !onTasks.contains($0.id) && !waiting.contains($0.id) }
+        for s in back { handled[s.id] = nil }
+        if !back.isEmpty {
+            suggestions = (suggestions + back).sorted { $0.receivedAt > $1.receivedAt }
+            save()
+        }
+        store?.undoManager?.registerUndo(withTarget: self) { $0.retire(Set(items.map(\.id))) }
+    }
+
+    /// Cards whose message is now on a task are done: added here, through Edit… in the planner, or by redo.
+    private func retireSuggestions(onTasks tasks: [TaskItem]) {
+        guard !suggestions.isEmpty else { return }
+        let waiting = Set(suggestions.map(\.id))
+        var done = Set<String>()
+        for t in tasks {
+            if let id = t.source?.externalID, waiting.contains(id) { done.insert(id) }
+        }
+        retire(done)
     }
 
     // MARK: Focus status (Slack)
@@ -1063,15 +1199,16 @@ final class Integrations: ObservableObject {
         let client = slackClient(token)
         let now = Date()
         do {
-            // Only undo what's still ours: the user may have set something else meanwhile.
+            // Only undo what's still ours: if the user set another status meanwhile, they've taken over
+            // (status and notifications both).
             if try await client.status(of: account.userID).isFocus {
                 if let previous = record.previous, !previous.hasExpired(at: now) {
                     try await client.setStatus(previous)
                 } else {
                     try await client.setStatus(SlackStatus())
                 }
+                if let snooze = record.snoozeUntil, snooze > now { try? await client.endSnooze() }
             }
-            if let snooze = record.snoozeUntil, snooze > now { try? await client.endSnooze() }
             focusRecord = nil
             save()
         } catch {

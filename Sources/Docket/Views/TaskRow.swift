@@ -212,7 +212,9 @@ struct TaskRow: View {
         if let window = NSApp?.keyWindow, window.firstResponder is NSText {
             window.makeFirstResponder(nil)
         }
-        app.click(task.id, kind, in: store)
+        // Clicking the open task closes it, but only once the click can't be the start of a double-click
+        // (which keeps it open). Capped so a slow double-click setting doesn't make closing feel stuck.
+        app.click(task.id, kind, in: store, closeDelay: min(NSEvent.doubleClickInterval, 0.35))
     }
 
     /// Evaluated when a drag starts: remember which task is moving.
@@ -576,18 +578,22 @@ struct TaskContextMenu: View {
     @ViewBuilder
     private var selectionItems: some View {
         let count = app.selectedTaskIDs.count
-        let anyOpen = store.tasks.contains { !$0.isCompleted && app.selectedTaskIDs.contains($0.id) }
-        Button(anyOpen ? "Mark \(count) as Done" : "Mark \(count) as Not Done") {
+        let open = store.tasks.filter { !$0.isCompleted && app.selectedTaskIDs.contains($0.id) }
+        Button(open.isEmpty ? "Mark \(count) as Not Done" : "Mark \(open.count) as Done") {
             app.toggleDone(targets, in: store)
             app.deselectAll()
         }
         Divider()
-        ForEach(QuickDay.allCases, id: \.self) { day in
-            Button(day == .nextWeek ? "Move to Next Monday" : "Move to \(day.label)") {
-                app.move(targets, toDay: day.date(), in: store)
+        // Dates move only on open tasks; done ones keep theirs.
+        if !open.isEmpty {
+            ForEach(QuickDay.allCases, id: \.self) { day in
+                Button(day == .nextWeek ? "Move to Next Monday" : "Move to \(day.label)") {
+                    app.move(targets, toDay: day.date(), in: store)
+                }
             }
+            Button("Remove Dates") { app.clearDates(targets, in: store) }
+                .disabled(!open.contains { $0.dueDate != nil || $0.scheduledDate != nil })
         }
-        Button("Remove Dates") { app.clearDates(targets, in: store) }
         Menu("Priority") {
             ForEach(Priority.allCases.reversed()) { p in
                 Button(p.label) { app.setPriority(p, for: targets, in: store) }

@@ -75,7 +75,15 @@ final class AppState: ObservableObject {
     @Published var noteModes: [UUID: NoteMode] = [:]
     /// The focused task: its details are open (unless several tasks are selected).
     @Published var selectedTaskID: UUID? {
-        didSet { if let selectedTaskID { lastFocusedTaskID = selectedTaskID } }
+        didSet {
+            guard selectedTaskID != oldValue else { return }
+            pendingClose?.cancel()
+            pendingClose = nil
+            guard let selectedTaskID else { return }
+            lastFocusedTaskID = selectedTaskID
+            // One task picked by any route (a click, the arrows, search, a reveal) is where ⇧-ranges start.
+            if selectedTaskIDs.isEmpty { selectionAnchor = selectedTaskID }
+        }
     }
     /// Several tasks selected (⌘-click / ⇧-click / ⌘A). Two or more = bulk editing; selectedTaskID stays the focused one.
     @Published var selectedTaskIDs: Set<UUID> = []
@@ -83,6 +91,9 @@ final class AppState: ObservableObject {
     private(set) var selectionAnchor: UUID?
     /// The task whose details were open last, so Return can bring them back.
     private(set) var lastFocusedTaskID: UUID?
+    /// A click on the open task closes it a moment later, unless the click turns out to be the first half
+    /// of a double-click (which keeps it open). See `click(_:_:in:closeDelay:)`.
+    private var pendingClose: DispatchWorkItem?
     /// The Search view's task results in on-screen order. Search keeps this up to date as its results change
     /// (its rows don't come from `Store.sections`), so ↑/↓, ⇧-click ranges and ⌘A work there like in any list.
     var searchResultIDs: [UUID] = []
@@ -288,16 +299,21 @@ extension AppState {
     /// Two or more tasks are selected, so the right-hand panel edits them together.
     var isMultiSelecting: Bool { selectedTaskIDs.count >= 2 }
 
-    func click(_ id: UUID, _ kind: RowClick, in store: Store) {
+    /// `closeDelay`: how long a plain click on the open task waits before closing it, so that the first click
+    /// of a double-click doesn't flash the panel shut (rows pass the double-click time; tests use 0).
+    func click(_ id: UUID, _ kind: RowClick, in store: Store, closeDelay: TimeInterval = 0) {
+        pendingClose?.cancel()
+        pendingClose = nil
         switch kind {
         case .plain:
             if isMultiSelecting || (selectedTaskID != nil && selectedTaskID != id) {
                 selectOnly(id)
+            } else if selectedTaskID == id {
+                closeDetail(of: id, after: closeDelay)
             } else {
                 // Opening and closing the panel animate; switching to another task is instant.
-                let closing = selectedTaskID == id
-                selectionAnchor = closing ? nil : id
-                withAnimation(Motion.sheet) { selectedTaskID = closing ? nil : id }
+                selectionAnchor = id
+                withAnimation(Motion.sheet) { selectedTaskID = id }
             }
         case .open:
             selectOnly(id)
@@ -327,6 +343,21 @@ extension AppState {
             selectedTaskID = nil
         }
         selectionAnchor = nil
+    }
+
+    /// Closes the open task's details now, or after `delay` if nothing else has been picked by then
+    /// (picking anything cancels it).
+    private func closeDetail(of id: UUID, after delay: TimeInterval) {
+        guard delay > 0 else { return closeDetailNow(of: id) }
+        let work = DispatchWorkItem { [weak self] in self?.closeDetailNow(of: id) }
+        pendingClose = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func closeDetailNow(of id: UUID) {
+        guard selectedTaskID == id, !isMultiSelecting else { return }
+        selectionAnchor = nil
+        withAnimation(Motion.sheet) { selectedTaskID = nil }
     }
 
     /// ⇧↑ / ⇧↓: grows or shrinks the selection from the anchor, one task at a time.
@@ -502,20 +533,23 @@ extension AppState {
         return true
     }
 
-    /// Moves the tasks to `day` (a deadline keeps its time) as one undo step, and says so.
+    /// Moves the open tasks to `day` (a deadline keeps its time) as one undo step, and says so.
+    /// Finished tasks keep their dates.
     func move(_ ids: [UUID], toDay day: Date, in store: Store) {
         guard !ids.isEmpty else { return }
         let date = Fmt.absoluteDay(day, now: clock)
-        let moved = withAnimation(Motion.gentle) { store.moveTasks(ids, toDay: day) }
+        let open = openTasks(ids, in: store)
+        guard !open.isEmpty else { return showToast(ids.count == 1 ? "It's done already" : "They're all done already") }
+        let moved = withAnimation(Motion.gentle) { store.moveTasks(open, toDay: day) }
         guard moved > 0 else {
-            showToast(ids.count == 1 ? "Already on \(date)" : "They're all on \(date) already")
+            showToast(open.count == 1 ? "Already on \(date)" : "They're all on \(date) already")
             return
         }
         Haptics.success()
-        showToast(ids.count == 1 ? "Moved to \(date)" : "Moved \(Fmt.plural(ids.count, "task")) to \(date)")
+        showToast(open.count == 1 ? "Moved to \(date)" : "Moved \(Fmt.plural(open.count, "task")) to \(date)")
     }
 
-    /// Takes the plan dates and deadlines off the tasks.
+    /// Takes the plan dates and deadlines off the open tasks.
     func clearDates(_ ids: [UUID], in store: Store) {
         let cleared = withAnimation(Motion.gentle) { store.clearDates(of: ids) }
         guard cleared > 0 else { return }
@@ -524,19 +558,28 @@ extension AppState {
 
     /// "Do Today" on several tasks: plan dates only, deadlines stay.
     func plan(_ ids: [UUID], on day: Date, in store: Store) {
-        guard withAnimation(Motion.gentle, { store.planTasks(ids, on: day) }) > 0 else { return }
-        showToast("Planned \(Fmt.plural(ids.count, "task")) for \(Fmt.absoluteDay(day, now: clock))")
+        let open = openTasks(ids, in: store)
+        guard withAnimation(Motion.gentle, { store.planTasks(open, on: day) }) > 0 else { return }
+        showToast("Planned \(Fmt.plural(open.count, "task")) for \(Fmt.absoluteDay(day, now: clock))")
     }
 
     /// "Move to Tomorrow" on several tasks.
     func pushToTomorrow(_ ids: [UUID], in store: Store) {
-        guard withAnimation(Motion.gentle, { store.pushTasksToTomorrow(ids) }) > 0 else { return }
-        showToast("Moved \(Fmt.plural(ids.count, "task")) to \(Fmt.absoluteDay(QuickDay.tomorrow.date(), now: clock))")
+        let open = openTasks(ids, in: store)
+        guard withAnimation(Motion.gentle, { store.pushTasksToTomorrow(open) }) > 0 else { return }
+        showToast("Moved \(Fmt.plural(open.count, "task")) to \(Fmt.absoluteDay(QuickDay.tomorrow.date(), now: clock))")
+    }
+
+    /// The ones still to do, in the same order.
+    private func openTasks(_ ids: [UUID], in store: Store) -> [UUID] {
+        let open = Set(store.tasks.lazy.filter { !$0.isCompleted }.map(\.id))
+        return ids.filter(open.contains)
     }
 
     /// Ticks the tasks off, or reopens them when they're all done already. One undo step.
     func toggleDone(_ ids: [UUID], in store: Store) {
-        let tasks = ids.compactMap { store.task($0) }
+        let picked = Set(ids)
+        let tasks = store.tasks.filter { picked.contains($0.id) }
         guard !tasks.isEmpty else { return }
         let done = tasks.contains { !$0.isCompleted }
         let changed = withAnimation(Motion.base) { store.completeTasks(ids, done: done) }
@@ -617,7 +660,8 @@ extension AppState {
     /// Deletes the tasks as one undo step, asking first when there are more than five. `then` runs once
     /// they're gone (not when the question is cancelled).
     func delete(_ ids: [UUID], in store: Store, then: @escaping () -> Void = {}) {
-        let ids = ids.filter { store.task($0) != nil }
+        let existing = Set(store.tasks.map(\.id))
+        let ids = ids.filter(existing.contains)
         guard !ids.isEmpty else { return }
         let run = { [weak self] in
             withAnimation(Motion.base) { store.deleteTasks(Set(ids)) }

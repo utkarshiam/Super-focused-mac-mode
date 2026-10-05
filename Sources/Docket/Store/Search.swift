@@ -1,9 +1,9 @@
 import Foundation
 
-// Search across every task and note. Case and accents don't matter, every word has to match somewhere,
-// "quoted phrases" match as written and #tag filters by tag. Each item's text is kept folded (lowercase,
-// accent-free UTF-8) between searches and refolded only when the item changes, so a search over 10,000
-// tasks takes a few milliseconds and typing stays instant.
+// Search across every task and note. Case, accents and curly apostrophes don't matter, every word has to
+// match somewhere, "quoted phrases" match as written and #tag filters by tag. Each item's text is kept folded
+// (lowercase, accent-free UTF-8) between searches and refolded only when the item changes, so a search over
+// 10,000 tasks takes a few milliseconds and typing stays instant.
 
 // MARK: - Query
 
@@ -112,6 +112,12 @@ extension Store {
     func search(_ query: String, keeping: Set<UUID> = [], now: Date = Date()) -> SearchResults {
         SearchIndex.shared.results(for: query, keeping: keeping, now: now, in: self)
     }
+
+    /// Folds every task and note not folded yet, so the first letter typed doesn't wait for it. The search
+    /// field calls this when it gets the cursor; after that it only folds what changed.
+    func prepareSearch() {
+        SearchIndex.shared.prepare(tasks: tasks, notes: notes)
+    }
 }
 
 // MARK: - Folding
@@ -120,7 +126,13 @@ extension Store {
 enum SearchText {
     static let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive, .widthInsensitive]
 
-    /// Lowercase, accent-free and width-normalised, each run of whitespace (line breaks too) as one space.
+    /// Curly apostrophes and single quotes (’ ‘ ʼ ′), which pasted and generated text is full of: they search
+    /// as a straight ', so "sam's" finds “Sam’s”. Each is one UTF-16 unit, like ', so swapping one for the
+    /// other keeps UTF-16 offsets (NSRange) lined up with the original text.
+    static let apostrophes: Set<Unicode.Scalar> = ["\u{2018}", "\u{2019}", "\u{02BC}", "\u{2032}"]
+
+    /// Lowercase, accent-free and width-normalised, apostrophes straight, each run of whitespace (line breaks
+    /// too) as one space.
     static func fold(_ s: String) -> String {
         guard !s.isEmpty else { return "" }
         let folded = s.folding(options: options, locale: nil).precomposedStringWithCanonicalMapping
@@ -132,13 +144,40 @@ enum SearchText {
             } else {
                 if pendingSpace { out.append(" ") }
                 pendingSpace = false
-                out.append(u)
+                out.append(apostrophes.contains(u) ? "'" : u)
             }
         }
         return String(out)
     }
 
     static func bytes(_ s: String) -> [UInt8] { Array(fold(s).utf8) }
+
+    /// Where `needle` (folded text, as in a `SearchQuery`) appears in `text` as written, compared the way the
+    /// search compares: ignoring case, accents and width, with curly apostrophes matching straight ones.
+    /// Stops after `limit` matches.
+    static func ranges(of needle: String, in text: String, limit: Int = .max) -> [Range<String.Index>] {
+        guard !needle.isEmpty, !text.isEmpty, limit > 0 else { return [] }
+        let hay = straightened(text)
+        var found: [Range<String.Index>] = []
+        var location = 0
+        while location < hay.length {
+            let match = hay.range(of: needle, options: options, range: NSRange(location: location, length: hay.length - location))
+            // Offsets in `hay` are offsets in `text`: straightening never changes a UTF-16 length.
+            guard match.location != NSNotFound, match.length > 0, let range = Range(match, in: text) else { break }
+            found.append(range)
+            if found.count >= limit { break }
+            location = match.location + match.length
+        }
+        return found
+    }
+
+    /// `text` with curly apostrophes made straight, as NSString for searching by UTF-16 offset.
+    private static func straightened(_ text: String) -> NSString {
+        guard text.unicodeScalars.contains(where: apostrophes.contains) else { return text as NSString }
+        var out = String.UnicodeScalarView()
+        for u in text.unicodeScalars { out.append(apostrophes.contains(u) ? "'" : u) }
+        return String(out) as NSString
+    }
 
     private static func isSpace(_ u: Unicode.Scalar) -> Bool {
         u.value < 0x80 ? (u == " " || (0x09...0x0D).contains(u.value)) : u.properties.isWhitespace
@@ -178,6 +217,28 @@ private enum Bytes {
     }
 
     static func contains(_ needle: [UInt8], in hay: [UInt8]) -> Bool { find(needle, in: hay) != nil }
+
+    /// Byte order, as memcmp: negative when `a` sorts first. Folded UTF-8 in byte order is folded text in
+    /// code point order, a steady tie-breaker that's much quicker than comparing Strings.
+    static func compare(_ a: [UInt8], _ b: [UInt8]) -> Int {
+        let shared = min(a.count, b.count)
+        let order = a.withUnsafeBufferPointer { pa in
+            b.withUnsafeBufferPointer { pb -> Int32 in
+                guard shared > 0, let x = pa.baseAddress, let y = pb.baseAddress else { return 0 }
+                return memcmp(x, y, shared)
+            }
+        }
+        if order != 0 { return Int(order) }
+        return a.count == b.count ? 0 : (a.count < b.count ? -1 : 1)
+    }
+
+    /// The first 8 bytes as one big-endian number, zero-padded: two of these compare the way `compare` does,
+    /// as far as they reach, so most comparisons are a single integer one.
+    static func prefixKey(_ bytes: [UInt8]) -> UInt64 {
+        var key: UInt64 = 0
+        for i in 0..<8 { key = key << 8 | UInt64(i < bytes.count ? bytes[i] : 0) }
+        return key
+    }
 
     /// Whether position `i` begins a word: the start, or right after something that isn't a letter or digit.
     static func isWordStart(_ hay: [UInt8], at i: Int) -> Bool {
@@ -229,6 +290,8 @@ private struct TaskDoc {
     let sourceLabel: String?
 
     let foldedTitle: [UInt8]
+    /// The folded title's first bytes as a number, for ordering equally good matches by title quickly.
+    let titleKey: UInt64
     let titleStart: Int
     /// Notes, tags, steps, waiting on and source, one per line so a phrase can't run from one into the next.
     let foldedRest: [UInt8]
@@ -243,6 +306,7 @@ private struct TaskDoc {
         sourceLabel = t.source?.label
         let folded = SearchText.fold(t.title)
         foldedTitle = Array(folded.utf8)
+        titleKey = Bytes.prefixKey(foldedTitle)
         titleStart = SearchText.wordStartOffset(folded)
         var rest = [t.notes] + t.tags + t.subtasks.map(\.title)
         if let w = t.waitingOn { rest.append(w) }
@@ -288,6 +352,38 @@ private struct Score: Comparable {
     static func < (a: Score, b: Score) -> Bool {
         (a.tier, a.exact ? 0 : 1, a.sum) < (b.tier, b.exact ? 0 : 1, b.sum)
     }
+
+    /// The score, then overdue before not, as one number that sorts the same way (lower first), so most
+    /// pairs of results are settled by a single comparison.
+    func rank(overdue: Bool) -> UInt64 {
+        UInt64(min(max(tier, 0), 3)) << 40 | UInt64(exact ? 0 : 1) << 39 | UInt64(min(max(sum, 0), 1 << 30)) << 1 | (overdue ? 0 : 1)
+    }
+}
+
+/// An open task that matched, reduced to what orders it: sorting these instead of whole tasks keeps a search
+/// that matches thousands of tasks quick.
+private struct OpenMatch {
+    /// Where the task is in the store's list.
+    var index: Int
+    var rank: UInt64
+    /// The date the row shows (deadline, else plan date): timed deadlines at their time, others at the end of the day.
+    var when: Date
+    var priority: Priority
+    var titleKey: UInt64
+    var title: [UInt8]
+    var createdAt: Date
+
+    /// Best match first; equally good matches overdue first, then by the row's date, priority and title.
+    static func precedes(_ a: OpenMatch, _ b: OpenMatch) -> Bool {
+        if a.rank != b.rank { return a.rank < b.rank }
+        if a.when != b.when { return a.when < b.when }
+        if a.priority != b.priority { return a.priority > b.priority }
+        if a.titleKey != b.titleKey { return a.titleKey < b.titleKey }
+        let byTitle = Bytes.compare(a.title, b.title)
+        if byTitle != 0 { return byTitle < 0 }
+        if a.createdAt != b.createdAt { return a.createdAt < b.createdAt }
+        return a.index < b.index
+    }
 }
 
 @MainActor
@@ -296,6 +392,8 @@ private final class SearchIndex {
 
     private var taskDocs: [UUID: TaskDoc] = [:]
     private var noteDocs: [UUID: NoteDoc] = [:]
+    /// Note excerpts already worked out, with the note text and query they're for.
+    private var excerpts: [UUID: (body: String, needles: [String], text: String)] = [:]
 
     /// Everything a result depends on. Unchanged arrays compare in constant time.
     private struct Inputs: Equatable {
@@ -325,40 +423,44 @@ private final class SearchIndex {
         var listNames: [UUID: [UInt8]] = [:]
         for list in input.lists { listNames[list.id] = SearchText.bytes(list.name) }
 
-        struct OpenMatch {
-            var task: TaskItem
-            var score: Score
-            var overdue: Bool
-            var when: Date
-            var titleKey: [UInt8]
+        // Calendar math is slow next to everything else here, so it's done once per day, not once per task.
+        let startOfToday = cal.startOfDay(for: input.now)
+        var dayEnds: [Date: Date] = [:]
+        func endOfDay(_ date: Date) -> Date {
+            if let end = dayEnds[date] { return end }
+            let end = cal.endOfDay(for: date)
+            dayEnds[date] = end
+            return end
         }
+
         var open: [OpenMatch] = []
-        var done: [TaskItem] = []
-        for t in input.tasks {
+        var done: [(index: Int, completedAt: Date)] = []
+        for (index, t) in input.tasks.enumerated() {
             let doc = taskDoc(t)
             guard let score = Self.score(doc, listName: t.listID.flatMap { listNames[$0] }, query) else { continue }
-            if t.isCompleted && !input.keeping.contains(t.id) {
-                done.append(t)
-            } else {
-                open.append(OpenMatch(task: t, score: score, overdue: t.isOverdue(now: input.now, calendar: cal),
-                                      when: Self.when(t, calendar: cal), titleKey: doc.foldedTitle))
+            if let completedAt = t.completedAt, !input.keeping.contains(t.id) {
+                done.append((index, completedAt))
+                continue
             }
+            // As `TaskItem.isOverdue`: a timed deadline that has passed, or a date-only one on an earlier day.
+            let overdue = !t.isCompleted && t.dueDate.map { t.dueHasTime ? $0 < input.now : $0 < startOfToday } == true
+            let when: Date
+            if let due = t.dueDate {
+                when = t.dueHasTime ? due : endOfDay(due)
+            } else if let planned = t.scheduledDate {
+                when = endOfDay(planned)
+            } else {
+                when = .distantFuture
+            }
+            open.append(OpenMatch(index: index, rank: score.rank(overdue: overdue), when: when, priority: t.priority,
+                                  titleKey: doc.titleKey, title: doc.foldedTitle, createdAt: t.createdAt))
         }
+        open.sort(by: OpenMatch.precedes)
+        results.tasks = open.map { input.tasks[$0.index] }
 
-        // Equally good matches: overdue first, then by the date shown on the row, priority, title.
-        open.sort { a, b in
-            if a.score != b.score { return a.score < b.score }
-            if a.overdue != b.overdue { return a.overdue }
-            if a.when != b.when { return a.when < b.when }
-            if a.task.priority != b.task.priority { return a.task.priority > b.task.priority }
-            if a.titleKey != b.titleKey { return a.titleKey.lexicographicallyPrecedes(b.titleKey) }
-            return a.task.createdAt < b.task.createdAt
-        }
-        results.tasks = open.map(\.task)
-
-        done.sort { ($0.completedAt ?? .distantPast) > ($1.completedAt ?? .distantPast) }
+        done.sort { $0.completedAt != $1.completedAt ? $0.completedAt > $1.completedAt : $0.index < $1.index }
         results.completedTotal = done.count
-        results.completed = Array(done.prefix(Store.searchCompletedLimit))
+        results.completed = done.prefix(Store.searchCompletedLimit).map { input.tasks[$0.index] }
 
         var notes: [(note: Note, score: Score)] = []
         for n in input.notes {
@@ -373,8 +475,23 @@ private final class SearchIndex {
         }
         results.notes = notes.map(\.note)
 
-        prune(input)
+        prune(tasks: input.tasks, notes: input.notes)
         return results
+    }
+
+    /// Folds whatever isn't folded yet (or changed since), without searching.
+    func prepare(tasks: [TaskItem], notes: [Note]) {
+        for t in tasks { _ = taskDoc(t) }
+        for n in notes { _ = noteDoc(n) }
+        prune(tasks: tasks, notes: notes)
+    }
+
+    func excerpt(for note: Note, query: SearchQuery) -> String {
+        let needles = query.needles
+        if let known = excerpts[note.id], known.needles == needles, known.body == note.body { return known.text }
+        let text = query.snippet(in: note.body) ?? note.preview
+        excerpts[note.id] = (note.body, needles, text)
+        return text
     }
 
     private func taskDoc(_ t: TaskItem) -> TaskDoc {
@@ -392,22 +509,16 @@ private final class SearchIndex {
     }
 
     /// Forgets deleted items once there are enough of them to matter.
-    private func prune(_ input: Inputs) {
-        if taskDocs.count > input.tasks.count + 256 {
-            let live = Set(input.tasks.map(\.id))
+    private func prune(tasks: [TaskItem], notes: [Note]) {
+        if taskDocs.count > tasks.count + 256 {
+            let live = Set(tasks.map(\.id))
             taskDocs = taskDocs.filter { live.contains($0.key) }
         }
-        if noteDocs.count > input.notes.count + 64 {
-            let live = Set(input.notes.map(\.id))
+        if noteDocs.count > notes.count + 64 || excerpts.count > notes.count + 64 {
+            let live = Set(notes.map(\.id))
             noteDocs = noteDocs.filter { live.contains($0.key) }
+            excerpts = excerpts.filter { live.contains($0.key) }
         }
-    }
-
-    /// The date the row shows (deadline, else plan date); timed deadlines at their time, others at the end of the day.
-    private static func when(_ t: TaskItem, calendar cal: Calendar) -> Date {
-        if let due = t.dueDate { return t.dueHasTime ? due : cal.endOfDay(for: due) }
-        if let planned = t.scheduledDate { return cal.endOfDay(for: planned) }
-        return .distantFuture
     }
 
     // MARK: Matching
@@ -452,19 +563,17 @@ private final class SearchIndex {
 
 extension SearchQuery {
     /// What to look for in displayed text: the words and phrases, and #tags as written.
-    private var needles: [String] { terms.map(\.text) + tags.map { "#" + $0.text } }
+    fileprivate var needles: [String] { terms.map(\.text) + tags.map { "#" + $0.text } }
 
-    /// Where the query's words, phrases and #tags appear in `text` (ignoring case and accents), merged, in order.
+    /// What a note in the results shows under its title: the line that matched (`snippet(in:)`), else its
+    /// opening lines. Remembered while the note and the query stay the same, since rows redraw often.
+    @MainActor func excerpt(for note: Note) -> String {
+        SearchIndex.shared.excerpt(for: note, query: self)
+    }
+
+    /// Where the query's words, phrases and #tags appear in `text` (compared as the search compares), merged, in order.
     func highlights(in text: String) -> [Range<String.Index>] {
-        var found: [Range<String.Index>] = []
-        for needle in needles {
-            var from = text.startIndex
-            while from < text.endIndex, let r = text.range(of: needle, options: SearchText.options, range: from..<text.endIndex) {
-                guard !r.isEmpty else { break }
-                found.append(r)
-                from = r.upperBound
-            }
-        }
+        var found = needles.flatMap { SearchText.ranges(of: $0, in: text) }
         found.sort { $0.lowerBound < $1.lowerBound }
         var merged: [Range<String.Index>] = []
         for r in found {
@@ -485,12 +594,25 @@ extension SearchQuery {
         let lines = body.split(separator: "\n", omittingEmptySubsequences: true)
         guard let titleLine = lines.firstIndex(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else { return nil }
         for line in lines[(titleLine + 1)...] {
-            let text = Self.plainLine(String(line))
+            let raw = String(line)
+            guard Self.mayMatch(raw, needles) else { continue }
+            let text = Self.plainLine(raw)
             guard !text.isEmpty else { continue }
-            let first = needles.compactMap { text.range(of: $0, options: SearchText.options) }.min { $0.lowerBound < $1.lowerBound }
+            let first = needles.compactMap { SearchText.ranges(of: $0, in: text, limit: 1).first }.min { $0.lowerBound < $1.lowerBound }
             if let first { return Self.excerpt(text, around: first, maxLength: maxLength) }
         }
         return nil
+    }
+
+    /// A quick look at a line as written, before the slower clean-up into plain text: could any needle be in it?
+    /// Photos count by their description and emphasis marks are skipped, as `plainLine` does, so a long note's
+    /// many other lines are passed over cheaply.
+    private static func mayMatch(_ line: String, _ needles: [String]) -> Bool {
+        var probes = [line.contains("![") ? Note.describingMedia(line) : line]
+        if line.contains(where: { $0 == "*" || $0 == "_" || $0 == "`" }) {
+            probes.append(probes[0].filter { $0 != "*" && $0 != "_" && $0 != "`" })
+        }
+        return needles.contains { needle in probes.contains { !SearchText.ranges(of: needle, in: $0, limit: 1).isEmpty } }
     }
 
     /// One line of Markdown as plain text (the same clean-up as a note's preview).

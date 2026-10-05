@@ -255,7 +255,8 @@ struct QuickCaptureView: View {
                     }
                     .transition(.opacity.combined(with: .scale(scale: 0.95)))
                 } else if mode == .task {
-                    // One line: the panel has a fixed size, so tags and the hint drop out before anything wraps.
+                    // One line, as the panel has a fixed size: repeat and tags fold into "+2" and the hint
+                    // drops out before anything wraps.
                     AddOptionsBar(options: $options, parsed: parser(now).parse(text), context: AddContext(), lists: store.lists, now: now,
                                   usesPopovers: false, arrangement: .oneLine,
                                   hint: text.trimmingCharacters(in: .whitespaces).isEmpty ? "Or just type “fri 10am 30m”" : nil,

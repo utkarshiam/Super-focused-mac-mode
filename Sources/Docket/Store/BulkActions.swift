@@ -37,6 +37,7 @@ enum QuickDay: CaseIterable, Hashable {
 /// Changes made to several tasks at once: the bulk edit panel, keyboard triage and the Task menu when
 /// more than one task is selected. Each is a single undo step. Each returns how many tasks it actually
 /// changed; when that's none, nothing is recorded, so ⌘Z never undoes a change you can't see.
+/// Date changes skip finished tasks: they keep the dates they were done with.
 extension Store {
     /// Runs `body` as one undo step called `name`. The store methods it uses (`setDueDay`, `setCompleted`,
     /// `move`…) normally record steps of their own; inside a batch those are folded into this one, so a
@@ -57,10 +58,7 @@ extension Store {
     @discardableResult
     func moveTasks(_ ids: [UUID], toDay day: Date) -> Int {
         let target = calendar.startOfDay(for: day)
-        let changing = bulkTargets(ids).filter { t in
-            if let due = t.dueDate { return !calendar.isDate(due, inSameDayAs: target) || t.scheduledDate != nil }
-            return t.scheduledDate.map { calendar.startOfDay(for: $0) } != target
-        }
+        let changing = bulkTargets(ids).filter { !$0.isCompleted && !isPlaced($0, on: target) }
         guard !changing.isEmpty else { return 0 }
         undoableBatch("Reschedule") {
             for t in changing { move(t.id, toDay: target) }
@@ -68,10 +66,10 @@ extension Store {
         return changing.count
     }
 
-    /// Removes the plan date and the deadline (with its time) from each task.
+    /// Removes the plan date and the deadline (with its time) from each open task.
     @discardableResult
     func clearDates(of ids: [UUID]) -> Int {
-        let changing = bulkTargets(ids).filter { $0.dueDate != nil || $0.scheduledDate != nil }
+        let changing = bulkTargets(ids).filter { !$0.isCompleted && ($0.dueDate != nil || $0.scheduledDate != nil) }
         guard !changing.isEmpty else { return 0 }
         undoableBatch("Remove Dates") {
             for t in changing {
@@ -85,11 +83,11 @@ extension Store {
         return changing.count
     }
 
-    /// "Do Today" on several tasks: plans each one for `day` and leaves deadlines alone.
+    /// "Do Today" on several tasks: plans each open one for `day` and leaves deadlines alone.
     @discardableResult
     func planTasks(_ ids: [UUID], on day: Date) -> Int {
         let target = calendar.startOfDay(for: day)
-        let changing = bulkTargets(ids).filter { $0.scheduledDate.map { calendar.startOfDay(for: $0) } != target }
+        let changing = bulkTargets(ids).filter { !$0.isCompleted && $0.scheduledDate.map { calendar.startOfDay(for: $0) } != target }
         guard !changing.isEmpty else { return 0 }
         undoableBatch("Plan") {
             for t in changing { setScheduled(t.id, target) }
@@ -97,12 +95,13 @@ extension Store {
         return changing.count
     }
 
-    /// "Move to Tomorrow" on several tasks: whichever date each one goes by (deadline, else plan date)
+    /// "Move to Tomorrow" on several tasks: whichever date each open one goes by (deadline, else plan date)
     /// moves to tomorrow.
     @discardableResult
     func pushTasksToTomorrow(_ ids: [UUID], now: Date = Date()) -> Int {
         let tomorrow = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: now))!
         let changing = bulkTargets(ids).filter { t in
+            guard !t.isCompleted else { return false }
             guard let date = t.dueDate ?? t.scheduledDate else { return true }
             return !calendar.isDate(date, inSameDayAs: tomorrow)
         }
@@ -196,6 +195,13 @@ extension Store {
     }
 
     // MARK: Helpers
+
+    /// Whether moving `t` to `day` would change nothing: its deadline is on that day with no separate plan
+    /// date, or it has no deadline and is planned for that day.
+    func isPlaced(_ t: TaskItem, on day: Date) -> Bool {
+        if let due = t.dueDate { return t.scheduledDate == nil && calendar.isDate(due, inSameDayAs: day) }
+        return t.scheduledDate.map { calendar.isDate($0, inSameDayAs: day) } ?? false
+    }
 
     /// A tag as it's stored: no leading "#", no spaces (they become "-"). Nil when nothing is left.
     static func tagName(_ text: String) -> String? {

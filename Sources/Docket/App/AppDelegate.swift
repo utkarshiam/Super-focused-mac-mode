@@ -143,16 +143,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         case 51, 117: // delete, forward delete
             return inTasks && app.deleteSelection(in: store)
         case 36, 76: // return, enter
-            return inTasks && app.toggleDetail(in: store)
+            guard inTasks else { return false }
+            // Holding Return doesn't flap the details open and shut.
+            return event.isARepeat || app.toggleDetail(in: store)
         default:
             guard inTasks else { return false }
+            let action: AppState.Triage
             switch key {
-            case "t": return app.triage(.move(.today), in: store)
-            case "m": return app.triage(.move(.tomorrow), in: store)
-            case "w": return app.triage(.move(.nextWeek), in: store)
-            case "x": return app.triage(.done, in: store)
+            case "t": action = .move(.today)
+            case "m": action = .move(.tomorrow)
+            case "w": action = .move(.nextWeek)
+            case "x": action = .done
             default: return false
             }
+            // One press, one change: a held key mustn't run on down the list, ticking off task after task.
+            return event.isARepeat || app.triage(action, in: store)
         }
     }
 
@@ -466,7 +471,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         switch item.action {
         case #selector(selectAll(_:)):
-            return mainWindow.isKeyWindow && app.selection.isTaskView
+            // The month grid has no rows to select.
+            return mainWindow.isKeyWindow && app.selection.isTaskView && !(app.selection == .calendar && app.calendarMode == .month)
         case #selector(moveSelectedUp(_:)), #selector(moveSelectedDown(_:)):
             return app.selection == .calendar && !app.isMultiSelecting && selectedTask.map { !$0.isCompleted } == true
         case #selector(focusSelected(_:)):
