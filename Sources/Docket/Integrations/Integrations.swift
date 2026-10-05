@@ -1158,8 +1158,10 @@ final class Integrations: ObservableObject {
         let subject = m.subject.flatMap { $0.isEmpty ? nil : $0 }
         let source = TaskSource(kind: .gmail, externalID: m.externalID, url: GmailClient.threadLink(account: address, threadID: m.threadID),
                                 label: [sender, subject].compactMap { $0 }.joined(separator: " · "))
-        let suggestion = Suggestion(source: source, from: sender, subject: subject, snippet: m.snippet,
+        var suggestion = Suggestion(source: source, from: sender, subject: subject, snippet: m.snippet,
                                     receivedAt: m.date, draft: nil, trigger: trigger)
+        // Starred in Gmail: starred here too (unstarring it in Docket keeps it in the inbox until it's dismissed).
+        suggestion.isStarred = trigger == .starred || m.labels.contains(GmailClient.starredLabel)
         let message = IncomingMessage(source: source, from: m.sender.full, subject: subject, text: m.snippet, date: m.date)
         return SuggestionCandidate(suggestion: suggestion, message: message)
     }
