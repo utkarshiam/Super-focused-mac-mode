@@ -102,6 +102,10 @@ extension Prefs.Key {
     static let slackFocusStatus = "slackFocusStatus"
     static let gmailNeedsReply = "gmailNeedsReply"
     static let slackShareChannel = "slackShareChannel"
+    /// "Check Slack and email every 2 minutes".
+    static let checkMessagesOften = "checkMessagesOften"
+    /// "Notify me about new messages".
+    static let notifyNewMessages = "notifyNewMessages"
 }
 
 /// The switches on Settings → Connections, read at the start of each refresh.
@@ -112,6 +116,10 @@ struct IntegrationSettings: Equatable {
     var directMessages = true
     var focusStatus = true
     var needsReply = true
+    /// Slack and Gmail are checked every 2 minutes (`MessagePoll`), not only every 15.
+    var checksOften = true
+    /// New messages from others show a macOS notification.
+    var notifies = true
 
     static var current: IntegrationSettings {
         let d = UserDefaults.standard
@@ -120,7 +128,9 @@ struct IntegrationSettings: Equatable {
             mentions: d.object(forKey: Prefs.Key.slackMentions) as? Bool ?? true,
             directMessages: d.object(forKey: Prefs.Key.slackDirectMessages) as? Bool ?? true,
             focusStatus: d.object(forKey: Prefs.Key.slackFocusStatus) as? Bool ?? true,
-            needsReply: d.object(forKey: Prefs.Key.gmailNeedsReply) as? Bool ?? true)
+            needsReply: d.object(forKey: Prefs.Key.gmailNeedsReply) as? Bool ?? true,
+            checksOften: d.object(forKey: Prefs.Key.checkMessagesOften) as? Bool ?? true,
+            notifies: d.object(forKey: Prefs.Key.notifyNewMessages) as? Bool ?? true)
     }
 }
 
@@ -561,6 +571,17 @@ struct SuggestionTriage {
 struct SuggestionCandidate {
     var suggestion: Suggestion
     var message: IncomingMessage
+    /// The user sent it (a 📌 on their own Slack message, an email to themselves): never notified about.
+    var isFromMe = false
+}
+
+/// How much a check reads.
+enum RefreshMode {
+    /// Everything in the windows (on launch, every 15 minutes, on coming back, Check now).
+    case full
+    /// The quick check every 2 minutes: DMs with nothing new since the last check aren't read, and emails
+    /// fetched before aren't fetched again. Anything it leaves for later, the next full check reads.
+    case quick
 }
 
 /// What a refresh already knows when it starts, so the messages it has seen don't come back.
@@ -622,6 +643,9 @@ final class Integrations: ObservableObject {
     @Published private(set) var gmailProblem: String?
     /// AI couldn't sort the newest messages (they're tried again next time).
     @Published private(set) var aiProblem: String?
+    /// Messages from others that came in since the menu bar panel was last opened (its icon shows a dot).
+    /// Not the backlog of a first check. Not saved.
+    @Published private(set) var newMessageIDs: Set<String> = []
 
     /// The Docket app in Slack lacks permissions some features need. Stays until Slack is connected again.
     /// The ones only the complete message needs (files, threads) have their own banner: `missingSlackScopes`.
@@ -676,6 +700,10 @@ final class Integrations: ObservableObject {
     var summarizer: ThreadSummarizer = .gemini
     /// The user's name, to sign a reply ("Maya Chen"): the Mac account's full name.
     var fullName: () -> String = { NSFullUserName() }
+    /// Where notifications about new messages go.
+    var alertSink: MessageAlertSink = .system
+    /// Whether a focus session is running (the app's `FocusTimer`): notifications wait until it ends.
+    var isFocusing: () -> Bool = { false }
 
     static let refreshInterval: TimeInterval = 15 * 60
     /// Coming back to Docket refreshes when the last check is older than this.
@@ -702,6 +730,18 @@ final class Integrations: ObservableObject {
     private var cancellables: Set<AnyCancellable> = []
     private var slackPausedUntil: Date?
     private var gmailPausedUntil: Date?
+    /// The services checked at least once since connecting (or before this launch): what they bring in after
+    /// that is new, so it's notified about. A first check's backlog never is.
+    private var primed: Set<IntegrationError.Service> = []
+    /// New messages that came in during a focus session, notified about when it ends.
+    private var heldAlerts: [String] = []
+    /// What the last check saw in each Slack DM and group DM, so quick checks skip the unchanged ones.
+    private(set) var directMessageMarks: [String: SlackClient.DirectMessageMark] = [:]
+    /// Emails whose details were fetched this session: quick checks don't fetch them again.
+    private(set) var fetchedEmailIDs: Set<String> = []
+    /// What stops quick checks right now (the Mac asleep, the screen locked).
+    private(set) var pollPauses: Set<MessagePoll.Pause> = []
+    private var pollTimer: Timer?
     private var userNames: [String: String] = [:]
     private var conversations: [String: SlackChannel] = [:]
     /// Who's in each group DM (by id), for its label. Looked up once a session.
@@ -742,6 +782,15 @@ final class Integrations: ObservableObject {
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
 
+        // The quick check every 2 minutes (`poll`), paused while the Mac sleeps or is locked.
+        let quick = Timer(timeInterval: MessagePoll.interval, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.poll() }
+        }
+        quick.tolerance = 15
+        RunLoop.main.add(quick, forMode: .common)
+        pollTimer = quick
+        watchSleep()
+
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.refreshIfStale() }
@@ -778,6 +827,12 @@ final class Integrations: ObservableObject {
         savedSlackNames = file.slackNames
         slackStarsStayInDocket = file.slackStarsStayInDocket
         threadSummaries = file.summaries
+        // Checked before this launch: what comes in now is new. Never checked: the first check is the backlog.
+        primed = []
+        if file.lastRefresh != nil {
+            if file.slack != nil { primed.insert(.slack) }
+            if file.gmailAddress != nil { primed.insert(.gmail) }
+        }
         // Attachments of messages that are gone, and a cache grown too big.
         pruneInboxCache()
 
@@ -833,17 +888,22 @@ final class Integrations: ObservableObject {
         await refreshTask?.value
     }
 
-    /// One full check: collect new messages, let AI pick out the ones that need a task, merge, save.
-    func refreshNow(now: Date = Date()) async {
+    /// One check: collect new messages, let AI pick out the ones that need a task, merge, save, and notify
+    /// about the new ones. `mode` says how much is read (`RefreshMode`).
+    func refreshNow(now: Date = Date(), mode: RefreshMode = .full) async {
         guard let store else { return }
         isRefreshing = true
         defer { isRefreshing = false }
         let settings = settings()
         let seen = SeenMessages(blocked: blockedIDs(store), skipped: skipped, pending: suggestions, tasks: store.tasks)
+        // What's new is only told about for services checked before (not a first check's backlog).
+        let notifiable = primed
+        let waiting = Set(suggestions.map(\.id))
 
-        async let fromSlack = collectSlack(settings: settings, seen: seen, now: now)
-        async let fromGmail = collectGmail(settings: settings, seen: seen, now: now)
+        async let fromSlack = collectSlack(settings: settings, seen: seen, now: now, mode: mode)
+        async let fromGmail = collectGmail(settings: settings, seen: seen, now: now, mode: mode)
         let (slack, gmail) = await (fromSlack, fromGmail)
+        let fromMe = Set((slack.found + gmail.found).filter(\.isFromMe).map(\.suggestion.id))
 
         let sorted = await sort(slack.found + gmail.found, store: store, now: now)
         for id in sorted.skipped { skipped[id] = now }
@@ -869,6 +929,107 @@ final class Integrations: ObservableObject {
         // "Updated 10:42 AM" only when something was actually checked; otherwise coming back retries.
         if slack.checked || gmail.checked { lastRefresh = now }
         save()
+
+        let arrived = suggestions.filter { s in
+            guard !waiting.contains(s.id), !fromMe.contains(s.id), !(s.trigger?.isExplicit ?? false) else { return false }
+            switch s.source.kind {
+            case .slack: return notifiable.contains(.slack)
+            case .gmail: return notifiable.contains(.gmail)
+            case .ai: return false
+            }
+        }
+        if slack.checked { primed.insert(.slack) }
+        if gmail.checked { primed.insert(.gmail) }
+        announce(arrived, settings: settings)
+    }
+
+    // MARK: New messages
+
+    /// Notifies about messages that just came in (one each, or a summary), and marks them new for the menu bar
+    /// icon. Only from others, never ones flagged on purpose (the user did that), never a first check's
+    /// backlog (`refreshNow` picks them). During a focus session they wait until it ends.
+    private func announce(_ arrived: [Suggestion], settings: IntegrationSettings) {
+        guard !arrived.isEmpty else { return }
+        newMessageIDs.formUnion(arrived.map(\.id))
+        guard settings.notifies else { return }
+        if isFocusing() {
+            for s in arrived where !heldAlerts.contains(s.id) { heldAlerts.append(s.id) }
+            return
+        }
+        alertSink.post(MessageAlerts.plan(arrived))
+    }
+
+    /// Notifies about what came in during the focus session that just ended, if it's still waiting.
+    private func releaseHeldAlerts() {
+        let ids = heldAlerts
+        heldAlerts = []
+        guard settings().notifies else { return }
+        let items = ids.compactMap { suggestion($0) }
+        guard !items.isEmpty else { return }
+        alertSink.post(MessageAlerts.plan(items))
+    }
+
+    /// New messages still waiting: how many the menu bar icon's dot stands for.
+    var newMessageCount: Int {
+        guard !newMessageIDs.isEmpty else { return 0 }
+        return suggestions.lazy.filter { self.newMessageIDs.contains($0.id) }.count
+    }
+
+    /// The menu bar panel was opened: what's new has been seen.
+    func markMessagesSeen() {
+        if !newMessageIDs.isEmpty { newMessageIDs = [] }
+    }
+
+    // MARK: Quick checks
+
+    /// Checks Slack and Gmail lightly (`RefreshMode.quick`), unless the switch is off, a check is running,
+    /// the Mac is asleep or locked, or every service is waiting out a rate limit. Returns why it didn't run.
+    @discardableResult
+    func poll(now: Date = Date()) -> MessagePoll.Skip? {
+        if let skip = pollSkip(now: now) { return skip }
+        guard !DebugSnapshot.isActive else { return .notConnected }
+        refreshTask = Task { @MainActor [weak self] in
+            await self?.refreshNow(now: now, mode: .quick)
+            self?.refreshTask = nil
+            if self?.started == true { self?.summarizeImportantInBackground() }
+        }
+        return nil
+    }
+
+    /// Why a quick check wouldn't run now (nil: it would).
+    func pollSkip(now: Date = Date()) -> MessagePoll.Skip? {
+        guard store != nil else { return .notConnected }
+        return MessagePoll.skip(enabled: settings().checksOften, slackConnected: isSlackConnected, gmailConnected: isGmailConnected,
+                                refreshing: refreshTask != nil || isRefreshing, asleep: !pollPauses.isEmpty,
+                                slackPausedUntil: slackPausedUntil, gmailPausedUntil: gmailPausedUntil, now: now)
+    }
+
+    /// The Mac went to sleep, its screens went off, the screen locked or the user switched out (or back).
+    /// Quick checks stop meanwhile; when nothing holds them any more, one runs at once to catch up.
+    func notePause(_ pause: MessagePoll.Pause, _ on: Bool, now: Date = Date()) {
+        let wasPaused = !pollPauses.isEmpty
+        if on { pollPauses.insert(pause) } else { pollPauses.remove(pause) }
+        if wasPaused, pollPauses.isEmpty { poll(now: now) }
+    }
+
+    private func watchSleep() {
+        let workspace = NSWorkspace.shared.notificationCenter
+        let pairs: [(Notification.Name, MessagePoll.Pause, Bool)] = [
+            (NSWorkspace.willSleepNotification, .sleep, true), (NSWorkspace.didWakeNotification, .sleep, false),
+            (NSWorkspace.screensDidSleepNotification, .screens, true), (NSWorkspace.screensDidWakeNotification, .screens, false),
+            (NSWorkspace.sessionDidResignActiveNotification, .session, true), (NSWorkspace.sessionDidBecomeActiveNotification, .session, false),
+        ]
+        for (name, pause, on) in pairs {
+            observers.append(workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.notePause(pause, on) }
+            })
+        }
+        let distributed = DistributedNotificationCenter.default()
+        for (name, on) in [("com.apple.screenIsLocked", true), ("com.apple.screenIsUnlocked", false)] {
+            observers.append(distributed.addObserver(forName: Notification.Name(name), object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.notePause(.locked, on) }
+            })
+        }
     }
 
     private func blockedIDs(_ store: Store) -> Set<String> {
@@ -963,7 +1124,7 @@ final class Integrations: ObservableObject {
 
     /// New Slack messages to consider, the whole messages of waiting items saved without them, and whether
     /// Slack could be checked at all.
-    private func collectSlack(settings: IntegrationSettings, seen: SeenMessages, now: Date) async
+    private func collectSlack(settings: IntegrationSettings, seen: SeenMessages, now: Date, mode: RefreshMode = .full) async
         -> (found: [SuggestionCandidate], wholeMessages: [Suggestion], checked: Bool) {
         guard isSlackConnected, let account = slackAccount else { return ([], [], false) }
         if let until = slackPausedUntil, until > now { return ([], [], false) }
@@ -976,8 +1137,9 @@ final class Integrations: ObservableObject {
         let unfilled = Set(suggestions.lazy.filter { $0.source.kind == .slack && $0.content == nil }.map(\.id))
         let client = slackClient(token)
         do {
+            // A quick check reads the newest page of reactions; a full one goes further back.
             var found = try await client.savedMessages(by: account.userID, emoji: settings.saveEmoji,
-                                                       since: now.addingTimeInterval(-Self.savedWindow))
+                                                       since: now.addingTimeInterval(-Self.savedWindow), pages: mode == .quick ? 1 : 2)
                 .map { ($0, SuggestionTrigger.reaction) }
             if settings.mentions {
                 found += try await client.mentions(of: account.userID, since: now.addingTimeInterval(-Self.mentionsWindow))
@@ -985,7 +1147,7 @@ final class Integrations: ObservableObject {
             }
             var dmProblem: IntegrationError?
             if settings.directMessages {
-                let dms = try await directMessages(client, account: account, now: now)
+                let dms = try await directMessages(client, account: account, now: now, mode: mode)
                 found += dms.messages.map { ($0, SuggestionTrigger.directMessage) }
                 dmProblem = dms.problem
             }
@@ -1002,7 +1164,11 @@ final class Integrations: ObservableObject {
             if case .missingPermission(.slack, let scopes)? = dmProblem { noteRefusedSlackScopes(scopes) }
             slackProblem = dmProblem?.errorDescription
             slackPausedUntil = nil
-            return (fresh.map { slackCandidate($0.0, trigger: $0.1, account: account, now: now) },
+            return (fresh.map { m, trigger in
+                        var candidate = slackCandidate(m, trigger: trigger, account: account, now: now)
+                        candidate.isFromMe = m.userID == account.userID
+                        return candidate
+                    },
                     old.map { slackCandidate($0.0, trigger: $0.1, account: account, now: now).suggestion }, true)
         } catch {
             handleSlack(error, now: now)
@@ -1013,7 +1179,7 @@ final class Integrations: ObservableObject {
     /// The DMs and group DMs people sent the user lately (`SlackClient.directMessages`), best effort: Slack
     /// signing Docket out or asking it to slow down stops the check as usual; a permission Slack refused comes
     /// back as `problem`, with what could be read; anything else skips DMs this time.
-    private func directMessages(_ client: SlackClient, account: SlackAccount, now: Date) async throws
+    private func directMessages(_ client: SlackClient, account: SlackAccount, now: Date, mode: RefreshMode) async throws
         -> (messages: [SlackMessage], problem: IntegrationError?) {
         // The kinds the token can read, when Slack has said which permissions it has (Settings says what's missing).
         var kinds: Set<String> = ["im", "mpim"]
@@ -1023,7 +1189,10 @@ final class Integrations: ObservableObject {
         }
         guard !kinds.isEmpty else { return ([], nil) }
         do {
-            let found = try await client.directMessages(of: account.userID, since: now.addingTimeInterval(-Self.mentionsWindow), kinds: kinds)
+            // A quick check reads only conversations with something new since the last check, and only what's new.
+            let found = try await client.directMessages(of: account.userID, since: now.addingTimeInterval(-Self.mentionsWindow), kinds: kinds,
+                                                        seen: mode == .quick ? directMessageMarks : nil)
+            if slackAccount?.userID == account.userID { directMessageMarks.merge(found.seen) { _, new in new } }
             let problem = found.missingScopes.isEmpty ? nil
                 : IntegrationError.missingPermission(.slack, found.missingScopes.sorted().joined(separator: ","))
             return (found.messages, problem)
@@ -1144,6 +1313,11 @@ final class Integrations: ObservableObject {
         var (account, scopes) = try await slackClient(token).identity()
         account.missingScopes = Self.missingCoreScopes(granted: scopes)
         Keychain.set(token, for: Keychain.Account.slackUserToken)
+        // Another account (or the first): its messages so far are a backlog, not news.
+        if slackAccount?.userID != account.userID {
+            primed.remove(.slack)
+            directMessageMarks = [:]
+        }
         slackAccount = account
         isSlackConnected = true
         slackPausedUntil = nil
@@ -1201,6 +1375,8 @@ final class Integrations: ObservableObject {
         channelList = nil
         userNames = [:]
         conversations = [:]
+        primed.remove(.slack)
+        directMessageMarks = [:]
         focusRecord = nil
         grantedSlackScopes = nil
         refusedSlackScopes = []
@@ -1268,7 +1444,8 @@ final class Integrations: ObservableObject {
     }
 
     /// New emails to consider, and whether Gmail could be checked at all.
-    private func collectGmail(settings: IntegrationSettings, seen: SeenMessages, now: Date) async -> (found: [SuggestionCandidate], checked: Bool) {
+    private func collectGmail(settings: IntegrationSettings, seen: SeenMessages, now: Date, mode: RefreshMode = .full) async
+        -> (found: [SuggestionCandidate], checked: Bool) {
         guard isGmailConnected, let address = gmailAddress else { return ([], false) }
         if let until = gmailPausedUntil, until > now { return ([], false) }
         // As for Slack: an unreadable secret doesn't disconnect; Google refusing the sign-in does.
@@ -1286,16 +1463,25 @@ final class Integrations: ObservableObject {
             }
             // One card per conversation: the newest message (lists come newest first), a star first.
             var threads = Set<String>()
-            let fresh = refs.filter { ref, trigger in
+            var fresh = refs.filter { ref, trigger in
                 seen.isNewEmail(ref, trigger) && threads.insert(ref.threadID).inserted
             }
+            // A quick check fetches only emails it hasn't fetched before (the full check retries the rest).
+            if mode == .quick { fresh = fresh.filter { !fetchedEmailIDs.contains($0.0.externalID) } }
             let messages = try await client.messages(fresh.map { $0.0 })
             guard isGmailConnected, gmailAddress == address else { return ([], false) }
+            fetchedEmailIDs.formUnion(messages.map(\.externalID))
             let triggers = Dictionary(fresh.map { ($0.0.id, $0.1) }, uniquingKeysWith: { first, _ in first })
             gmailProblem = nil
             gmailPausedUntil = nil
             await noteGmailGrants(session)
-            return (messages.compactMap { m in triggers[m.id].map { gmailCandidate(m, trigger: $0, address: address) } }, true)
+            return (messages.compactMap { m in
+                triggers[m.id].map { trigger in
+                    var candidate = gmailCandidate(m, trigger: trigger, address: address)
+                    candidate.isFromMe = m.sender.address?.caseInsensitiveCompare(address) == .orderedSame
+                    return candidate
+                }
+            }, true)
         } catch {
             handleGmail(error, now: now)
             return ([], false)
@@ -1354,6 +1540,10 @@ final class Integrations: ObservableObject {
                 let email = try await GmailClient(session: session, transport: transport).profileEmail()
                 Keychain.set(refreshToken, for: Keychain.Account.googleRefreshToken)
                 google = session
+                if gmailAddress != email {
+                    primed.remove(.gmail)
+                    fetchedEmailIDs = []
+                }
                 gmailAddress = email
                 isGmailConnected = true
                 gmailPausedUntil = nil
@@ -1390,6 +1580,8 @@ final class Integrations: ObservableObject {
         isGmailConnected = false
         gmailProblem = problem
         gmailPausedUntil = nil
+        primed.remove(.gmail)
+        fetchedEmailIDs = []
         grantedGmailScopes = nil
         if problem == nil {
             // Their attachments and conversations go with them.
@@ -1482,6 +1674,9 @@ final class Integrations: ObservableObject {
         guard !retired.isEmpty else { return }
         for s in retired { handled[s.id] = now }
         suggestions.removeAll { ids.contains($0.id) }
+        // Handled: its notification has nothing left to say.
+        alertSink.withdraw(retired.map(\.id))
+        newMessageIDs.subtract(retired.map(\.id))
         save()
         store?.undoManager?.registerUndo(withTarget: self) { $0.bringBack(retired) }
     }
@@ -1521,6 +1716,8 @@ final class Integrations: ObservableObject {
     /// The focus session stopped.
     func focusEnded() {
         guard store != nil else { return }
+        // What came in meanwhile, now that there's room for it.
+        releaseHeldAlerts()
         enqueueFocus { [weak self] in await self?.clearFocusStatus() }
     }
 

@@ -1,11 +1,17 @@
 import AppKit
 import SwiftUI
 
-/// The dropdown under the menu bar icon: today's agenda, quick add and the running focus timer.
+/// The dropdown under the menu bar icon, as tall as the screen: today's agenda, quick add and the running focus
+/// timer at the top, the newest Slack messages and emails below.
 struct MenuBarView: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var app: AppState
     @EnvironmentObject var focus: FocusTimer
+    @ObservedObject private var integrations = Integrations.shared
+    /// The panel's height (`MenuBarPanelLayout`).
+    var height: CGFloat = 540
+    /// The messages that came in since the panel was last opened: listed first, marked new.
+    var newMessageIDs: Set<String> = []
     var close: () -> Void
     @State private var text = ""
     /// The Date, Time, List and More dropdowns (menus only here: a popover would close the panel).
@@ -87,27 +93,19 @@ struct MenuBarView: View {
                     .padding(.vertical, Space.sm)
             }
 
-            if tasks.isEmpty {
-                VStack(spacing: Space.sm) {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 18, weight: .bold))
-                        .foregroundStyle(Color.onPrimary)
-                        .frame(width: 44, height: 44)
-                        .background(Circle().fill(Color.primaryFill))
-                    Text("All clear for today").textStyle(.headline).foregroundStyle(Color.ink)
-                    Text("\(store.count(for: .inbox)) in your inbox").textStyle(.footnote).foregroundStyle(Color.ink2)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    VStack(spacing: 2) {
-                        ForEach(Array(tasks.enumerated()), id: \.element.id) { i, t in
-                            row(t, now: now)
-                                .enterUp(i)
-                        }
+            // Today's tasks take what they need, up to 45% of the room; Messages fills the rest. Each scrolls.
+            let showsMessages = integrations.isAnyConnected || !integrations.suggestions.isEmpty
+            GeometryReader { geo in
+                let taskHeight = MenuBarPanelLayout.taskListHeight(available: geo.size.height, tasksNeed: tasksNeed(tasks),
+                                                                   showsMessages: showsMessages)
+                VStack(spacing: 0) {
+                    taskList(tasks, now: now, compact: showsMessages)
+                        .frame(height: taskHeight)
+                    if showsMessages {
+                        Rectangle().fill(Color.hair).frame(height: 1)
+                        MenuBarMessages(newIDs: newMessageIDs, close: close)
+                            .frame(maxHeight: .infinity)
                     }
-                    .padding(.horizontal, Space.sm)
-                    .padding(.vertical, Space.xs)
                 }
             }
 
@@ -130,8 +128,62 @@ struct MenuBarView: View {
             .padding(.horizontal, Space.lg)
             .frame(height: 54)
         }
-        .frame(width: 370, height: 540)
+        .frame(width: MenuBarPanelLayout.width, height: height)
         .floatingPanelChrome()
+    }
+
+    /// The height the task list needs to show every task (rows with an estimate have a second line).
+    private func tasksNeed(_ tasks: [TaskItem]) -> CGFloat {
+        guard !tasks.isEmpty else { return Self.emptyHeight }
+        let rows = tasks.reduce(CGFloat(0)) { $0 + ($1.estimateMinutes == nil ? 42 : 52) + 2 }
+        return rows + 2 * Space.xs
+    }
+
+    private static let emptyHeight: CGFloat = 64
+
+    @ViewBuilder
+    private func taskList(_ tasks: [TaskItem], now: Date, compact: Bool) -> some View {
+        if tasks.isEmpty {
+            if compact {
+                // One line, so the messages below get the room.
+                HStack(spacing: Space.md) {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(Color.onPrimary)
+                        .frame(width: 24, height: 24)
+                        .background(Circle().fill(Color.primaryFill))
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("All clear for today").textStyle(.subheadStrong).foregroundStyle(Color.ink)
+                        Text("\(store.count(for: .inbox)) in your inbox").textStyle(.caption).foregroundStyle(Color.ink2)
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, Space.lg)
+                .frame(maxHeight: .infinity)
+            } else {
+                VStack(spacing: Space.sm) {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 18, weight: .bold))
+                        .foregroundStyle(Color.onPrimary)
+                        .frame(width: 44, height: 44)
+                        .background(Circle().fill(Color.primaryFill))
+                    Text("All clear for today").textStyle(.headline).foregroundStyle(Color.ink)
+                    Text("\(store.count(for: .inbox)) in your inbox").textStyle(.footnote).foregroundStyle(Color.ink2)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        } else {
+            ScrollView {
+                VStack(spacing: 2) {
+                    ForEach(Array(tasks.enumerated()), id: \.element.id) { i, t in
+                        row(t, now: now)
+                            .enterUp(i)
+                    }
+                }
+                .padding(.horizontal, Space.sm)
+                .padding(.vertical, Space.xs)
+            }
+        }
     }
 
     private func row(_ t: TaskItem, now: Date) -> some View {
@@ -198,6 +250,122 @@ struct MenuBarView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) {
             if confirmation == message { confirmation = nil }
         }
+    }
+}
+
+// MARK: - Messages in the menu bar panel
+
+/// The newest Slack messages and emails, the new ones first. A click opens one in Messages; hovering offers
+/// Add task.
+private struct MenuBarMessages: View {
+    @EnvironmentObject var app: AppState
+    @ObservedObject private var integrations = Integrations.shared
+    let newIDs: Set<String>
+    var close: () -> Void
+
+    var body: some View {
+        let items = MenuBarMessageList.items(integrations.suggestions, new: newIDs)
+        let newCount = items.filter { newIDs.contains($0.id) }.count
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .firstTextBaseline, spacing: Space.sm) {
+                Text("Messages")
+                    .textStyle(.headline)
+                    .foregroundStyle(Color.ink)
+                Text(newCount > 0 ? "\(newCount) new" : "\(integrations.suggestions.count) waiting")
+                    .textStyle(.footnote)
+                    .foregroundStyle(Color.ink2)
+                Spacer()
+                Button {
+                    close()
+                    app.reveal(message: nil)
+                } label: { Image(systemName: "tray") }
+                    .buttonStyle(IconButtonStyle(size: 26))
+                    .help("Open Messages")
+            }
+            .padding(.horizontal, Space.lg)
+            .padding(.top, Space.md)
+            .padding(.bottom, Space.xs)
+
+            if items.isEmpty {
+                Text(integrations.isRefreshing ? "Checking Slack and Gmail…" : "Nothing waiting. New Slack messages and emails show up here.")
+                    .textStyle(.footnote)
+                    .foregroundStyle(Color.ink2)
+                    .padding(.horizontal, Space.lg)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 2) {
+                        ForEach(items) { item in
+                            MenuBarMessageRow(item: item, isNew: newIDs.contains(item.id)) {
+                                close()
+                                app.reveal(message: item.id)
+                            } add: {
+                                withAnimation(Motion.gentle) { _ = integrations.add(item) }
+                            }
+                        }
+                    }
+                    .padding(.horizontal, Space.sm)
+                    .padding(.bottom, Space.sm)
+                }
+            }
+        }
+    }
+}
+
+/// One message: where it's from, who and where, when, and two lines of it.
+private struct MenuBarMessageRow: View {
+    let item: Suggestion
+    let isNew: Bool
+    var open: () -> Void
+    var add: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: Space.sm) {
+            SourceIcon(kind: item.source.kind)
+                .frame(width: 14)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    if isNew {
+                        Circle().fill(Color.ink).frame(width: 6, height: 6)
+                            .alignmentGuide(.firstTextBaseline) { d in d[.bottom] }
+                            .accessibilityLabel("New")
+                    }
+                    Text(MessageAlerts.title(for: item))
+                        .font(.system(size: 13, weight: isNew ? .bold : .semibold))
+                        .foregroundStyle(Color.ink)
+                        .lineLimit(1)
+                    Spacer(minLength: Space.xs)
+                    if hovering {
+                        Button(action: add) { Image(systemName: "plus") }
+                            .buttonStyle(IconButtonStyle(size: 22))
+                            .help("Add task")
+                    } else {
+                        Text(Fmt.dateTime(item.receivedAt))
+                            .font(.system(size: 11, weight: .semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(Color.ink3)
+                            .lineLimit(1)
+                            .fixedSize()
+                    }
+                }
+                .frame(height: 22)
+                Text(MenuBarMessageList.snippet(item))
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(Color.ink2)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .hoverHighlight(cornerRadius: Radius.md)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .onTapGesture(perform: open)
+        .help("Open in Messages")
     }
 }
 

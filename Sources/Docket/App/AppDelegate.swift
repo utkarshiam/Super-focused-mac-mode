@@ -32,6 +32,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
         focus.store = store
         focus.alarms = alarms
+        // New-message notifications wait for a focus session to end.
+        Integrations.shared.isFocusing = { [weak focus] in focus?.isActive ?? false }
         alarms.store = store
         alarms.app = app
         alarms.focus = focus
@@ -62,6 +64,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             .store(in: &cancellables)
         focus.objectWillChange
             .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.statusItem.refresh() }
+            .store(in: &cancellables)
+        // New messages put a dot on the menu bar icon; handling them takes it off.
+        Integrations.shared.$newMessageIDs.combineLatest(Integrations.shared.$suggestions)
+            .debounce(for: .milliseconds(200), scheduler: RunLoop.main)
             .sink { [weak self] _ in self?.statusItem.refresh() }
             .store(in: &cancellables)
         NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)

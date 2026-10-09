@@ -18,6 +18,10 @@ final class NotificationService: NSObject, ObservableObject {
         static let alarm = "ALARM"
         static let briefing = "BRIEFING"
         static let focus = "FOCUS"
+        /// A new Slack message or email: Add task, Dismiss.
+        static let message = "MESSAGE"
+        /// Several new messages at once.
+        static let messages = "MESSAGES"
     }
 
     enum Action {
@@ -25,6 +29,8 @@ final class NotificationService: NSObject, ObservableObject {
         static let snooze10 = "SNOOZE_10"
         static let snooze60 = "SNOOZE_60"
         static let tomorrow = "TOMORROW"
+        static let addTask = "ADD_TASK"
+        static let dismiss = "DISMISS"
     }
 
     /// UNUserNotificationCenter crashes when the binary isn't inside an .app bundle (e.g. `swift run`).
@@ -50,6 +56,11 @@ final class NotificationService: NSObject, ObservableObject {
             UNNotificationCategory(identifier: Category.alarm, actions: actions, intentIdentifiers: []),
             UNNotificationCategory(identifier: Category.briefing, actions: [], intentIdentifiers: []),
             UNNotificationCategory(identifier: Category.focus, actions: [], intentIdentifiers: []),
+            UNNotificationCategory(identifier: Category.message,
+                                   actions: [UNNotificationAction(identifier: Action.addTask, title: "Add task"),
+                                             UNNotificationAction(identifier: Action.dismiss, title: "Dismiss")],
+                                   intentIdentifiers: []),
+            UNNotificationCategory(identifier: Category.messages, actions: [], intentIdentifiers: []),
         ])
         requestAuthorization()
     }
@@ -203,6 +214,35 @@ final class NotificationService: NSObject, ObservableObject {
         center.add(UNNotificationRequest(identifier: "n|\(UUID())", content: content, trigger: nil))
     }
 
+    /// The notification identifier of a message's notification ("m|slack:C0LEAD/1712345678.000100").
+    static func messageIdentifier(_ itemID: String) -> String { "m|\(itemID)" }
+
+    /// New Slack messages and emails (`MessageAlerts.plan`): each opens its message in Docket when clicked.
+    func deliverMessages(_ alerts: [MessageAlert]) {
+        guard let center else { return }
+        for alert in alerts {
+            let content = UNMutableNotificationContent()
+            content.title = alert.title
+            content.body = alert.body
+            content.sound = .default
+            content.threadIdentifier = alert.threadID
+            if let id = alert.itemID {
+                content.categoryIdentifier = Category.message
+                content.userInfo = ["messageID": id]
+            } else {
+                content.categoryIdentifier = Category.messages
+            }
+            let identifier = alert.itemID.map(Self.messageIdentifier) ?? "m|summary|\(UUID())"
+            center.add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
+        }
+    }
+
+    /// Takes back the notifications of messages handled since (added as a task or dismissed).
+    func removeDeliveredMessages(_ itemIDs: [String]) {
+        guard let center, !itemIDs.isEmpty else { return }
+        center.removeDeliveredNotifications(withIdentifiers: itemIDs.map(Self.messageIdentifier))
+    }
+
     /// Clears a delivered alarm banner once the alarm window has taken over.
     func removeDelivered(forTask id: UUID) {
         guard let center else { return }
@@ -214,8 +254,11 @@ final class NotificationService: NSObject, ObservableObject {
 
     // MARK: Actions
 
-    fileprivate func handle(action: String, taskID: UUID?, isAlarm: Bool, category: String) {
+    fileprivate func handle(action: String, taskID: UUID?, isAlarm: Bool, category: String, messageID: String?) {
         guard let store, let app else { return }
+        if category == Category.message || category == Category.messages {
+            return handleMessage(action: action, id: messageID, app: app)
+        }
         switch action {
         case Action.complete:
             if let id = taskID { store.setCompleted(id, true) }
@@ -235,6 +278,23 @@ final class NotificationService: NSObject, ObservableObject {
             } else {
                 app.showMainWindow()
             }
+        default:
+            break
+        }
+    }
+
+    /// A message's notification: open it in Messages, add it as a task, or dismiss it. One that was handled
+    /// meanwhile just opens Messages.
+    private func handleMessage(action: String, id: String?, app: AppState) {
+        let integrations = Integrations.shared
+        let item = id.flatMap { integrations.suggestion($0) }
+        switch action {
+        case Action.addTask:
+            if let item { integrations.add(item) }
+        case Action.dismiss:
+            if let item { integrations.dismiss(item) }
+        case UNNotificationDefaultActionIdentifier:
+            app.reveal(message: item?.id)
         default:
             break
         }
@@ -263,10 +323,11 @@ extension NotificationService: UNUserNotificationCenterDelegate {
         let content = response.notification.request.content
         let taskID = (content.userInfo["taskID"] as? String).flatMap(UUID.init(uuidString:))
         let isAlarm = content.userInfo["isAlarm"] as? Bool ?? false
+        let messageID = content.userInfo["messageID"] as? String
         let action = response.actionIdentifier
         let category = content.categoryIdentifier
         Task { @MainActor in
-            NotificationService.shared.handle(action: action, taskID: taskID, isAlarm: isAlarm, category: category)
+            NotificationService.shared.handle(action: action, taskID: taskID, isAlarm: isAlarm, category: category, messageID: messageID)
             completionHandler()
         }
     }

@@ -124,8 +124,29 @@ struct SuggestionsView: View {
                 .environmentObject(store)
                 .environmentObject(app)
         }
-        .onAppear { inbox.startWatchingKeys(app: app) }
+        .onAppear {
+            inbox.startWatchingKeys(app: app)
+            revealRequested()
+        }
         .onDisappear { inbox.stopWatchingKeys() }
+        .onChange(of: app.messageToReveal) { _ in revealRequested() }
+    }
+
+    /// Opens the message a notification or the menu bar asked for: in this tab when it shows there, else in
+    /// All; with Starred on and the message not starred, the filter goes off.
+    private func revealRequested() {
+        guard let id = app.messageToReveal else { return }
+        app.messageToReveal = nil
+        guard let item = integrations.suggestion(id) else { return }
+        let tab = InboxReveal.tab(for: item.source.kind, current: currentTab)
+        if tab != currentTab { tabName = tab.rawValue }
+        if inbox.isStarredOnly(tab), !item.isStarred { inbox.setStarredOnly(false, for: tab) }
+        inbox.select(item.id, in: tab)
+        // After the tab's panes appear (they start on the list in a narrow window).
+        DispatchQueue.main.async {
+            inbox.select(item.id, in: tab)
+            if inbox.isNarrow { withAnimation(Motion.snappy) { inbox.showsDetail = true } }
+        }
     }
 
     /// The tab picked last; before any was picked, All when Slack and Gmail are both in use, else the one that is.
@@ -862,6 +883,8 @@ private struct GmailConnection: View {
 private struct SuggestionSettings: View {
     @ObservedObject var integrations: Integrations
     let aiOn: Bool
+    @AppStorage(Prefs.Key.checkMessagesOften) private var checksOften = true
+    @AppStorage(Prefs.Key.notifyNewMessages) private var notifies = true
 
     var body: some View {
         SettingsSection(title: "Suggestions",
@@ -874,6 +897,14 @@ private struct SuggestionSettings: View {
                     .disabled(integrations.isRefreshing)
                     .help("Check Slack and Gmail now")
             }
+            ToggleRow(title: "Check Slack and email every 2 minutes",
+                      subtitle: "A quick look for new messages while your Mac is awake and unlocked. Off: every 15 minutes.",
+                      isOn: $checksOften)
+                .help("Look for new Slack messages and emails every 2 minutes")
+            ToggleRow(title: "Notify me about new messages",
+                      subtitle: "A notification for each new message someone sends you (one summary for more than 3). Held during a focus session.",
+                      isOn: $notifies)
+                .help("Show a notification when a new Slack message or email comes in")
             SettingsRow(title: "Sort with AI",
                         subtitle: aiOn ? "Gemini picks out what needs you and writes the task."
                             : "Turn on AI in Settings → AI (it needs a Gemini API key) to use this.",
@@ -884,7 +915,7 @@ private struct SuggestionSettings: View {
     }
 
     private var checkedSubtitle: String {
-        var text = "Every 15 minutes, and when you come back to Docket."
+        var text = checksOften ? "Every 2 minutes, and when you come back to Docket." : "Every 15 minutes, and when you come back to Docket."
         if let last = integrations.lastRefresh {
             text += Calendar.current.isDateInToday(last) ? " Last checked \(Fmt.time(last))." : " Last checked \(Fmt.dateTime(last))."
         }

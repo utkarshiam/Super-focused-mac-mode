@@ -56,6 +56,14 @@ enum InboxTab: String, CaseIterable, Hashable {
     }
 }
 
+/// Which tab opens a message asked for from outside Messages (a notification, the menu bar).
+enum InboxReveal {
+    /// The tab on screen when the message shows there, else All.
+    static func tab(for kind: TaskSource.Kind, current: InboxTab) -> InboxTab {
+        current.includes(kind) ? current : .all
+    }
+}
+
 /// Where a message comes from, as the small icon before its sender says it.
 enum InboxSource {
     static func icon(_ kind: TaskSource.Kind) -> String { SourceStyle.icon(kind) }
@@ -743,7 +751,7 @@ private struct InboxList: View {
 }
 
 /// Where a message comes from: # for Slack, an envelope for email, small and quiet before its sender.
-private struct SourceIcon: View {
+struct SourceIcon: View {
     let kind: TaskSource.Kind
     var size: CGFloat = 11
 

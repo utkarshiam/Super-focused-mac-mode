@@ -54,7 +54,8 @@ final class QuickCapturePanel: FloatingPanel {}
 final class StatusItemController: NSObject {
     private weak var delegate: AppDelegate?
     private var item: NSStatusItem?
-    private let panel = FloatingPanel(size: NSSize(width: 370, height: 540))
+    /// Sized on every open to the screen it opens on (`MenuBarPanelLayout`).
+    private let panel = FloatingPanel(size: NSSize(width: MenuBarPanelLayout.width, height: 540))
     private var clockTimer: Timer?
 
     init(delegate: AppDelegate) {
@@ -64,12 +65,17 @@ final class StatusItemController: NSObject {
 
     /// Built fresh on every open so it always matches the current light/dark appearance
     /// (a hidden panel's SwiftUI content can miss appearance changes).
+    /// The messages that are new show as new in this opening of the panel; then they count as seen.
     private func rebuildContent() {
         guard let delegate else { return }
-        panel.contentView = NSHostingView(rootView: MenuBarView(close: { [weak self] in self?.panel.hide() })
+        let integrations = Integrations.shared
+        let newIDs = integrations.newMessageIDs
+        panel.contentView = NSHostingView(rootView: MenuBarView(height: panel.frame.height, newMessageIDs: newIDs,
+                                                                close: { [weak self] in self?.panel.hide() })
             .environmentObject(delegate.store)
             .environmentObject(delegate.app)
             .environmentObject(delegate.focus))
+        integrations.markMessagesSeen()
     }
 
     func setVisible(_ visible: Bool) {
@@ -100,9 +106,12 @@ final class StatusItemController: NSObject {
             let count = delegate.store.todayTasks().count
             if Prefs.menuBarShowsCount, count > 0 { title = "\(count)" }
         }
+        // A dot on the icon for messages that came in since the panel was last opened.
+        let newMessages = Integrations.shared.newMessageCount
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Docket")
         image?.isTemplate = true
-        button.image = image
+        button.image = newMessages > 0 ? image.map(Self.withDot) : image
+        button.toolTip = newMessages > 0 ? "Docket · \(Fmt.plural(newMessages, "new message"))" : "Docket"
         button.attributedTitle = NSAttributedString(
             string: title.isEmpty ? "" : " " + title,
             attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .medium)]
@@ -134,27 +143,44 @@ final class StatusItemController: NSObject {
         }
     }
 
+    /// The full height of the screen the icon is on, under the icon.
     private func showPanel(below button: NSStatusBarButton) {
         guard let buttonWindow = button.window else { return }
         let anchor = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
-        let screen = buttonWindow.screen ?? NSScreen.main
-        let size = panel.frame.size
-        var x = anchor.midX - size.width / 2
-        if let frame = screen?.visibleFrame {
-            x = min(max(x, frame.minX + 8), frame.maxX - size.width - 8)
-        }
-        panel.setFrameOrigin(NSPoint(x: x, y: anchor.minY - size.height - 6))
+        guard let visible = (buttonWindow.screen ?? NSScreen.main)?.visibleFrame else { return }
+        panel.setFrame(MenuBarPanelLayout.frame(visibleFrame: visible, anchorMidX: anchor.midX, anchorMinY: anchor.minY), display: false)
         delegate?.app.clock = Date()
         rebuildContent()
         panel.makeKeyAndOrderFront(nil)
+        refresh()
     }
 
     /// Snapshot mode only: shows the dropdown even when the status item isn't on screen.
     func debugShow() {
-        guard let frame = NSScreen.main?.visibleFrame else { return }
-        panel.setFrameOrigin(NSPoint(x: frame.maxX - panel.frame.width - 20, y: frame.maxY - panel.frame.height - 6))
+        guard let visible = NSScreen.main?.visibleFrame else { return }
+        let midX = visible.maxX - MenuBarPanelLayout.width / 2 - 20
+        panel.setFrame(MenuBarPanelLayout.frame(visibleFrame: visible, anchorMidX: midX), display: false)
         rebuildContent()
         panel.makeKeyAndOrderFront(nil)
+    }
+
+    /// The icon with a small dot at its top right (cut out of the symbol, so it reads at menu bar size).
+    private static func withDot(_ base: NSImage) -> NSImage {
+        let size = NSSize(width: base.size.width + 3, height: base.size.height)
+        let image = NSImage(size: size, flipped: false) { _ in
+            base.draw(in: NSRect(x: 0, y: (size.height - base.size.height) / 2, width: base.size.width, height: base.size.height))
+            let d: CGFloat = 6
+            let dot = NSRect(x: size.width - d, y: size.height - d, width: d, height: d)
+            NSGraphicsContext.current?.compositingOperation = .clear
+            NSBezierPath(ovalIn: dot.insetBy(dx: -1.5, dy: -1.5)).fill()
+            NSGraphicsContext.current?.compositingOperation = .sourceOver
+            NSColor.black.setFill()
+            NSBezierPath(ovalIn: dot).fill()
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = "Docket, new messages"
+        return image
     }
 
     private func showContextMenu() {

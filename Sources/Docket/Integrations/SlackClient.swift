@@ -278,6 +278,28 @@ struct SlackClient: Sendable {
     struct DirectMessages: Sendable {
         var messages: [SlackMessage] = []
         var missingScopes: Set<String> = []
+        /// What was seen in each conversation read (and kept for the ones skipped as unchanged), to pass back as
+        /// `seen` next time.
+        var seen: [String: DirectMessageMark] = [:]
+    }
+
+    /// The last thing seen in one DM or group DM: the newest message's ts read there, and Slack's `updated` for
+    /// it then. A check given these reads only conversations with something newer, and only what's newer.
+    struct DirectMessageMark: Hashable, Sendable {
+        var ts: String?
+        var updated: Double?
+
+        /// Nothing new since this mark, as far as Slack's listing tells: its `latest` isn't newer than the ts
+        /// seen, or (without a `latest`) its `updated` hasn't moved. A conversation listed with neither (Slack
+        /// leaves both out for most DMs) is always read, from the ts seen on.
+        func isUnchanged(latest: String?, updated: Double?) -> Bool {
+            if let latest {
+                guard let ts else { return false }
+                return SlackClient.compare(latest, ts) <= 0
+            }
+            if let updated, let seen = self.updated { return updated == seen }
+            return false
+        }
     }
 
     /// Conversations whose history one check reads at most (one conversations.history call each).
@@ -294,8 +316,13 @@ struct SlackClient: Sendable {
     ///
     /// A conversation Slack won't read for want of a permission is skipped and its permission listed in
     /// `missingScopes`; one that's gone is skipped. Signing out and long rate limits throw as usual.
+    ///
+    /// `seen` (from the last check's `DirectMessages.seen`) makes it lighter, for checks every few minutes: a
+    /// conversation with nothing new since (`DirectMessageMark.isUnchanged`) isn't read, and one that is read
+    /// returns only messages after the one seen last. Without it, everything since `since` is read.
     func directMessages(of userID: String, since: Date, kinds: Set<String> = ["im", "mpim"],
-                        checks: Int = directMessageChecks, pages: Int = 5) async throws -> DirectMessages {
+                        checks: Int = directMessageChecks, pages: Int = 5,
+                        seen: [String: DirectMessageMark]? = nil) async throws -> DirectMessages {
         let types = ["im", "mpim"].filter(kinds.contains)
         guard !types.isEmpty, checks > 0 else { return DirectMessages() }
         var listed: [RawChannel] = []
@@ -309,18 +336,30 @@ struct SlackClient: Sendable {
             cursor = next
         }
 
-        let chosen = Self.directConversations(listed, me: userID, since: since, limit: checks)
-        let oldest = String(format: "%.6f", since.timeIntervalSince1970)
-        let outcomes = await IntegrationHTTP.concurrentMap(chosen, limit: 4) { conversation in
-            await self.newestDirectMessage(in: conversation, me: userID, oldest: oldest, since: since)
-        }
         var found = DirectMessages()
-        for outcome in outcomes {
+        var candidates = Self.directConversations(listed, me: userID, since: since)
+        if let seen {
+            candidates = candidates.filter { c in
+                guard let mark = seen[c.channel.id], mark.isUnchanged(latest: c.latest, updated: c.updated) else { return true }
+                found.seen[c.channel.id] = mark
+                return false
+            }
+        }
+        let chosen = Array(candidates.prefix(max(0, checks)))
+        let since = since
+        let outcomes = await IntegrationHTTP.concurrentMap(chosen, limit: 4) { c in
+            // Only what came after the message seen last, when that's later than the window's start.
+            var oldest = String(format: "%.6f", since.timeIntervalSince1970)
+            if let ts = seen?[c.channel.id]?.ts, SlackClient.compare(ts, oldest) > 0 { oldest = ts }
+            return (c, await self.newestDirectMessage(in: c.channel, me: userID, oldest: oldest, since: since))
+        }
+        for (c, outcome) in outcomes {
             switch outcome {
-            case .found(let message?):
-                found.messages.append(message)
-            case .found(nil):
-                break
+            case .found(let message, let newest):
+                if let message { found.messages.append(message) }
+                let previous = seen?[c.channel.id]?.ts
+                let ts = [newest, c.latest, previous].compactMap { $0 }.max { SlackClient.compare($0, $1) < 0 }
+                found.seen[c.channel.id] = DirectMessageMark(ts: ts, updated: c.updated)
             case .missing(let scope):
                 found.missingScopes.insert(scope)
             case .failed(let error):
@@ -336,7 +375,8 @@ struct SlackClient: Sendable {
 
     /// How reading one conversation went.
     private enum DirectOutcome: Sendable {
-        case found(SlackMessage?)
+        /// The message to suggest, if any, and the newest ts read in the conversation (anyone's).
+        case found(SlackMessage?, newest: String?)
         case missing(String)
         case failed(IntegrationError)
     }
@@ -353,28 +393,41 @@ struct SlackClient: Sendable {
                 let needed = refusal.needed.flatMap { $0.isEmpty ? nil : $0 } ?? (conversation.isGroupDM ? "mpim:history" : "im:history")
                 return .missing(needed)
             case "channel_not_found", "not_in_channel", "is_archived", "user_not_found", "user_disabled":
-                return .found(nil)
+                return .found(nil, newest: nil)
             default:
                 return .failed(Self.error(code: refusal.code, needed: refusal.needed))
             }
         } catch {
             return .failed(IntegrationError.wrap(error, .slack))
         }
-        guard let raw = Self.newestFromOthers((reply.messages ?? []).compactMap(\.value), me: me),
-              var message = SlackMessage(raw, channel: conversation.id, info: nil), message.date >= since else { return .found(nil) }
+        let messages = (reply.messages ?? []).compactMap(\.value)
+        let newest = messages.compactMap(\.ts).filter(Self.isTimestamp).max { Self.compare($0, $1) < 0 }
+        guard let raw = Self.newestFromOthers(messages, me: me),
+              var message = SlackMessage(raw, channel: conversation.id, info: nil), message.date >= since else {
+            return .found(nil, newest: newest)
+        }
         message.channelName = nil
         message.isDirect = conversation.isDirect
         message.isGroupDM = conversation.isGroupDM
-        return .found(message)
+        return .found(message, newest: newest)
     }
 
-    /// Which DMs and group DMs to read: not archived, not with a deactivated person, not your note-to-self. Those
-    /// whose newest message (`latest`, when Slack sends it) is since `since` come first, newest first; the
-    /// others by when they were last updated or created. At most `limit`.
-    fileprivate static func directConversations(_ listed: [RawChannel], me: String, since: Date, limit: Int) -> [SlackChannel] {
+    /// A DM or group DM worth reading, with what Slack's listing says about its activity.
+    fileprivate struct ListedConversation: Sendable {
+        var channel: SlackChannel
+        /// The newest message's ts, when Slack sends it.
+        var latest: String?
+        /// Slack's `updated`, when it sends it (group DMs, mostly).
+        var updated: Double?
+    }
+
+    /// Which DMs and group DMs to read, in order: not archived, not with a deactivated person, not your
+    /// note-to-self. Those whose newest message (`latest`, when Slack sends it) is since `since` come first,
+    /// newest first; the others by when they were last updated or created. The caller reads the first few.
+    fileprivate static func directConversations(_ listed: [RawChannel], me: String, since: Date) -> [ListedConversation] {
         var seen = Set<String>()
-        var recent: [(SlackChannel, TimeInterval)] = []
-        var unknown: [(SlackChannel, TimeInterval)] = []
+        var recent: [(ListedConversation, TimeInterval)] = []
+        var unknown: [(ListedConversation, TimeInterval)] = []
         let cutoff = since.timeIntervalSince1970
         for raw in listed {
             guard let channel = raw.channel, seen.insert(channel.id).inserted, raw.isArchived != true, raw.isUserDeleted != true,
@@ -382,14 +435,14 @@ struct SlackClient: Sendable {
             var conversation = channel
             // users.conversations names a DM after the person's id; the name isn't used for DMs.
             conversation.isDirect = raw.isDirect && !raw.isGroupDM
+            let listedOne = ListedConversation(channel: conversation, latest: raw.latestTS, updated: raw.updated)
             if let latest = raw.latestTS.flatMap(TimeInterval.init) {
-                if latest >= cutoff { recent.append((conversation, latest)) }
+                if latest >= cutoff { recent.append((listedOne, latest)) }
             } else {
-                unknown.append((conversation, max(raw.created.map(Self.seconds) ?? 0, raw.updated.map(Self.seconds) ?? 0)))
+                unknown.append((listedOne, max(raw.created.map(Self.seconds) ?? 0, raw.updated.map(Self.seconds) ?? 0)))
             }
         }
-        let ordered = recent.sorted { $0.1 > $1.1 } + unknown.sorted { $0.1 > $1.1 }
-        return ordered.prefix(max(0, limit)).map(\.0)
+        return (recent.sorted { $0.1 > $1.1 } + unknown.sorted { $0.1 > $1.1 }).map(\.0)
     }
 
     /// Slack's times in seconds: `created` is in seconds, `updated` in milliseconds.

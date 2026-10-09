@@ -121,11 +121,22 @@ final class AppState: ObservableObject {
     /// Tasks that were just ticked stay visible for a moment so the list doesn't jump.
     @Published private(set) var recentlyCompleted: Set<UUID> = []
 
+    /// A message to open in Messages (`Suggestion.id`), from a notification or the menu bar panel. Messages
+    /// opens it, switching tabs if need be, then clears it.
+    @Published var messageToReveal: String?
+
     var showMainWindow: () -> Void = {}
     var showSettings: () -> Void = {}
     var showQuickCapture: () -> Void = {}
 
     private var toastWork: DispatchWorkItem?
+
+    /// Opens Messages, on the message `id` when it's still there.
+    func reveal(message id: String?) {
+        selection = .suggestions
+        messageToReveal = id
+        showMainWindow()
+    }
 
     func reveal(task id: UUID, in store: Store) {
         guard let t = store.task(id) else { return }
