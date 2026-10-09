@@ -212,7 +212,8 @@ enum MenuBarMessageList {
     /// The row's two lines of text: a Slack message's words; an email's subject, then its preview.
     static func snippet(_ s: Suggestion) -> String {
         let text = s.snippet.split(whereSeparator: \.isWhitespace).joined(separator: " ")
-        guard s.source.kind == .gmail else { return text }
+        // Slack: readable text, not *markup* or :shortcodes: (the same rendering the Messages screen uses).
+        guard s.source.kind == .gmail else { return String(SlackText.attributed(text, names: [:]).characters) }
         let subject = MailText.cleanSubject(s.subject ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         return [subject, text].filter { !$0.isEmpty }.joined(separator: " — ")
     }

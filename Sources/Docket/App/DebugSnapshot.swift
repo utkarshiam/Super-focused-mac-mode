@@ -172,6 +172,7 @@ enum DebugSnapshot {
             }),
             ("35b-inbox-email", { UserDefaults.standard.set(TaskSource.Kind.gmail.rawValue, forKey: SuggestionsView.tabKey) }),
             ("35c-inbox-all", { UserDefaults.standard.set("all", forKey: SuggestionsView.tabKey) }),
+            ("35d-menubar-messages", { d.debugShowMenuBarPanel() }),
             ("36-waiting", {
                 var sow = TaskItem(title: "Get the signed SOW back from Northwind")
                 sow.waitingOn = "Priya"
