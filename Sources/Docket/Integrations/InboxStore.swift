@@ -1,7 +1,7 @@
 import Foundation
 import UniformTypeIdentifiers
 
-// MARK: - The Slack and Email tabs
+// MARK: - The All, Slack and Email tabs
 
 /// What the inbox shows and does with a message: each tab's items, the complete message and its whole thread,
 /// stars, attachments, the user's notes, and replies (to it or to any message of its thread).
@@ -18,8 +18,18 @@ extension Integrations {
     /// One tab's items (Slack or Gmail): the starred ones first, each part newest first. With `starredOnly`,
     /// just the starred ones (the tab's Starred filter).
     func items(_ kind: TaskSource.Kind, starredOnly: Bool = false) -> [Suggestion] {
-        suggestions.filter { $0.source.kind == kind && (!starredOnly || $0.isStarred) }
-            .sorted { ($0.isStarred ? 1 : 0, $0.receivedAt, $0.id) > ($1.isStarred ? 1 : 0, $1.receivedAt, $1.id) }
+        Self.inboxOrder(suggestions.filter { $0.source.kind == kind && (!starredOnly || $0.isStarred) })
+    }
+
+    /// The All tab: Slack messages and emails together, in the same order as one tab (starred first, each
+    /// part newest first). With `starredOnly`, just the starred ones.
+    func allItems(starredOnly: Bool = false) -> [Suggestion] {
+        Self.inboxOrder(suggestions.filter { ($0.source.kind == .slack || $0.source.kind == .gmail) && (!starredOnly || $0.isStarred) })
+    }
+
+    /// Starred first, then newest first (ties by id, so the order never jumps).
+    private static func inboxOrder(_ items: [Suggestion]) -> [Suggestion] {
+        items.sorted { ($0.isStarred ? 1 : 0, $0.receivedAt, $0.id) > ($1.isStarred ? 1 : 0, $1.receivedAt, $1.id) }
     }
 
     /// The item with this id, if it's still in the inbox.

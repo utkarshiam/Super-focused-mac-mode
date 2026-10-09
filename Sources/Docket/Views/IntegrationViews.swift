@@ -93,7 +93,7 @@ enum InboxStatus {
     }
 }
 
-/// Sidebar "Messages": the Slack messages and emails that need you, in two tabs. A message opens complete
+/// Sidebar "Messages": the Slack messages and emails that need you, together (All) or in a tab each. A message opens complete
 /// (its files and earlier messages), with one row of actions: add the suggested task, reply, note, dismiss.
 struct SuggestionsView: View {
     @EnvironmentObject var store: Store
@@ -101,7 +101,7 @@ struct SuggestionsView: View {
     @ObservedObject private var integrations = Integrations.shared
     @ObservedObject private var ai = AIService.shared
     @AppStorage(Prefs.Key.aiEnabled) private var aiEnabled = true
-    /// The tab, remembered across launches: "slack" or "gmail" (empty until one is picked).
+    /// The tab, remembered across launches: "all", "slack" or "gmail" (an `InboxTab`; empty until one is picked).
     @AppStorage(SuggestionsView.tabKey) private var tabName = ""
     @StateObject private var inbox = InboxModel()
     @State private var sheet: ConnectionsSheet.Opening?
@@ -114,7 +114,7 @@ struct SuggestionsView: View {
             header(tab)
             InboxBanners()
             Rectangle().fill(Color.hair).frame(height: 1)
-            InboxPanes(model: inbox, kind: tab, connect: { sheet = .plain }, updateSlack: updateSlack)
+            InboxPanes(model: inbox, tab: tab, connect: { sheet = .plain }, updateSlack: updateSlack)
                 .id(tab)
                 .transition(.opacity)
         }
@@ -128,16 +128,15 @@ struct SuggestionsView: View {
         .onDisappear { inbox.stopWatchingKeys() }
     }
 
-    /// The tab picked last; before any was picked, Slack unless only Gmail has something.
-    private var currentTab: TaskSource.Kind {
-        if let kind = TaskSource.Kind(rawValue: tabName), kind != .ai { return kind }
+    /// The tab picked last; before any was picked, All when Slack and Gmail are both in use, else the one that is.
+    private var currentTab: InboxTab {
         let slack = integrations.isSlackConnected || integrations.suggestions.contains { $0.source.kind == .slack }
         let gmail = integrations.isGmailConnected || integrations.suggestions.contains { $0.source.kind == .gmail }
-        return gmail && !slack ? .gmail : .slack
+        return InboxTab.current(stored: tabName, slack: slack, gmail: gmail)
     }
 
-    private func count(_ kind: TaskSource.Kind) -> Int {
-        integrations.suggestions.lazy.filter { $0.source.kind == kind }.count
+    private func count(_ tab: InboxTab) -> Int {
+        integrations.suggestions.lazy.filter { tab.includes($0.source.kind) }.count
     }
 
     /// Opens Slack's "Create an app" with the new permissions, and the two steps that finish the update.
@@ -163,7 +162,7 @@ struct SuggestionsView: View {
     // MARK: Header
 
     /// "Messages" over the status line, the tabs, refresh and ⋯ on the right (under, when it's narrow).
-    private func header(_ tab: TaskSource.Kind) -> some View {
+    private func header(_ tab: InboxTab) -> some View {
         ViewThatFits(in: .horizontal) {
             HStack(alignment: .center, spacing: Space.md) {
                 titleBlock
@@ -276,11 +275,11 @@ struct SuggestionsView: View {
         }
     }
 
-    private func headerControls(_ tab: TaskSource.Kind) -> some View {
+    private func headerControls(_ tab: InboxTab) -> some View {
         HStack(spacing: Space.sm) {
             SegmentedControl(selection: Binding(get: { tab }, set: { tabName = $0.rawValue }),
-                             options: [(TaskSource.Kind.slack, "Slack (\(count(.slack)))"), (TaskSource.Kind.gmail, "Email (\(count(.gmail)))")])
-                .help("Slack messages or emails")
+                             options: InboxTab.allCases.map { ($0, "\($0.title) (\(count($0)))") })
+                .help("Slack messages and emails together, or one at a time")
             if integrations.isAnyConnected {
                 Button { integrations.refresh() } label: {
                     if integrations.isRefreshing {

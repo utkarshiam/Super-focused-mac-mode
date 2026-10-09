@@ -126,6 +126,21 @@ struct SlackClient: Sendable {
         }
     }
 
+    /// One page of a paginated method. Slack sometimes refuses its own cursor for a later page
+    /// ("invalid_cursor": it expired, or the list changed under it). That page returns nil so the caller
+    /// keeps the pages it already has instead of failing the whole refresh. On the first page it's an error.
+    func page<Reply: Decodable>(_ method: String, _ params: [(String, String)], cursor: String?, as type: Reply.Type) async throws -> Reply? {
+        do {
+            return try await perform(method, params, as: type).0
+        } catch let refusal as Refusal {
+            if refusal.code == "invalid_cursor", cursor != nil {
+                NSLog("Docket: Slack refused the next page of %@ (invalid_cursor); keeping the pages so far", method)
+                return nil
+            }
+            throw Self.error(code: refusal.code, needed: refusal.needed)
+        }
+    }
+
     /// Slack turned a call down (`"ok": false`): its error code, before it's put in plain words.
     struct Refusal: Error, Equatable {
         var code: String
@@ -230,7 +245,7 @@ struct SlackClient: Sendable {
         for _ in 0..<pages {
             var params = [("user", userID), ("full", "true"), ("limit", "100")]
             if let cursor { params.append(("cursor", cursor)) }
-            let (reply, _) = try await call("reactions.list", params, as: ReactionsReply.self)
+            guard let reply = try await page("reactions.list", params, cursor: cursor, as: ReactionsReply.self) else { break }
             for item in (reply.items ?? []).compactMap(\.value) {
                 guard item.type == "message", let channel = item.channel?.id, let raw = item.message,
                       raw.hasReaction(emoji, by: userID),
@@ -267,7 +282,7 @@ struct SlackClient: Sendable {
         for _ in 0..<pages {
             var params = [("types", "public_channel,private_channel"), ("exclude_archived", "true"), ("limit", "200")]
             if let cursor { params.append(("cursor", cursor)) }
-            let (reply, _) = try await call("users.conversations", params, as: ConversationsReply.self)
+            guard let reply = try await page("users.conversations", params, cursor: cursor, as: ConversationsReply.self) else { break }
             result += (reply.channels ?? []).compactMap(\.value).compactMap(\.channel)
                 .filter { $0.isMember && !$0.isArchived && !$0.isDirect && !$0.isGroupDM }
             guard let next = reply.responseMetadata?.nextCursor, !next.isEmpty else { break }
@@ -382,6 +397,8 @@ extension SlackClient {
             do {
                 page = try await perform("conversations.replies", params, as: RepliesReply.self).0
             } catch let refusal as Refusal {
+                // A later page Slack won't continue: keep what came so far.
+                if refusal.code == "invalid_cursor", cursor != nil { break }
                 // The message, and with it the thread, was deleted.
                 if refusal.code == "thread_not_found" { return [] }
                 throw Self.error(code: refusal.code, needed: refusal.needed)
@@ -635,6 +652,7 @@ extension SlackClient {
             do {
                 page = try await perform("conversations.replies", params, as: RepliesReply.self).0
             } catch let refusal as Refusal {
+                if refusal.code == "invalid_cursor", cursor != nil { break }
                 if ["thread_not_found", "message_not_found"].contains(refusal.code) { throw Self.messageGone }
                 throw Self.error(code: refusal.code, needed: refusal.needed)
             }

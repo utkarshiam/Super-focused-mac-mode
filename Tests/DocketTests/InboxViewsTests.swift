@@ -413,6 +413,79 @@ final class InboxViewsTests: XCTestCase {
         XCTAssertEqual(model.items(.gmail, in: integrations).map(\.id), [email.id])
     }
 
+    // MARK: The All tab
+
+    func testAllShowsSlackAndEmailTogetherStarredFirstThenNewest() {
+        let starredSlack = slackItem("1791100000.000100", minutesAgo: 90, starred: true)
+        let starredEmail = emailItem("gmail:t2/m2", minutesAgo: 30, starred: true)
+        let newestSlack = slackItem("1791400000.000100", minutesAgo: 1)
+        let email = emailItem("gmail:t1/m1", minutesAgo: 15)
+        let olderSlack = slackItem("1791300000.000100", minutesAgo: 45)
+        var ai = Suggestion(source: TaskSource(kind: .ai, externalID: "ai:1", url: nil, label: "AI"), from: "AI", subject: nil,
+                            snippet: "", receivedAt: Date(), draft: nil, trigger: nil)
+        ai.isStarred = true
+        let integrations = integrations([email, olderSlack, starredSlack, ai, newestSlack, starredEmail])
+        let model = InboxModel(defaults: defaults())
+        XCTAssertEqual(model.items(.all, in: integrations).map(\.id),
+                       [starredEmail.id, starredSlack.id, newestSlack.id, email.id, olderSlack.id],
+                       "starred first, each part newest first, whichever service; never AI's own")
+        XCTAssertEqual(integrations.allItems().map(\.id), model.items(.all, in: integrations).map(\.id))
+        // Each one tab is the All list with only its own.
+        XCTAssertEqual(model.items(.slack, in: integrations).map(\.id), [starredSlack.id, newestSlack.id, olderSlack.id])
+        XCTAssertEqual(model.items(.gmail, in: integrations).map(\.id), [starredEmail.id, email.id])
+    }
+
+    func testAllHasItsOwnStarredFilterAndOpenMessage() {
+        let starredSlack = slackItem("1791100000.000100", minutesAgo: 90, starred: true)
+        let slack = slackItem("1791400000.000100", minutesAgo: 1)
+        let starredEmail = emailItem("gmail:t2/m2", minutesAgo: 30, starred: true)
+        let email = emailItem("gmail:t1/m1", minutesAgo: 15)
+        let integrations = integrations([slack, email, starredSlack, starredEmail])
+        let defaults = defaults()
+        let model = InboxModel(defaults: defaults)
+        model.setStarredOnly(true, for: .all)
+        XCTAssertEqual(model.items(.all, in: integrations).map(\.id), [starredEmail.id, starredSlack.id])
+        XCTAssertEqual(integrations.allItems(starredOnly: true).map(\.id), [starredEmail.id, starredSlack.id])
+        XCTAssertFalse(model.isStarredOnly(.slack))
+        XCTAssertFalse(model.isStarredOnly(.gmail))
+        XCTAssertEqual(model.items(.slack, in: integrations).map(\.id), [starredSlack.id, slack.id])
+        XCTAssertEqual(defaults.bool(forKey: "inboxStarredOnly.all"), true)
+        XCTAssertTrue(InboxModel(defaults: defaults).isStarredOnly(.all), "remembered across launches")
+
+        // Each tab keeps its own open message.
+        model.select(email.id, in: .all)
+        model.select(slack.id, in: .slack)
+        XCTAssertEqual(model.selected[.all], email.id)
+        XCTAssertEqual(model.selected[.slack], slack.id)
+        XCTAssertNil(model.selected[.gmail])
+    }
+
+    func testTheTabIsRememberedAndAllIsTheDefaultWhenBothAreInUse() {
+        // Remembered from before All: still good.
+        XCTAssertEqual(InboxTab.current(stored: "slack", slack: true, gmail: true), .slack)
+        XCTAssertEqual(InboxTab.current(stored: "gmail", slack: true, gmail: false), .gmail)
+        XCTAssertEqual(InboxTab.current(stored: "all", slack: false, gmail: true), .all)
+        // Nothing picked yet (or something Docket no longer has).
+        XCTAssertEqual(InboxTab.current(stored: "", slack: true, gmail: true), .all)
+        XCTAssertEqual(InboxTab.current(stored: "ai", slack: true, gmail: true), .all)
+        XCTAssertEqual(InboxTab.current(stored: "", slack: false, gmail: true), .gmail)
+        XCTAssertEqual(InboxTab.current(stored: "", slack: true, gmail: false), .slack)
+        XCTAssertEqual(InboxTab.current(stored: "", slack: false, gmail: false), .slack)
+
+        XCTAssertEqual(InboxTab.allCases, [.all, .slack, .gmail], "All comes first")
+        XCTAssertEqual(InboxTab.allCases.map(\.title), ["All", "Slack", "Email"])
+        XCTAssertNil(InboxTab.all.kind)
+        XCTAssertEqual(InboxTab.slack.kind, .slack)
+        XCTAssertEqual(InboxTab.gmail.kind, .gmail)
+        XCTAssertTrue(InboxTab.all.includes(.slack) && InboxTab.all.includes(.gmail))
+        XCTAssertFalse(InboxTab.all.includes(.ai))
+        XCTAssertFalse(InboxTab.slack.includes(.gmail))
+        XCTAssertEqual(InboxSource.icon(.slack), "number")
+        XCTAssertEqual(InboxSource.icon(.gmail), "envelope")
+        XCTAssertEqual(InboxSource.name(.slack), "Slack")
+        XCTAssertEqual(InboxSource.name(.gmail), "Email")
+    }
+
     // MARK: Permissions and signing in
 
     func testTheSlackBannerNamesWhatsMissing() {

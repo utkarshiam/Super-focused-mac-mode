@@ -446,7 +446,7 @@ final class MessagesToolsTests: XCTestCase {
 
     func testGmailStepsSpellOutTestUsersAndTheUnverifiedScreen() {
         var steps = SetupSteps.gmail(SetupSteps.GmailFacts(), ticked: [])
-        XCTAssertEqual(steps.map(\.id), ["gmail.project", "gmail.api", "gmail.consent", "gmail.testUsers", "gmail.client", "gmail.paste", "gmail.signIn"])
+        XCTAssertEqual(steps.map(\.id), ["gmail.project", "gmail.api", "gmail.consent", "gmail.testUsers", "gmail.client", "gmail.paste", "gmail.signIn", "gmail.publish"])
         let testUsers = steps[3]
         XCTAssertTrue(testUsers.detail?.contains("Access blocked") ?? false)
         XCTAssertEqual(testUsers.copies.map(\.kind), [.email])
@@ -461,6 +461,9 @@ final class MessagesToolsTests: XCTestCase {
         XCTAssertTrue(steps[6].title.contains("again"))
 
         steps = SetupSteps.gmail(SetupSteps.GmailFacts(hasClient: true, connected: true, canModify: true), ticked: [])
+        XCTAssertEqual(SetupSteps.current(steps), "gmail.publish", "connected, but Docket can't tell whether the app was published")
+        XCTAssertTrue(steps[7].detail?.contains("every 7 days") ?? false)
+        steps = SetupSteps.gmail(SetupSteps.GmailFacts(hasClient: true, connected: true, canModify: true), ticked: ["gmail.publish"])
         XCTAssertTrue(steps.allSatisfy(\.done))
 
         XCTAssertEqual(SetupSteps.ticked(SetupSteps.raw(["gmail.api", "gmail.project"])), ["gmail.api", "gmail.project"])

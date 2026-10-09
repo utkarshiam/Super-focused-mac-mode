@@ -109,6 +109,9 @@ enum SetupSteps {
             SetupStep(id: "gmail.signIn", title: f.connected ? "Sign in again to allow starring and replying" : "Sign in with Google",
                       detail: "Pick your account. Google will say the app isn't verified: click Continue. Tick every box it shows, then Continue.",
                       verifiable: true),
+            SetupStep(id: "gmail.publish", title: "Keep Gmail signed in: publish the app",
+                      detail: "On the Audience page, click Publish app, then Confirm. Until you do, Google signs Docket out every 7 days. (You'll still see the “isn't verified” notice when signing in. That's fine for your own app.)",
+                      link: audiencePage, linkTitle: "Open Audience"),
         ]
         return resolve(steps, verified: ["gmail.paste": f.hasClient || f.connected, "gmail.signIn": f.connected && f.canModify], ticked: ticked)
     }

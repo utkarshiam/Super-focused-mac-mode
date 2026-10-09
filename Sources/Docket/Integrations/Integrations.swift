@@ -146,7 +146,7 @@ enum IntegrationError: LocalizedError, Equatable {
         case .signedOut(.slack):
             "Slack no longer accepts Docket's token. Paste a new one in Settings → Connections."
         case .signedOut:
-            "Google signed Docket out of Gmail. Connect it again in Settings → Connections. (Google signs out apps in testing after 7 days.)"
+            "Google signed Docket out of Gmail. While your Google app is in Testing, Google does this every 7 days: click Publish app on its Audience page once to stop it, then connect again in Settings → Connections."
         case .missingPermission(.slack, let scope) where Self.isStarScope(scope):
             "Docket needs one more Slack permission to save messages for later in Slack. Update the Docket app in Settings → Connections."
         case .missingPermission(.slack, let scope) where Self.isContentScope(scope):

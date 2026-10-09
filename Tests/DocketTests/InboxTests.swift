@@ -1656,6 +1656,10 @@ final class InboxTests: XCTestCase {
         XCTAssertEqual(integrations.items(.gmail).map(\.id), ["gmail:t1/m1", "gmail:t2/m2"])
         XCTAssertEqual(integrations.items(.gmail, starredOnly: true).map(\.id), ["gmail:t1/m1"])
         XCTAssertTrue(integrations.items(.ai, starredOnly: true).isEmpty)
+        // All: both together, by the same rule.
+        XCTAssertEqual(integrations.allItems().map(\.id),
+                       ["gmail:t1/m1", "slack:C0LEAD/2", "slack:C0LEAD/3", "slack:D0DM/4", "gmail:t2/m2", "slack:C0LEAD/1"])
+        XCTAssertEqual(integrations.allItems(starredOnly: true).map(\.id), ["gmail:t1/m1", "slack:C0LEAD/2", "slack:C0LEAD/3"])
     }
 
     func testAStarShowsAtOnceReachesGmailAndIsSaved() async throws {

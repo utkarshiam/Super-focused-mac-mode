@@ -5,11 +5,70 @@ import Quartz
 import SwiftUI
 import UniformTypeIdentifiers
 
-// The Slack and Email tabs of "Messages": the message list (All · Starred, ☆ and S) and the message
+// The All, Slack and Email tabs of "Messages": the message list (All · Starred, ☆ and S) and the message
 // detail (header, the whole thread or conversation from ConversationViews.swift with each message's files,
 // notes, the suggested task and the reply). `SuggestionsView` in IntegrationViews.swift stays the entry point.
 
 // MARK: - Layout and words (pure, so they're easy to test)
+
+/// A tab of Messages: Slack messages and emails together, or one service's. Its raw value is what
+/// `SuggestionsView.tabKey` remembers ("slack" and "gmail" from before All are still good).
+enum InboxTab: String, CaseIterable, Hashable {
+    case all, slack, gmail
+
+    /// The one service the tab shows; nil for All.
+    var kind: TaskSource.Kind? {
+        switch self {
+        case .all: nil
+        case .slack: .slack
+        case .gmail: .gmail
+        }
+    }
+
+    /// Whether a message from `kind` shows in this tab.
+    func includes(_ kind: TaskSource.Kind) -> Bool {
+        self.kind.map { $0 == kind } ?? (kind == .slack || kind == .gmail)
+    }
+
+    /// "All", "Slack", "Email": the segment, and the back button in a narrow window.
+    var title: String {
+        switch self {
+        case .all: "All"
+        case .slack: "Slack"
+        case .gmail: "Email"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .all: "tray"
+        case .slack: "number"
+        case .gmail: "envelope"
+        }
+    }
+
+    /// The tab remembered in `stored`; before one was picked (or if it's one Docket no longer has), All when
+    /// both Slack and Gmail are in use (connected, or with messages), else the one that is, else Slack.
+    static func current(stored: String, slack: Bool, gmail: Bool) -> InboxTab {
+        if let tab = InboxTab(rawValue: stored) { return tab }
+        if slack && gmail { return .all }
+        return gmail ? .gmail : .slack
+    }
+}
+
+/// Where a message comes from, as the small icon before its sender says it.
+enum InboxSource {
+    static func icon(_ kind: TaskSource.Kind) -> String { SourceStyle.icon(kind) }
+
+    /// "Slack" or "Email" (the icon's tooltip).
+    static func name(_ kind: TaskSource.Kind) -> String {
+        switch kind {
+        case .slack: "Slack"
+        case .gmail: "Email"
+        case .ai: "AI"
+        }
+    }
+}
 
 enum InboxLayout {
     /// Below this width the list shows alone, and a message opens in its place with a back button.
@@ -200,13 +259,14 @@ enum AttachmentInfo {
 /// The open message in each tab, the narrow window's list-or-detail, the Starred filter, and the keys.
 @MainActor
 final class InboxModel: ObservableObject {
-    @Published var selected: [TaskSource.Kind: String] = [:]
+    /// The open message in each tab (All remembers its own).
+    @Published var selected: [InboxTab: String] = [:]
     /// Narrow window: the open message shows in place of the list.
     @Published var showsDetail = false
     /// The tabs showing only starred messages (remembered across launches, per tab).
-    @Published private(set) var starredOnly: Set<TaskSource.Kind>
+    @Published private(set) var starredOnly: Set<InboxTab>
     /// The tab on screen and whether the window is narrow, kept up to date by the panes.
-    var kind: TaskSource.Kind = .slack
+    var tab: InboxTab = .all
     var isNarrow = false
     private var monitor: Any?
     private let defaults: UserDefaults
@@ -214,32 +274,35 @@ final class InboxModel: ObservableObject {
     /// Posted before acting on several messages at once (Add all), so notes still being typed are saved first.
     static let saveEditsNow = Notification.Name("DocketInboxSaveEditsNow")
 
-    /// "inboxStarredOnly.slack", "inboxStarredOnly.gmail".
-    static func starredOnlyKey(_ kind: TaskSource.Kind) -> String { "inboxStarredOnly." + kind.rawValue }
+    /// "inboxStarredOnly.all", "inboxStarredOnly.slack", "inboxStarredOnly.gmail".
+    static func starredOnlyKey(_ tab: InboxTab) -> String { "inboxStarredOnly." + tab.rawValue }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        starredOnly = Set([TaskSource.Kind.slack, .gmail].filter { defaults.bool(forKey: Self.starredOnlyKey($0)) })
+        starredOnly = Set(InboxTab.allCases.filter { defaults.bool(forKey: Self.starredOnlyKey($0)) })
     }
 
-    func select(_ id: String?, in kind: TaskSource.Kind) {
-        guard selected[kind] != id else { return }
-        selected[kind] = id
+    func select(_ id: String?, in tab: InboxTab) {
+        guard selected[tab] != id else { return }
+        selected[tab] = id
     }
 
-    func isStarredOnly(_ kind: TaskSource.Kind) -> Bool { starredOnly.contains(kind) }
+    func isStarredOnly(_ tab: InboxTab) -> Bool { starredOnly.contains(tab) }
 
     /// All · Starred for one tab.
-    func setStarredOnly(_ on: Bool, for kind: TaskSource.Kind) {
-        guard on != starredOnly.contains(kind) else { return }
-        if on { starredOnly.insert(kind) } else { starredOnly.remove(kind) }
-        defaults.set(on, forKey: Self.starredOnlyKey(kind))
+    func setStarredOnly(_ on: Bool, for tab: InboxTab) {
+        guard on != starredOnly.contains(tab) else { return }
+        if on { starredOnly.insert(tab) } else { starredOnly.remove(tab) }
+        defaults.set(on, forKey: Self.starredOnlyKey(tab))
     }
 
     /// The tab's messages as the list shows them: starred first, newest first; with the filter on, only
     /// the starred ones. From `Integrations.shared` unless given others.
-    func items(_ kind: TaskSource.Kind, in integrations: Integrations? = nil) -> [Suggestion] {
-        (integrations ?? .shared).items(kind, starredOnly: isStarredOnly(kind))
+    func items(_ tab: InboxTab, in integrations: Integrations? = nil) -> [Suggestion] {
+        let integrations = integrations ?? .shared
+        let starred = isStarredOnly(tab)
+        guard let kind = tab.kind else { return integrations.allItems(starredOnly: starred) }
+        return integrations.items(kind, starredOnly: starred)
     }
 
     /// ↑/↓ move through the list, Return opens the message, Esc goes back (narrow window) and S stars or
@@ -261,21 +324,21 @@ final class InboxModel: ObservableObject {
         guard let window = event.window, window === NSApp.docketMainWindow, window.attachedSheet == nil,
               !(window.firstResponder is NSText), !app.showPalette, app.selection == .suggestions,
               event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty else { return false }
-        let ids = items(kind).map(\.id)
+        let ids = items(tab).map(\.id)
         if event.charactersIgnoringModifiers?.lowercased() == "s" {
             // S: star or unstar the open message (once per press, however long it's held).
-            guard let id = selected[kind], ids.contains(id) else { return false }
+            guard let id = selected[tab], ids.contains(id) else { return false }
             if !event.isARepeat { InboxStarring.toggle(item: id) }
             return true
         }
         switch event.keyCode {
         case 125, 126: // down, up
-            guard let next = InboxLayout.step(from: selected[kind], by: event.keyCode == 125 ? 1 : -1, in: ids) else { return false }
-            select(next, in: kind)
+            guard let next = InboxLayout.step(from: selected[tab], by: event.keyCode == 125 ? 1 : -1, in: ids) else { return false }
+            select(next, in: tab)
             return true
         case 36, 76: // return, enter
-            guard isNarrow, !showsDetail, let id = selected[kind].flatMap({ ids.contains($0) ? $0 : nil }) ?? ids.first else { return false }
-            select(id, in: kind)
+            guard isNarrow, !showsDetail, let id = selected[tab].flatMap({ ids.contains($0) ? $0 : nil }) ?? ids.first else { return false }
+            select(id, in: tab)
             withAnimation(Motion.snappy) { showsDetail = true }
             return true
         case 53: // esc
@@ -290,13 +353,13 @@ final class InboxModel: ObservableObject {
 
 // MARK: - The panes
 
-/// One tab: the list and the open message side by side, or one at a time in a narrow window.
+/// One tab (All, Slack or Email): the list and the open message side by side, or one at a time in a narrow window.
 struct InboxPanes: View {
     @EnvironmentObject var app: AppState
     @ObservedObject var model: InboxModel
     @ObservedObject private var integrations = Integrations.shared
     @AppStorage(Prefs.Key.slackSaveEmoji) private var saveEmoji = SlackSaveEmoji.standard
-    let kind: TaskSource.Kind
+    let tab: InboxTab
     /// Opens the Connections sheet.
     let connect: () -> Void
     /// Starts updating the Docket app in Slack (new permissions).
@@ -305,9 +368,9 @@ struct InboxPanes: View {
     @State private var shownIDs: [String] = []
 
     var body: some View {
-        let items = model.items(kind, in: integrations)
+        let items = model.items(tab, in: integrations)
         let ids = items.map(\.id)
-        let tabIsEmpty = items.isEmpty && !integrations.suggestions.contains { $0.source.kind == kind }
+        let tabIsEmpty = items.isEmpty && !integrations.suggestions.contains { tab.includes($0.source.kind) }
         GeometryReader { geo in
             let narrow = InboxLayout.isNarrow(geo.size.width)
             Group {
@@ -335,7 +398,7 @@ struct InboxPanes: View {
                         if let item = selectedItem(in: items) {
                             detail(item, paneHeight: geo.size.height, narrow: false)
                         } else {
-                            EmptyState(icon: kind == .slack ? "number" : "envelope", title: "No message open",
+                            EmptyState(icon: tab.icon, title: "No message open",
                                        message: "Pick one on the left, or use ↑ and ↓.")
                         }
                     }
@@ -351,7 +414,7 @@ struct InboxPanes: View {
             }
         }
         .onAppear {
-            model.kind = kind
+            model.tab = tab
             model.showsDetail = false
             shownIDs = ids
             pickIfNeeded(ids)
@@ -363,30 +426,30 @@ struct InboxPanes: View {
     }
 
     private func selectedItem(in items: [Suggestion]) -> Suggestion? {
-        guard let id = model.selected[kind] else { return nil }
+        guard let id = model.selected[tab] else { return nil }
         return items.first { $0.id == id }
     }
 
     /// Something is always open in the two-pane layout: the newest message, to start with.
     private func pickIfNeeded(_ ids: [String]) {
-        if let current = model.selected[kind], ids.contains(current) { return }
-        model.select(ids.first, in: kind)
+        if let current = model.selected[tab], ids.contains(current) { return }
+        model.select(ids.first, in: tab)
     }
 
     /// The open message left the list: open the one that took its place.
     private func follow(_ ids: [String]) {
-        guard let current = model.selected[kind] else { return pickIfNeeded(ids) }
+        guard let current = model.selected[tab] else { return pickIfNeeded(ids) }
         guard !ids.contains(current) else { return }
         let next = InboxLayout.successor(of: current, before: shownIDs, after: ids)
-        model.select(next, in: kind)
+        model.select(next, in: tab)
         if next == nil { model.showsDetail = false }
     }
 
     private func list(_ items: [Suggestion]) -> some View {
         VStack(spacing: 0) {
             filterBar
-            InboxList(items: items, selectedID: model.selected[kind]) { id in
-                model.select(id, in: kind)
+            InboxList(items: items, selectedID: model.selected[tab]) { id in
+                model.select(id, in: tab)
                 if model.isNarrow { withAnimation(Motion.snappy) { model.showsDetail = true } }
             }
         }
@@ -395,18 +458,18 @@ struct InboxPanes: View {
 
     /// All · Starred, over the list.
     private var filterBar: some View {
-        let starred = integrations.suggestions.lazy.filter { $0.source.kind == kind && $0.isStarred }.count
-        return InboxFilterBar(starredOnly: Binding(get: { model.isStarredOnly(kind) },
-                                                   set: { on in withAnimation(Motion.snappy) { model.setStarredOnly(on, for: kind) } }),
+        let starred = integrations.suggestions.lazy.filter { tab.includes($0.source.kind) && $0.isStarred }.count
+        return InboxFilterBar(starredOnly: Binding(get: { model.isStarredOnly(tab) },
+                                                   set: { on in withAnimation(Motion.snappy) { model.setStarredOnly(on, for: tab) } }),
                               starredCount: starred)
     }
 
     private var noStarred: some View {
         VStack(spacing: Space.md) {
-            EmptyState(icon: "star", title: kind == .slack ? "No starred Slack messages" : "No starred emails",
+            EmptyState(icon: "star", title: noStarredTitle,
                        message: "Star a message with ☆, or press S, and it shows up here.")
                 .frame(maxHeight: 260)
-            Button("Show all") { withAnimation(Motion.snappy) { model.setStarredOnly(false, for: kind) } }
+            Button("Show all") { withAnimation(Motion.snappy) { model.setStarredOnly(false, for: tab) } }
                 .buttonStyle(SecondaryPill(height: 32))
                 .help("Show every message in this tab")
         }
@@ -416,58 +479,115 @@ struct InboxPanes: View {
     private func detail(_ item: Suggestion, paneHeight: CGFloat, narrow: Bool) -> some View {
         InboxDetail(item: item, paneHeight: paneHeight,
                     back: narrow ? { withAnimation(Motion.snappy) { model.showsDetail = false } } : nil,
-                    backTitle: kind == .slack ? "Slack" : "Email", updateSlack: updateSlack)
+                    backTitle: tab.title, updateSlack: updateSlack)
             .id(item.id)
     }
 
     // MARK: Empty, loading, not connected
 
+    private var noStarredTitle: String {
+        switch tab {
+        case .all: "No starred messages"
+        case .slack: "No starred Slack messages"
+        case .gmail: "No starred emails"
+        }
+    }
+
+    /// All: either service connected (the other's pitch would only get in the way of the one in use).
+    private var isConnected: Bool {
+        switch tab {
+        case .all: integrations.isSlackConnected || integrations.isGmailConnected
+        case .slack: integrations.isSlackConnected
+        case .gmail: integrations.isGmailConnected
+        }
+    }
+
     @ViewBuilder
     private var emptyState: some View {
-        let connected = kind == .slack ? integrations.isSlackConnected : integrations.isGmailConnected
-        if !connected {
-            InboxPitch(kind: kind, saveEmoji: saveEmoji, connect: connect)
+        if !isConnected {
+            InboxPitch(kind: tab.kind, saveEmoji: saveEmoji, connect: connect)
         } else if integrations.isRefreshing && integrations.lastRefresh == nil {
             VStack(spacing: Space.md) {
                 ProgressView().controlSize(.small)
                 Text("Looking for messages that need you…").textStyle(.callout).foregroundStyle(Color.ink2)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if kind == .slack {
-            EmptyState(icon: "number", title: "Nothing from Slack",
-                       message: "React with \(SlackSaveEmoji.glyph(saveEmoji)) to a message and it shows up here.")
         } else {
-            EmptyState(icon: "envelope", title: "Nothing from Gmail", message: "Star an email and it shows up here.")
+            switch tab {
+            case .all:
+                EmptyState(icon: "tray", title: "Nothing here yet",
+                           message: "React with \(SlackSaveEmoji.glyph(saveEmoji)) in Slack or star an email in Gmail.")
+            case .slack:
+                EmptyState(icon: "number", title: "Nothing from Slack",
+                           message: "React with \(SlackSaveEmoji.glyph(saveEmoji)) to a message and it shows up here.")
+            case .gmail:
+                EmptyState(icon: "envelope", title: "Nothing from Gmail", message: "Star an email and it shows up here.")
+            }
         }
     }
 }
 
-/// A tab whose service isn't connected: what it's for, and the way in. For Gmail, what to do when Google
-/// says "Access blocked" (the sign-in page never comes back to Docket then).
+/// A tab whose service isn't connected (All: neither is): what it's for, and the way in. For Gmail, what to
+/// do when Google says "Access blocked" (the sign-in page never comes back to Docket then).
 private struct InboxPitch: View {
     @ObservedObject private var integrations = Integrations.shared
-    let kind: TaskSource.Kind
+    /// Nil for All.
+    let kind: TaskSource.Kind?
     let saveEmoji: String
     let connect: () -> Void
 
+    private var title: String {
+        switch kind {
+        case .slack?: "Bring in Slack"
+        case .gmail?: "Bring in Gmail"
+        default: "Bring in Slack and Gmail"
+        }
+    }
+
+    private var pitch: String {
+        let glyph = SlackSaveEmoji.glyph(saveEmoji)
+        switch kind {
+        case .slack?:
+            return "Messages you react to with \(glyph), and the ones that @mention you, show up here with their files and threads, ready to answer or turn into tasks."
+        case .gmail?:
+            return "Emails you star, and the ones waiting on your reply, show up here with their whole conversation and attachments, ready to answer or turn into tasks."
+        default:
+            return "Slack messages you react to with \(glyph) and emails you star show up here together, with their files and whole conversations, ready to answer or turn into tasks."
+        }
+    }
+
+    private var buttonTitle: String {
+        switch kind {
+        case .slack?: "Connect Slack"
+        case .gmail?: "Connect Gmail"
+        default: "Connect Slack or Gmail"
+        }
+    }
+
+    private var buttonHelp: String {
+        switch kind {
+        case .slack?: "Set up Slack in Connections"
+        case .gmail?: "Set up Gmail in Connections"
+        default: "Set up Slack and Gmail in Connections"
+        }
+    }
+
     var body: some View {
         VStack(spacing: Space.md) {
-            Image(systemName: kind == .slack ? "number" : "envelope")
+            Image(systemName: kind.map(SourceStyle.icon) ?? InboxTab.all.icon)
                 .font(.system(size: 22, weight: .regular))
                 .foregroundStyle(Color.ink)
                 .frame(width: 56, height: 56)
                 .background(Circle().fill(Color.fill))
-            Text(kind == .slack ? "Bring in Slack" : "Bring in Gmail")
+            Text(title)
                 .textStyle(.title3)
                 .foregroundStyle(Color.ink)
-            Text(kind == .slack
-                 ? "Messages you react to with \(SlackSaveEmoji.glyph(saveEmoji)), and the ones that @mention you, show up here with their files and threads, ready to answer or turn into tasks."
-                 : "Emails you star, and the ones waiting on your reply, show up here with their whole conversation and attachments, ready to answer or turn into tasks.")
+            Text(pitch)
                 .textStyle(.callout)
                 .foregroundStyle(Color.ink2)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 380)
-            if kind == .gmail, integrations.isSigningInToGmail {
+            if kind != .slack, integrations.isSigningInToGmail {
                 HStack(spacing: Space.sm) {
                     ProgressView().controlSize(.small)
                     Text("Waiting for you in the browser…")
@@ -479,12 +599,12 @@ private struct InboxPitch: View {
                 }
                 .padding(.top, Space.xs)
             } else {
-                Button(kind == .slack ? "Connect Slack" : "Connect Gmail", action: connect)
+                Button(buttonTitle, action: connect)
                     .buttonStyle(PrimaryPill())
-                    .help(kind == .slack ? "Set up Slack in Connections" : "Set up Gmail in Connections")
+                    .help(buttonHelp)
                     .padding(.top, Space.xs)
             }
-            if kind == .gmail {
+            if kind == .gmail || (kind == nil && integrations.isSigningInToGmail) {
                 GmailSignInHint(style: .centered)
                     .frame(maxWidth: 380)
                     .padding(.top, Space.sm)
@@ -504,9 +624,10 @@ private struct InboxFilterBar: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            FilterChip(title: "All", icon: nil, isOn: !starredOnly, help: "Show every message") { starredOnly = false }
+            // One toggle: the tabs above already say "All".
             FilterChip(title: starredCount > 0 ? "Starred (\(starredCount))" : "Starred", icon: "star", isOn: starredOnly,
-                       help: "Show only starred messages (star one with ☆ or S)") { starredOnly = true }
+                       help: starredOnly ? "Showing only starred messages. Click to show every message"
+                                         : "Show only starred messages (star one with ☆ or S)") { starredOnly.toggle() }
             Spacer(minLength: 0)
         }
         .padding(.horizontal, Space.md)
@@ -621,7 +742,22 @@ private struct InboxList: View {
     }
 }
 
-/// One message in the list: who, where (or the subject), two lines of it, when, its star, and one small chip.
+/// Where a message comes from: # for Slack, an envelope for email, small and quiet before its sender.
+private struct SourceIcon: View {
+    let kind: TaskSource.Kind
+    var size: CGFloat = 11
+
+    var body: some View {
+        Image(systemName: InboxSource.icon(kind))
+            .font(.system(size: size, weight: .semibold))
+            .foregroundStyle(Color.ink3)
+            .help(InboxSource.name(kind))
+            .accessibilityLabel(InboxSource.name(kind))
+    }
+}
+
+/// One message in the list: where it's from, who, where (or the subject), two lines of it, when, its star,
+/// and one small chip.
 private struct InboxRow: View {
     let item: Suggestion
     let isSelected: Bool
@@ -640,11 +776,14 @@ private struct InboxRow: View {
         let shape = RoundedRectangle(cornerRadius: Radius.md, style: .continuous)
         VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: Space.sm) {
-                Text(item.from)
-                    .font(.system(size: 14, weight: .bold))
-                    .tracking(-0.1)
-                    .foregroundStyle(Color.ink)
-                    .lineLimit(1)
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    SourceIcon(kind: item.source.kind)
+                    Text(item.from)
+                        .font(.system(size: 14, weight: .bold))
+                        .tracking(-0.1)
+                        .foregroundStyle(Color.ink)
+                        .lineLimit(1)
+                }
                 Spacer(minLength: Space.xs)
                 Text(Fmt.dateTime(item.receivedAt))
                     .font(.system(size: 11.5, weight: .semibold))
@@ -934,11 +1073,18 @@ struct InboxDetail: View {
         .transition(.opacity)
     }
 
-    /// The date and time stay whole: in a narrow pane, why it's here goes on a line of its own.
+    /// Where it's from ("# Slack", "✉ Email": in All, the list mixes them), then when. The date and time stay
+    /// whole: in a narrow pane, why it's here goes on a line of its own.
     private var dateLine: some View {
         let date = Text(Fmt.dateTime(item.receivedAt)).monospacedDigit()
+        let source = HStack(spacing: 4) {
+            SourceIcon(kind: item.source.kind)
+            Text(InboxSource.name(item.source.kind))
+        }
         return ViewThatFits(in: .horizontal) {
             HStack(spacing: 6) {
+                source
+                Text("·")
                 date
                 if let why {
                     Text("·")
@@ -947,7 +1093,12 @@ struct InboxDetail: View {
             }
             .fixedSize()
             VStack(alignment: .leading, spacing: 2) {
-                date
+                HStack(spacing: 6) {
+                    source
+                    Text("·")
+                    date
+                }
+                .fixedSize()
                 if let why { Text(why) }
             }
         }

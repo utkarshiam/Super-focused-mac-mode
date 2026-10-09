@@ -489,6 +489,27 @@ final class SlackClientTests: XCTestCase {
         XCTAssertEqual(FakeIntegrationServer.form(server.requests[1])["cursor"], "page2")
     }
 
+    func testARefusedLaterPageKeepsThePagesSoFar() async throws {
+        let server = FakeIntegrationServer()
+        server.slack("users.conversations", """
+        {"ok":true,"channels":[{"id":"C0LEAD","name":"leadership"}],"response_metadata":{"next_cursor":"dXNlcjpVMDYx+/="}}
+        """, #"{"ok":false,"error":"invalid_cursor"}"#)
+        let channels = try await SlackClient(token: Fixture.token, transport: server.transport).channels()
+        XCTAssertEqual(channels.map(\.name), ["leadership"], "page one survives a cursor Slack won't continue")
+        XCTAssertEqual(FakeIntegrationServer.form(server.requests[1])["cursor"], "dXNlcjpVMDYx+/=", "+, / and = reach Slack intact")
+
+        // On the first page it's a real error.
+        let first = FakeIntegrationServer()
+        first.slack("reactions.list", #"{"ok":false,"error":"invalid_cursor"}"#)
+        do {
+            _ = try await SlackClient(token: Fixture.token, transport: first.transport)
+                .savedMessages(by: Fixture.me, emoji: "pushpin", since: Date())
+            XCTFail("a refused first page must fail")
+        } catch {
+            XCTAssertNotNil(error as? IntegrationError)
+        }
+    }
+
     func testSlackErrorsInPlainWords() async {
         let server = FakeIntegrationServer()
         server.slack("auth.test", #"{"ok":false,"error":"invalid_auth"}"#)
