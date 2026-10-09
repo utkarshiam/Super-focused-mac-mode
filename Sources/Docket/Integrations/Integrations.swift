@@ -65,14 +65,32 @@ extension Suggestion {
         isStarred = c.value(.isStarred, default: source.kind == .gmail && trigger == .starred)
         starredInThread = c.value(.starredInThread, default: [])
     }
+
+    /// Nothing of the user's on it yet: no note, reply, or star.
+    var isUntouched: Bool {
+        note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && replyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && repliedAt == nil && !isStarred && starredInThread.isEmpty
+    }
 }
 
 /// Why a message became a suggestion.
 enum SuggestionTrigger: String, Codable, Hashable {
     case reaction, mention, starred, needsReply
+    /// Someone wrote to the user in a Slack DM or group DM.
+    case directMessage
 
     /// The user flagged it on purpose (a reaction, a star): it's suggested even when AI sees nothing to do.
     var isExplicit: Bool { self == .reaction || self == .starred }
+
+    /// Reads the name as saved. One this version doesn't know (saved by a newer Docket) throws, so the
+    /// suggestion it's on loads without a trigger (`Suggestion.init(from:)`) instead of being lost.
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        guard let known = Self(rawValue: raw) else {
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unknown trigger \(raw)"))
+        }
+        self = known
+    }
 }
 
 // MARK: - Settings
@@ -80,6 +98,7 @@ enum SuggestionTrigger: String, Codable, Hashable {
 extension Prefs.Key {
     static let slackSaveEmoji = "slackSaveEmoji"
     static let slackMentions = "slackMentions"
+    static let slackDirectMessages = "slackDirectMessages"
     static let slackFocusStatus = "slackFocusStatus"
     static let gmailNeedsReply = "gmailNeedsReply"
     static let slackShareChannel = "slackShareChannel"
@@ -89,6 +108,8 @@ extension Prefs.Key {
 struct IntegrationSettings: Equatable {
     var saveEmoji = SlackSaveEmoji.standard
     var mentions = true
+    /// Messages people send you in Slack DMs and group DMs.
+    var directMessages = true
     var focusStatus = true
     var needsReply = true
 
@@ -97,6 +118,7 @@ struct IntegrationSettings: Equatable {
         return IntegrationSettings(
             saveEmoji: SlackSaveEmoji.normalized(d.string(forKey: Prefs.Key.slackSaveEmoji)),
             mentions: d.object(forKey: Prefs.Key.slackMentions) as? Bool ?? true,
+            directMessages: d.object(forKey: Prefs.Key.slackDirectMessages) as? Bool ?? true,
             focusStatus: d.object(forKey: Prefs.Key.slackFocusStatus) as? Bool ?? true,
             needsReply: d.object(forKey: Prefs.Key.gmailNeedsReply) as? Bool ?? true)
     }
@@ -149,6 +171,8 @@ enum IntegrationError: LocalizedError, Equatable {
             "Google signed Docket out of Gmail. While your Google app is in Testing, Google does this every 7 days: click Publish app on its Audience page once to stop it, then connect again in Settings → Connections."
         case .missingPermission(.slack, let scope) where Self.isStarScope(scope):
             "Docket needs one more Slack permission to save messages for later in Slack. Update the Docket app in Settings → Connections."
+        case .missingPermission(.slack, let scope) where Self.isDirectMessageScope(scope):
+            "Docket needs more Slack permissions to read your direct messages. Update the Docket app in Settings → Connections."
         case .missingPermission(.slack, let scope) where Self.isContentScope(scope):
             "Docket needs more Slack permissions to show files and threads. Update the Docket app in Settings → Connections."
         case .missingPermission(.slack, let scope):
@@ -178,6 +202,12 @@ enum IntegrationError: LocalizedError, Equatable {
     private static func isContentScope(_ needed: String) -> Bool {
         let names = needed.split(whereSeparator: { $0 == "," || $0.isWhitespace }).map(String.init)
         return !names.isEmpty && names.allSatisfy(SlackManifest.contentScopes.contains)
+    }
+
+    /// Slack's "needed" names only the permissions for reading DMs and group DMs.
+    private static func isDirectMessageScope(_ needed: String) -> Bool {
+        let names = needed.split(whereSeparator: { $0 == "," || $0.isWhitespace }).map(String.init)
+        return !names.isEmpty && names.allSatisfy(SlackManifest.directMessageScopes.contains)
     }
 
     /// Slack's "needed" names only the permissions for saving messages for later (stars:read, stars:write).
@@ -317,7 +347,7 @@ struct IntegrationsFile: Codable {
     /// 2 added the inbox: notes, replies, complete messages, granted permissions. 3 added stars (on items and
     /// on messages of their threads). 4 added thread summaries. Older files load as they are (the new fields
     /// start empty).
-    static let currentVersion = 4
+    static let currentVersion = 5
 
     var version = currentVersion
     var suggestions: [Suggestion] = []
@@ -357,6 +387,8 @@ struct IntegrationsFile: Codable {
         suggestions = c.value(.suggestions, default: [LenientSuggestion]()).compactMap(\.value)
         handled = c.value(.handled, default: [:])
         skipped = c.value(.skipped, default: [:])
+        // Before version 5, DMs were only found as @mentions and often skipped: give them a fresh look.
+        if version < 5 { skipped = skipped.filter { !$0.key.hasPrefix("slack:D") } }
         lastRefresh = c.value(.lastRefresh, default: nil)
         slack = c.value(.slack, default: nil)
         gmailAddress = c.value(.gmailAddress, default: nil)
@@ -409,6 +441,38 @@ enum SuggestionInbox {
             result.append(s)
         }
         return Array(result.sorted { $0.receivedAt > $1.receivedAt }.prefix(limit))
+    }
+
+    /// One card per DM conversation. Of the cards just accepted from a DM or group DM (mentions and direct
+    /// messages, not replies in a thread, not ones flagged on purpose), only each conversation's newest stays,
+    /// and it takes the place of that conversation's older cards still waiting that the user hasn't touched
+    /// (no note, reply or star). Returns the cards to add, the ones left waiting, and the ids replaced.
+    static func collapseConversations(_ incoming: [Suggestion], pending: [Suggestion])
+        -> (incoming: [Suggestion], pending: [Suggestion], superseded: [String]) {
+        func conversation(_ s: Suggestion) -> String? {
+            guard s.source.kind == .slack, s.trigger == .mention || s.trigger == .directMessage, s.threadTS == nil,
+                  InboxText.isConversation(InboxText.place(of: s)) else { return nil }
+            return InboxIDs.slack(s.id)?.channel
+        }
+        var newest: [String: Suggestion] = [:]
+        for s in incoming {
+            guard let c = conversation(s) else { continue }
+            if let top = newest[c], top.receivedAt >= s.receivedAt { continue }
+            newest[c] = s
+        }
+        guard !newest.isEmpty else { return (incoming, pending, []) }
+        var superseded: [String] = []
+        let kept = incoming.filter { s in
+            guard let c = conversation(s), let top = newest[c], top.id != s.id else { return true }
+            superseded.append(s.id)
+            return false
+        }
+        let left = pending.filter { s in
+            guard let c = conversation(s), let top = newest[c], top.id != s.id, s.receivedAt < top.receivedAt, s.isUntouched else { return true }
+            superseded.append(s.id)
+            return false
+        }
+        return (kept, left, superseded)
     }
 
     /// Drops ids older than `memory`.
@@ -640,6 +704,8 @@ final class Integrations: ObservableObject {
     private var gmailPausedUntil: Date?
     private var userNames: [String: String] = [:]
     private var conversations: [String: SlackChannel] = [:]
+    /// Who's in each group DM (by id), for its label. Looked up once a session.
+    private var groupMembers: [String: [String]] = [:]
     private var channelList: (channels: [SlackChannel], fetched: Date)?
     private var google: GoogleSession?
     private let saver = IntegrationsSaver()
@@ -791,8 +857,11 @@ final class Integrations: ObservableObject {
             case .ai: true
             }
         }
+        // One card per DM conversation: the newest message replaces older untouched ones.
+        let collapsed = SuggestionInbox.collapseConversations(accepted, pending: suggestions)
+        for id in collapsed.superseded { skipped[id] = now }
         // Recomputed: tasks may have been added (or cards handled) while this check waited on the network.
-        suggestions = SuggestionInbox.merge(accepted, into: suggestions, blocked: blockedIDs(store))
+        suggestions = SuggestionInbox.merge(collapsed.incoming, into: collapsed.pending, blocked: blockedIDs(store))
         fillIn(slack.wholeMessages)
         savedSlackNames = slackNamesToKeep()
         handled = SuggestionInbox.pruned(handled, now: now)
@@ -914,7 +983,14 @@ final class Integrations: ObservableObject {
                 found += try await client.mentions(of: account.userID, since: now.addingTimeInterval(-Self.mentionsWindow))
                     .map { ($0, SuggestionTrigger.mention) }
             }
-            // A saved message that also mentions you counts as saved (it's listed first).
+            var dmProblem: IntegrationError?
+            if settings.directMessages {
+                let dms = try await directMessages(client, account: account, now: now)
+                found += dms.messages.map { ($0, SuggestionTrigger.directMessage) }
+                dmProblem = dms.problem
+            }
+            // A saved message that also mentions you counts as saved, and a DM that mentions you as a mention
+            // (they're listed first).
             var ids = Set<String>()
             let fresh = found.filter { seen.isNew($0.0.externalID, $0.1) && ids.insert($0.0.externalID).inserted }
             var filled = Set<String>()
@@ -922,7 +998,9 @@ final class Integrations: ObservableObject {
             await learnNames(for: (fresh + old).map { $0.0 }, client: client)
             // The check may have outlived the connection (Disconnect while it ran).
             guard isSlackConnected, slackAccount?.userID == account.userID else { return ([], [], false) }
-            slackProblem = nil
+            // DMs Slack wouldn't let Docket read: said like any missing permission, the rest still comes in.
+            if case .missingPermission(.slack, let scopes)? = dmProblem { noteRefusedSlackScopes(scopes) }
+            slackProblem = dmProblem?.errorDescription
             slackPausedUntil = nil
             return (fresh.map { slackCandidate($0.0, trigger: $0.1, account: account, now: now) },
                     old.map { slackCandidate($0.0, trigger: $0.1, account: account, now: now).suggestion }, true)
@@ -932,21 +1010,66 @@ final class Integrations: ObservableObject {
         }
     }
 
-    /// Looks up the people and channels new messages mention, a few at a time, remembering them for the session.
+    /// The DMs and group DMs people sent the user lately (`SlackClient.directMessages`), best effort: Slack
+    /// signing Docket out or asking it to slow down stops the check as usual; a permission Slack refused comes
+    /// back as `problem`, with what could be read; anything else skips DMs this time.
+    private func directMessages(_ client: SlackClient, account: SlackAccount, now: Date) async throws
+        -> (messages: [SlackMessage], problem: IntegrationError?) {
+        // The kinds the token can read, when Slack has said which permissions it has (Settings says what's missing).
+        var kinds: Set<String> = ["im", "mpim"]
+        if let granted = grantedSlackScopes {
+            if !granted.isSuperset(of: ["im:read", "im:history"]) { kinds.remove("im") }
+            if !granted.isSuperset(of: ["mpim:read", "mpim:history"]) { kinds.remove("mpim") }
+        }
+        guard !kinds.isEmpty else { return ([], nil) }
+        do {
+            let found = try await client.directMessages(of: account.userID, since: now.addingTimeInterval(-Self.mentionsWindow), kinds: kinds)
+            let problem = found.missingScopes.isEmpty ? nil
+                : IntegrationError.missingPermission(.slack, found.missingScopes.sorted().joined(separator: ","))
+            return (found.messages, problem)
+        } catch {
+            let e = IntegrationError.wrap(error, .slack)
+            switch e {
+            case .signedOut, .rateLimited, .cancelled:
+                throw e
+            case .missingPermission:
+                return ([], e)
+            default:
+                NSLog("Docket: couldn't read Slack direct messages this time (%@)", e.errorDescription ?? "")
+                return ([], nil)
+            }
+        }
+    }
+
+    /// Looks up the people and channels new messages mention, and who's in their group DMs, a few at a time,
+    /// remembering them for the session.
     private func learnNames(for messages: [SlackMessage], client: SlackClient) async {
-        var users = Set<String>()
         var channels = Set<String>()
+        for m in messages where m.channelName == nil || m.isDirect {
+            channels.insert(m.channelID)
+        }
+        let missingChannels = Array(channels.filter { conversations[$0] == nil }.prefix(20))
+        let foundChannels = await IntegrationHTTP.concurrentMap(missingChannels, limit: 4) { id in try? await client.conversation(id) }
+        for channel in foundChannels.compactMap({ $0 }) { conversations[channel.id] = channel }
+
+        // Group DMs are named after the people in them.
+        var groups = Set<String>()
+        for m in messages where m.isGroupDM || conversations[m.channelID]?.isGroupDM == true {
+            groups.insert(m.channelID)
+        }
+        let missingGroups = Array(groups.filter { groupMembers[$0] == nil }.sorted().prefix(10))
+        let foundMembers = await IntegrationHTTP.concurrentMap(missingGroups, limit: 4) { id in (id, try? await client.members(of: id)) }
+        for (id, members) in foundMembers { if let members { groupMembers[id] = members } }
+
+        var users = Set<String>()
         for m in messages {
             if let id = m.userID { users.insert(id) }
             users.formUnion(SlackText.mentionedUserIDs(in: m.text))
-            if m.channelName == nil || m.isDirect { channels.insert(m.channelID) }
+            users.formUnion(groupMembers[m.channelID] ?? [])
         }
-        let missingUsers = Array(users.filter { userNames[$0] == nil }.prefix(40))
-        let missingChannels = Array(channels.filter { conversations[$0] == nil }.prefix(20))
+        let missingUsers = Array(users.filter { userNames[$0] == nil }.sorted().prefix(40))
         let foundUsers = await IntegrationHTTP.concurrentMap(missingUsers, limit: 6) { id in try? await client.user(id) }
         for user in foundUsers.compactMap({ $0 }) { userNames[user.id] = user.name }
-        let foundChannels = await IntegrationHTTP.concurrentMap(missingChannels, limit: 4) { id in try? await client.conversation(id) }
-        for channel in foundChannels.compactMap({ $0 }) { conversations[channel.id] = channel }
     }
 
     /// Slack ids and the names they stand for, people ("U…" → "Priya Shah") and channels ("C…" → "leadership"),
@@ -965,20 +1088,22 @@ final class Integrations: ObservableObject {
     private func slackCandidate(_ m: SlackMessage, trigger: SuggestionTrigger, account: SlackAccount, now: Date) -> SuggestionCandidate {
         let sender = m.userID.flatMap { userNames[$0] } ?? m.userName ?? "Someone"
         let conversation = conversations[m.channelID]
-        let place: String
-        if m.isDirect || conversation?.isDirect == true {
-            place = "Direct message"
-        } else if m.isGroupDM || conversation?.isGroupDM == true {
-            place = "Group message"
+        let label: String
+        if m.isGroupDM || conversation?.isGroupDM == true {
+            // "Group DM · Priya, Sam": the people in it, the sender first.
+            let others = [m.userID].compactMap { $0 } + (groupMembers[m.channelID] ?? [])
+            label = InboxText.groupLabel(people: others, me: account.userID, names: userNames, sender: sender)
+        } else if m.isDirect || conversation?.isDirect == true {
+            label = "\(InboxText.directPlace) · \(sender)"
         } else if let name = m.channelName ?? conversation?.name {
-            place = "#\(name)"
+            label = "#\(name) · \(sender)"
         } else {
-            place = "Slack"
+            label = "Slack · \(sender)"
         }
         let channelNames = conversations.compactMapValues { $0.isDirect || $0.isGroupDM ? nil : $0.name }
         let text = SlackText.plain(m.text, users: userNames, channels: channelNames)
         let link = m.permalink ?? account.permalink(channel: m.channelID, ts: m.ts)
-        let source = TaskSource(kind: .slack, externalID: m.externalID, url: link, label: "\(place) · \(sender)")
+        let source = TaskSource(kind: .slack, externalID: m.externalID, url: link, label: label)
         var suggestion = Suggestion(source: source, from: sender, subject: nil, snippet: String(SlackText.collapsed(text).prefix(500)),
                                     receivedAt: m.date, draft: nil, trigger: trigger)
         // The complete message comes with it: the markup as sent (for rich text), its files, its thread.

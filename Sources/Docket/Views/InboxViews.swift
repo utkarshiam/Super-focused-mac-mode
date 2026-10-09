@@ -109,13 +109,13 @@ enum InboxItemText {
         return !s.id.hasSuffix("/" + parent)
     }
 
-    /// Where a Slack message was posted ("#leadership", "Direct message"), from its label.
+    /// Where a Slack message was posted ("#leadership", "DM"), from its label.
     static func place(of s: Suggestion) -> String {
         let place = s.source.label.components(separatedBy: " · ").first?.trimmingCharacters(in: .whitespaces) ?? ""
         return place.isEmpty ? "Slack" : place
     }
 
-    /// The second line: "#leadership · in a thread", "Direct message", or the email's subject.
+    /// The second line: "#leadership · in a thread", "DM", or the email's subject.
     static func context(of s: Suggestion) -> String {
         switch s.source.kind {
         case .gmail:
@@ -1111,6 +1111,7 @@ struct InboxDetail: View {
         switch item.trigger {
         case .reaction?: "Saved with \(SlackSaveEmoji.glyph(saveEmoji))"
         case .mention?: "Mentions you"
+        case .directMessage?: "Messaged you"
         case .starred?: "Starred"
         case .needsReply?: "Waiting on your reply"
         case nil: nil

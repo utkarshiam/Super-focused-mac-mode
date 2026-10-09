@@ -96,7 +96,7 @@ enum ThreadImportance {
         // A reply that just went out from Docket is the user's.
         guard let newest = all.last, !newest.isMine else { return false }
         if let replied = s.repliedAt, replied >= newest.date { return false }
-        if s.trigger == .needsReply || s.trigger == .mention { return true }
+        if s.trigger == .needsReply || s.trigger == .mention || s.trigger == .directMessage { return true }
         return all.dropLast().contains { $0.isMine }
     }
 

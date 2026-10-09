@@ -195,6 +195,63 @@ private enum Fixture {
         """
     }
 
+    // Direct messages
+
+    /// Maya's DMs and group DMs: Sam (newest message minutes ago), Priya (no activity given), an old one, her
+    /// note-to-self, a deactivated person's, and a group DM with Priya and Sam.
+    static func directConversations(now: Date) -> String {
+        """
+        {"ok":true,"channels":[
+          {"id":"D0DM","is_im":true,"user":"U0SAM","created":1700000000,"latest":{"ts":"\(ts(now.addingTimeInterval(-300)))"}},
+          {"id":"D0PRIYA","is_im":true,"user":"U0PRIYA","created":1700000100},
+          {"id":"D0OLD","is_im":true,"user":"U0OLD","created":1700000200,"latest":{"ts":"\(ts(now.addingTimeInterval(-10 * 86_400)))"}},
+          {"id":"D0SELF","is_im":true,"user":"U0MAYA","created":1700000300},
+          {"id":"D0GONE","is_im":true,"user":"U0GONE","is_user_deleted":true,"created":1700000400},
+          {"id":"C0MPDM","name":"mpdm-maya--priya--sam-1","is_mpim":true,"created":1700000500,"updated":1791000000000}
+        ],"response_metadata":{"next_cursor":""}}
+        """
+    }
+
+    static func history(_ messages: [String]) -> String {
+        #"{"ok":true,"messages":[\#(messages.joined(separator: ","))],"has_more":false}"#
+    }
+
+    static func message(_ user: String, _ text: String, at date: Date, extra: String = "") -> String {
+        #"{"type":"message","user":"\#(user)","text":"\#(text)","ts":"\#(ts(date))"\#(extra)}"#
+    }
+
+    /// Sam: the hiring question (also a mention), then two more after it; Maya answered before that.
+    static func samHistory(now: Date, newer: String? = nil) -> String {
+        history((newer.map { [$0] } ?? []) + [
+            message("U0SAM", "Also, can you send me the offer letter template?", at: now.addingTimeInterval(-300)),
+            message("U0SAM", "and the hiring plan", at: now.addingTimeInterval(-400)),
+            message("U0SAM", "<@U0MAYA> quick question about hiring", at: now.addingTimeInterval(-1800)),
+            message("U0MAYA", "Sure", at: now.addingTimeInterval(-2000)),
+        ])
+    }
+
+    /// The group: Priya's question, then a join, a thread broadcast and a bot.
+    static func groupHistory(now: Date, newer: String? = nil) -> String {
+        history((newer.map { [$0] } ?? []) + [
+            #"{"type":"message","subtype":"bot_message","bot_id":"B0BOT","text":"Reminder: standup","ts":"\#(ts(now.addingTimeInterval(-60)))"}"#,
+            message("U0SAM", "replying in the thread", at: now.addingTimeInterval(-120), extra: #","subtype":"thread_broadcast","thread_ts":"1791000000.000100""#),
+            message("U0NEW", "<@U0NEW> has joined", at: now.addingTimeInterval(-180), extra: #","subtype":"channel_join""#),
+            message("U0PRIYA", "Which venue should we book for the offsite?", at: now.addingTimeInterval(-240)),
+        ])
+    }
+
+    /// Slack's answers for reading DMs. `sam` and `group` are the histories in turn (the last one repeats).
+    static func directMessages(on server: FakeIntegrationServer, now: Date, sam: [String]? = nil, group: [String]? = nil) {
+        server.slack("users.conversations", where: ("types", "im,mpim"), directConversations(now: now))
+        server.slack("conversations.history", where: ("channel", "D0DM"), replies: sam ?? [samHistory(now: now)])
+        server.slack("conversations.history", where: ("channel", "D0PRIYA"), history([
+            message("U0MAYA", "Done, sent it over", at: now.addingTimeInterval(-600)),
+            message("U0PRIYA", "Can you send the deck?", at: now.addingTimeInterval(-900)),
+        ]))
+        server.slack("conversations.history", where: ("channel", "C0MPDM"), replies: group ?? [groupHistory(now: now)])
+        server.slack("conversations.members", where: ("channel", "C0MPDM"), #"{"ok":true,"members":["U0MAYA","U0PRIYA","U0SAM"]}"#)
+    }
+
     /// The people and channels the messages above mention.
     static func names(on server: FakeIntegrationServer) {
         server.slack("users.info", where: ("user", "U0PRIYA"), user("U0PRIYA", "priya", "Priya Shah"))
@@ -468,6 +525,98 @@ final class SlackClientTests: XCTestCase {
         let form = FakeIntegrationServer.form(try XCTUnwrap(server.requests.first))
         XCTAssertEqual(form["query"], "<@U0MAYA> after:\(Fmt.dayKey(since.addingTimeInterval(-86_400)))")
         XCTAssertEqual(form["sort"], "timestamp")
+    }
+
+    func testDirectMessagesAreTheNewestFromOthersPerConversation() async throws {
+        let now = Date()
+        let server = FakeIntegrationServer()
+        Fixture.directMessages(on: server, now: now)
+        let since = now.addingTimeInterval(-3 * 86_400)
+        let found = try await SlackClient(token: Fixture.token, transport: server.transport).directMessages(of: Fixture.me, since: since)
+
+        // Sam's newest of three in a row; Priya was answered; the group's newest from a person (not the bot,
+        // the join or the thread broadcast).
+        XCTAssertEqual(found.messages.map(\.externalID),
+                       ["slack:C0MPDM/\(Fixture.ts(now.addingTimeInterval(-240)))", "slack:D0DM/\(Fixture.ts(now.addingTimeInterval(-300)))"])
+        XCTAssertTrue(found.missingScopes.isEmpty)
+        let group = found.messages[0], sam = found.messages[1]
+        XCTAssertTrue(group.isGroupDM)
+        XCTAssertFalse(group.isDirect)
+        XCTAssertNil(group.channelName)
+        XCTAssertEqual(group.userID, "U0PRIYA")
+        XCTAssertTrue(sam.isDirect)
+        XCTAssertEqual(sam.text, "Also, can you send me the offer letter template?")
+        XCTAssertNil(sam.threadTS)
+
+        let list = FakeIntegrationServer.form(try XCTUnwrap(server.calls("users.conversations").first))
+        XCTAssertEqual(list["types"], "im,mpim")
+        XCTAssertEqual(list["exclude_archived"], "true")
+        XCTAssertEqual(list["limit"], "200")
+        // An old conversation, the note-to-self and a deactivated person's aren't read.
+        let histories = server.calls("conversations.history").map(FakeIntegrationServer.form)
+        XCTAssertEqual(Set(histories.compactMap { $0["channel"] }), ["D0DM", "D0PRIYA", "C0MPDM"])
+        XCTAssertTrue(histories.allSatisfy { $0["oldest"] == String(format: "%.6f", since.timeIntervalSince1970) && $0["limit"] == "30" })
+    }
+
+    func testDirectMessagesReadAtMostThirtyConversationsTheRecentFirst() async throws {
+        let now = Date()
+        let server = FakeIntegrationServer()
+        // 40 DMs with no activity given, and an old DM whose newest message (sent as a bare ts) is recent.
+        let dms = (0..<40).map { #"{"id":"D0P\#(String(format: "%02d", $0))","is_im":true,"user":"U0P\#($0)","created":\#(1_700_000_000 + $0)}"# }
+        let recent = #"{"id":"D0LATEST","is_im":true,"user":"U0LATE","created":1,"latest":"\#(Fixture.ts(now.addingTimeInterval(-60)))"}"#
+        server.slack("users.conversations", where: ("types", "im,mpim"),
+                     #"{"ok":true,"channels":[\#((dms + [recent]).joined(separator: ","))],"response_metadata":{"next_cursor":""}}"#)
+        server.slack("conversations.history", Fixture.history([Fixture.message("U0PRIYA", "Got a minute?", at: now.addingTimeInterval(-60))]))
+        let found = try await SlackClient(token: Fixture.token, transport: server.transport)
+            .directMessages(of: Fixture.me, since: now.addingTimeInterval(-3 * 86_400))
+
+        XCTAssertEqual(found.messages.count, SlackClient.directMessageChecks)
+        let read = Set(server.calls("conversations.history").compactMap { FakeIntegrationServer.form($0)["channel"] })
+        XCTAssertEqual(read.count, 30)
+        XCTAssertTrue(read.contains("D0LATEST"), "recent activity first")
+        XCTAssertEqual(read, Set(["D0LATEST"] + (11..<40).map { "D0P\(String(format: "%02d", $0))" }), "then the most recently created")
+    }
+
+    func testDirectMessagesWithoutPermissionSayWhichOne() async throws {
+        let now = Date()
+        let server = FakeIntegrationServer()
+        Fixture.directMessages(on: server, now: now,
+                               sam: [#"{"ok":false,"error":"missing_scope","needed":"im:history","provided":"mpim:history"}"#])
+        let found = try await SlackClient(token: Fixture.token, transport: server.transport)
+            .directMessages(of: Fixture.me, since: now.addingTimeInterval(-3 * 86_400))
+        XCTAssertEqual(found.missingScopes, ["im:history"])
+        XCTAssertEqual(found.messages.map(\.channelID), ["C0MPDM"], "what could be read still comes")
+
+        // Without the permission to list them, nothing can be read: that's an error.
+        let refused = FakeIntegrationServer()
+        refused.slack("users.conversations", #"{"ok":false,"error":"missing_scope","needed":"im:read,mpim:read"}"#)
+        do {
+            _ = try await SlackClient(token: Fixture.token, transport: refused.transport).directMessages(of: Fixture.me, since: now)
+            XCTFail("listing without permission must fail")
+        } catch {
+            XCTAssertEqual(error as? IntegrationError, .missingPermission(.slack, "im:read,mpim:read"))
+            XCTAssertEqual((error as? IntegrationError)?.errorDescription,
+                           "Docket needs more Slack permissions to read your direct messages. Update the Docket app in Settings → Connections.")
+        }
+        // Only the kinds asked for are listed.
+        let groups = FakeIntegrationServer()
+        groups.slack("users.conversations", #"{"ok":true,"channels":[],"response_metadata":{"next_cursor":""}}"#)
+        _ = try await SlackClient(token: Fixture.token, transport: groups.transport).directMessages(of: Fixture.me, since: now, kinds: ["mpim"])
+        XCTAssertEqual(FakeIntegrationServer.form(try XCTUnwrap(groups.requests.first))["types"], "mpim")
+    }
+
+    func testTriggersFromANewerDocketLoadWithoutOne() throws {
+        let source = TaskSource(kind: .slack, externalID: "slack:D0DM/1791203000.000300", url: nil, label: "DM · Sam Lee")
+        let dm = Suggestion(source: source, from: "Sam Lee", subject: nil, snippet: "Got a minute?", receivedAt: Date(timeIntervalSince1970: 1_791_203_000),
+                            draft: nil, trigger: .directMessage)
+        let data = try Persistence.encoder.encode(dm)
+        XCTAssertEqual(try Persistence.decoder.decode(Suggestion.self, from: data).trigger, .directMessage)
+        XCTAssertFalse(SuggestionTrigger.directMessage.isExplicit, "AI decides, like mentions")
+
+        let newer = String(decoding: data, as: UTF8.self).replacingOccurrences(of: "\"directMessage\"", with: "\"someTriggerFromLater\"")
+        let loaded = try Persistence.decoder.decode(Suggestion.self, from: Data(newer.utf8))
+        XCTAssertNil(loaded.trigger)
+        XCTAssertEqual(loaded.id, dm.id, "the message itself is kept")
     }
 
     func testChannelsAreYoursSortedByName() async throws {
@@ -877,6 +1026,8 @@ final class IntegrationsFlowTests: XCTestCase {
     private func slackAnswers(now: Date, reactions: String...) {
         server.slack("reactions.list", replies: reactions.isEmpty ? [Fixture.reactions(now: now)] : reactions)
         server.slack("search.messages", Fixture.mentions(now: now))
+        // No DMs unless a test registers them first (`Fixture.directMessages`).
+        server.slack("users.conversations", where: ("types", "im,mpim"), #"{"ok":true,"channels":[],"response_metadata":{"next_cursor":""}}"#)
         Fixture.names(on: server)
     }
 
@@ -959,7 +1110,7 @@ final class IntegrationsFlowTests: XCTestCase {
         XCTAssertEqual(deck.source.url?.absoluteString, "https://acme-test.slack.com/archives/C0LEAD/p1000")
         XCTAssertEqual(deck.draft?.title, "Slack: Can you send the Q3 deck to @Sam Lee by Friday? & thanks")
         XCTAssertEqual(budget.trigger, .mention)
-        XCTAssertEqual(hiring.source.label, "Direct message · Sam Lee")
+        XCTAssertEqual(hiring.source.label, "DM · Sam Lee")
         XCTAssertEqual(file.snippet, "Shared a file: Offsite plan")
         XCTAssertEqual(file.source.url?.absoluteString,
                        "https://acme-test.slack.com/archives/C0GEN/p\(Fixture.ts(now.addingTimeInterval(-5400)).replacingOccurrences(of: ".", with: ""))",
@@ -1071,6 +1222,120 @@ final class IntegrationsFlowTests: XCTestCase {
         await integrations.refreshNow(now: now)
         XCTAssertEqual(integrations.suggestions.count, 4, "the mentions were looked at again")
         XCTAssertNil(integrations.aiProblem)
+    }
+
+    func testDirectMessagesBecomeOneCardPerConversation() async throws {
+        let now = Date()
+        let later = now.addingTimeInterval(120)
+        let samLater = Fixture.message("U0SAM", "Actually, the template can wait until Monday", at: now.addingTimeInterval(60))
+        let groupLater = Fixture.message("U0SAM", "I vote for the lake house", at: now.addingTimeInterval(30))
+        Fixture.directMessages(on: server, now: now,
+                               sam: [Fixture.samHistory(now: now), Fixture.samHistory(now: now), Fixture.samHistory(now: now, newer: samLater)],
+                               group: [Fixture.groupHistory(now: now), Fixture.groupHistory(now: now), Fixture.groupHistory(now: now, newer: groupLater)])
+        slackAnswers(now: now)
+        let (integrations, _) = try make(slackConnected())
+
+        await integrations.refreshNow(now: now)
+        XCTAssertNil(integrations.slackProblem)
+        let samID = "slack:D0DM/\(Fixture.ts(now.addingTimeInterval(-300)))"
+        let groupID = "slack:C0MPDM/\(Fixture.ts(now.addingTimeInterval(-240)))"
+        let hiringID = "slack:D0DM/\(Fixture.ts(now.addingTimeInterval(-1800)))"
+        let byID = Dictionary(uniqueKeysWithValues: integrations.suggestions.map { ($0.id, $0) })
+        let sam = try XCTUnwrap(byID[samID])
+        XCTAssertEqual(sam.trigger, .directMessage)
+        XCTAssertEqual(sam.source.label, "DM · Sam Lee")
+        XCTAssertEqual(sam.from, "Sam Lee")
+        XCTAssertEqual(sam.content?.text, "Also, can you send me the offer letter template?")
+        XCTAssertEqual(sam.draft?.title, "Slack: Also, can you send me the offer letter template?", "a plain draft without AI")
+        XCTAssertEqual(sam.source.url?.absoluteString,
+                       "https://acme-test.slack.com/archives/D0DM/p\(Fixture.ts(now.addingTimeInterval(-300)).replacingOccurrences(of: ".", with: ""))")
+        let group = try XCTUnwrap(byID[groupID])
+        XCTAssertEqual(group.source.label, "Group DM · Priya, Sam")
+        XCTAssertEqual(group.from, "Priya Shah")
+        XCTAssertEqual(group.trigger, .directMessage)
+        XCTAssertEqual(InboxText.repliedToast(for: sam), "Replied to Sam Lee")
+        XCTAssertNil(byID[hiringID], "the earlier mention in the same DM is one card with the newest message")
+        XCTAssertEqual(integrations.suggestions.count, 5, "two saved, the budget mention, two DMs")
+
+        // The same messages again: nothing new, and the mention doesn't come back on its own.
+        await integrations.refreshNow(now: now.addingTimeInterval(30))
+        XCTAssertEqual(Set(integrations.suggestions.map(\.id)), Set(byID.keys))
+
+        // Sam writes again: his card moves to the newest message. The group's card has a note, so it stays
+        // and the new message gets its own.
+        let note = try XCTUnwrap(integrations.suggestions.firstIndex { $0.id == groupID })
+        integrations.suggestions[note].note = "Ask about catering"
+        await integrations.refreshNow(now: later)
+        let ids = Set(integrations.suggestions.map(\.id))
+        XCTAssertFalse(ids.contains(samID))
+        XCTAssertTrue(ids.contains("slack:D0DM/\(Fixture.ts(now.addingTimeInterval(60)))"))
+        XCTAssertTrue(ids.contains(groupID))
+        XCTAssertTrue(ids.contains("slack:C0MPDM/\(Fixture.ts(now.addingTimeInterval(30)))"))
+        XCTAssertEqual(integrations.suggestions.filter { $0.id.hasPrefix("slack:D0DM/") }.count, 1)
+    }
+
+    func testAIKeepsOnlyDirectMessagesThatNeedYou() async throws {
+        let now = Date()
+        Fixture.directMessages(on: server, now: now)
+        slackAnswers(now: now)
+        let log = TriageLog()
+        let triage = SuggestionTriage(isAvailable: { true }, run: { messages, _, _ in
+            log.batches.append(messages)
+            var drafts: [String: TaskDraft] = [:]
+            for m in messages where m.text.contains("offer letter") {
+                drafts[m.source.externalID] = TaskDraft(title: "Send Sam the offer letter template")
+            }
+            return drafts
+        })
+        let (integrations, _) = try make(slackConnected(), triage: triage)
+
+        await integrations.refreshNow(now: now)
+        let labels = Set(log.batches.flatMap { $0 }.map(\.source.label))
+        XCTAssertTrue(labels.isSuperset(of: ["DM · Sam Lee", "Group DM · Priya, Sam"]), "DMs go to AI with mentions")
+        let sam = try XCTUnwrap(integrations.suggestions.first { $0.trigger == .directMessage })
+        XCTAssertEqual(sam.draft?.title, "Send Sam the offer letter template")
+        XCTAssertEqual(integrations.suggestions.filter { $0.trigger == .directMessage }.count, 1, "AI saw nothing to do in the group")
+        XCTAssertEqual(integrations.suggestions.filter { $0.trigger == .reaction }.count, 2)
+    }
+
+    func testDirectMessagesCanBeTurnedOff() async throws {
+        let now = Date()
+        Fixture.directMessages(on: server, now: now)
+        slackAnswers(now: now)
+        var settings = IntegrationSettings()
+        XCTAssertTrue(settings.directMessages, "on unless turned off")
+        settings.directMessages = false
+        let (integrations, _) = try make(slackConnected(), settings: settings)
+
+        await integrations.refreshNow(now: now)
+        XCTAssertTrue(server.calls("users.conversations").isEmpty)
+        XCTAssertTrue(server.calls("conversations.history").isEmpty)
+        XCTAssertFalse(integrations.suggestions.contains { $0.trigger == .directMessage })
+        XCTAssertTrue(integrations.suggestions.contains { $0.id == "slack:D0DM/\(Fixture.ts(now.addingTimeInterval(-1800)))" },
+                      "the DM that mentions you still comes as a mention")
+    }
+
+    func testDirectMessagesWithoutPermissionSaySoAndTheRestStillComes() async throws {
+        let now = Date()
+        Fixture.directMessages(on: server, now: now, sam: [#"{"ok":false,"error":"missing_scope","needed":"im:history"}"#])
+        slackAnswers(now: now)
+        let (integrations, _) = try make(slackConnected())
+
+        await integrations.refreshNow(now: now)
+        XCTAssertEqual(integrations.lastRefresh, now)
+        XCTAssertEqual(integrations.slackProblem, IntegrationError.missingPermission(.slack, "im:history").errorDescription)
+        XCTAssertEqual(integrations.missingSlackScopes, ["im:history"])
+        XCTAssertEqual(integrations.suggestions.filter { $0.trigger == .directMessage }.map(\.source.label), ["Group DM · Priya, Sam"])
+        XCTAssertEqual(integrations.suggestions.filter { $0.trigger == .reaction }.count, 2, "saved messages still come")
+
+        // Once Slack says the token can't read DMs, they aren't asked for (Settings says what's missing).
+        integrations.grantedSlackScopes = Set(SlackManifest.userScopes).subtracting(["im:history"])
+        server.slack("users.conversations", where: ("types", "mpim"), #"{"ok":true,"channels":[],"response_metadata":{"next_cursor":""}}"#)
+        let histories = server.calls("conversations.history").count
+        await integrations.refreshNow(now: now.addingTimeInterval(60))
+        XCTAssertEqual(FakeIntegrationServer.form(try XCTUnwrap(server.calls("users.conversations").last))["types"], "mpim")
+        XCTAssertEqual(server.calls("conversations.history").count, histories)
+        XCTAssertNil(integrations.slackProblem)
     }
 
     func testGmailSuggestsStarredAndUnansweredMailOnePerConversation() async throws {

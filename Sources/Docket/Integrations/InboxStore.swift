@@ -1560,22 +1560,49 @@ enum InboxText {
         return s.allSatisfy { ($0.isUppercase || $0.isNumber) && $0.isASCII } && s.contains { $0.isNumber }
     }
 
-    /// Where a Slack message was posted: "#leadership", "Direct message", "Group message".
+    /// Where a Slack message was posted: "#leadership", "DM", "Group DM".
     static func place(of s: Suggestion) -> String {
         let place = s.source.label.components(separatedBy: " · ").first?.trimmingCharacters(in: .whitespaces) ?? ""
         return place.isEmpty ? "Slack" : place
     }
 
+    /// The place in a DM's label ("DM · Priya Shah") and a group DM's ("Group DM · Priya, Sam").
+    static let directPlace = "DM"
+    static let groupPlace = "Group DM"
+
+    /// A DM (as labelled now, or before: "Direct message").
+    static func isDirect(_ place: String) -> Bool {
+        place == directPlace || place == "Direct message"
+    }
+
+    /// A group DM (as labelled now, or before: "Group message").
+    static func isGroup(_ place: String) -> Bool {
+        place == groupPlace || place == "Group message"
+    }
+
     /// A direct or group message rather than a channel.
     static func isConversation(_ place: String) -> Bool {
-        place == "Direct message" || place == "Group message"
+        isDirect(place) || isGroup(place)
+    }
+
+    /// "Group DM · Priya, Sam": the first names of the people in it (`people`, by id, the sender first),
+    /// without the user, at most four ("+2" for more). Just the sender when nobody else is known.
+    static func groupLabel(people: [String], me: String, names: [String: String], sender: String) -> String {
+        var seen: Set<String> = [me]
+        let others = people.filter { seen.insert($0).inserted }.compactMap { id -> String? in
+            guard let name = names[id]?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty else { return nil }
+            return name.split(separator: " ").first.map(String.init) ?? name
+        }
+        guard !others.isEmpty else { return "\(groupPlace) · \(sender)" }
+        let shown = others.prefix(4).joined(separator: ", ")
+        return "\(groupPlace) · \(shown)" + (others.count > 4 ? " +\(others.count - 4)" : "")
     }
 
     /// "Replied in #leadership", "Replied to Priya Shah".
     static func repliedToast(for s: Suggestion) -> String {
         let place = place(of: s)
         if place.hasPrefix("#") { return "Replied in \(place)" }
-        if place == "Direct message" { return "Replied to \(s.from)" }
+        if isDirect(place) { return "Replied to \(s.from)" }
         return "Reply sent"
     }
 }
@@ -1703,7 +1730,7 @@ private struct InboxSamples {
         // Slack: a direct message with a document, and a reply being written.
         let shared = ago(170)
         let copyID = "slack:D0DEMOALEX/\(ts(shared))"
-        var copy = slack("D0DEMOALEX", "Direct message", from: "Alex Kim", at: shared, markup:
+        var copy = slack("D0DEMOALEX", InboxText.directPlace, from: "Alex Kim", at: shared, markup:
             "Pricing page copy is ready for your sign-off :tada: Two options for the headline are in the doc. Can we ship it Monday?",
             trigger: .reaction, task: TaskDraft(title: "Sign off on the pricing page copy", estimateMinutes: 15),
             files: [attachment(documentFile, "Pricing page copy", id: "F0DEMOCOPY", item: copyID,

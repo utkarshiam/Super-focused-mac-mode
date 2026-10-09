@@ -471,8 +471,12 @@ final class InboxTests: XCTestCase {
 
         let saved = try Data(contentsOf: dir.appendingPathComponent("integrations.json"))
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: saved) as? [String: Any])
-        XCTAssertEqual(json["version"] as? Int, 4)
-        XCTAssertEqual(IntegrationsFile.currentVersion, 4)
+        XCTAssertEqual(json["version"] as? Int, 5)
+        XCTAssertEqual(IntegrationsFile.currentVersion, 5)
+        // Files from before DMs were a source forget earlier skips of DM messages (and only those).
+        let old = #"{"version":4,"skipped":{"slack:D0DM/1.000":"2026-10-01T00:00:00Z","slack:C0LEAD/2.000":"2026-10-01T00:00:00Z"}}"#
+        let loaded = try Persistence.decoder.decode(IntegrationsFile.self, from: Data(old.utf8))
+        XCTAssertEqual(Set(loaded.skipped.keys), ["slack:C0LEAD/2.000"])
 
         let again = relaunch(store)
         let slack = try XCTUnwrap(again.suggestion(Sample.threadReplyID))

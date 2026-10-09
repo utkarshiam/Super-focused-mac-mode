@@ -130,6 +130,7 @@ enum AIPrompts {
 
         Which messages need a task:
         - Ones that ask the user to do, decide, review, send or answer something specific.
+        - Slack DMs and group DMs ("DM", "Group DM") are written to the user personally: a question or request in one needs them, even a short one. Greetings, thanks and chit-chat don't.
         - Skip newsletters, marketing, notifications, receipts, calendar invitations, automated mail, FYIs, thank-yous, and anything already resolved in the message.
         - When unsure, skip it. Most messages don't need a task.
 
@@ -369,7 +370,7 @@ enum AIPrompts {
         var head: [String]
         let role = target == nil ? "to reply to" : "the user opened"
         if format == .slack {
-            // "#leadership · Priya", "Direct message · Sam".
+            // "#leadership · Priya", "DM · Sam".
             let label = oneLine(message.source.label, limit: 160)
             head = [label.isEmpty ? "The Slack message \(role):" : "The Slack message \(role) (\(label)):"]
         } else {

@@ -273,6 +273,153 @@ struct SlackClient: Sendable {
         }
     }
 
+    /// What `directMessages` found: one message per conversation, and the permissions Slack refused while reading
+    /// them (say "im:history" when only group messages could be read).
+    struct DirectMessages: Sendable {
+        var messages: [SlackMessage] = []
+        var missingScopes: Set<String> = []
+    }
+
+    /// Conversations whose history one check reads at most (one conversations.history call each).
+    static let directMessageChecks = 30
+
+    /// Your direct and group messages from others since `since`, newest first: per conversation, the newest
+    /// message someone else sent since you last wrote in it (five in a row are one message; one you answered
+    /// is none). Bots, joins and the like, thread broadcasts and your own messages are left out.
+    ///
+    /// Lists your DMs and group DMs (users.conversations, types im and mpim, `pages` pages of 200), then reads
+    /// the recent history (conversations.history, 30 messages since `since`) of at most `checks` of them: the
+    /// ones whose newest message is recent when Slack says, else the most recently created or updated.
+    /// `kinds` limits which ("im", "mpim"), say to the ones the token has permissions for.
+    ///
+    /// A conversation Slack won't read for want of a permission is skipped and its permission listed in
+    /// `missingScopes`; one that's gone is skipped. Signing out and long rate limits throw as usual.
+    func directMessages(of userID: String, since: Date, kinds: Set<String> = ["im", "mpim"],
+                        checks: Int = directMessageChecks, pages: Int = 5) async throws -> DirectMessages {
+        let types = ["im", "mpim"].filter(kinds.contains)
+        guard !types.isEmpty, checks > 0 else { return DirectMessages() }
+        var listed: [RawChannel] = []
+        var cursor: String?
+        for _ in 0..<pages {
+            var params = [("types", types.joined(separator: ",")), ("exclude_archived", "true"), ("limit", "200")]
+            if let cursor { params.append(("cursor", cursor)) }
+            guard let reply = try await page("users.conversations", params, cursor: cursor, as: ConversationsReply.self) else { break }
+            listed += (reply.channels ?? []).compactMap(\.value)
+            guard let next = reply.responseMetadata?.nextCursor, !next.isEmpty else { break }
+            cursor = next
+        }
+
+        let chosen = Self.directConversations(listed, me: userID, since: since, limit: checks)
+        let oldest = String(format: "%.6f", since.timeIntervalSince1970)
+        let outcomes = await IntegrationHTTP.concurrentMap(chosen, limit: 4) { conversation in
+            await self.newestDirectMessage(in: conversation, me: userID, oldest: oldest, since: since)
+        }
+        var found = DirectMessages()
+        for outcome in outcomes {
+            switch outcome {
+            case .found(let message?):
+                found.messages.append(message)
+            case .found(nil):
+                break
+            case .missing(let scope):
+                found.missingScopes.insert(scope)
+            case .failed(let error):
+                switch error {
+                case .signedOut, .rateLimited, .cancelled: throw error
+                default: NSLog("Docket: skipped a Slack conversation (%@)", error.errorDescription ?? "")
+                }
+            }
+        }
+        found.messages.sort { $0.date > $1.date }
+        return found
+    }
+
+    /// How reading one conversation went.
+    private enum DirectOutcome: Sendable {
+        case found(SlackMessage?)
+        case missing(String)
+        case failed(IntegrationError)
+    }
+
+    /// The newest message from someone else in one conversation since you last wrote there (conversations.history).
+    private func newestDirectMessage(in conversation: SlackChannel, me: String, oldest: String, since: Date) async -> DirectOutcome {
+        let reply: HistoryReply
+        do {
+            reply = try await perform("conversations.history", [("channel", conversation.id), ("oldest", oldest), ("limit", "30")],
+                                      as: HistoryReply.self).0
+        } catch let refusal as Refusal {
+            switch refusal.code {
+            case "missing_scope":
+                let needed = refusal.needed.flatMap { $0.isEmpty ? nil : $0 } ?? (conversation.isGroupDM ? "mpim:history" : "im:history")
+                return .missing(needed)
+            case "channel_not_found", "not_in_channel", "is_archived", "user_not_found", "user_disabled":
+                return .found(nil)
+            default:
+                return .failed(Self.error(code: refusal.code, needed: refusal.needed))
+            }
+        } catch {
+            return .failed(IntegrationError.wrap(error, .slack))
+        }
+        guard let raw = Self.newestFromOthers((reply.messages ?? []).compactMap(\.value), me: me),
+              var message = SlackMessage(raw, channel: conversation.id, info: nil), message.date >= since else { return .found(nil) }
+        message.channelName = nil
+        message.isDirect = conversation.isDirect
+        message.isGroupDM = conversation.isGroupDM
+        return .found(message)
+    }
+
+    /// Which DMs and group DMs to read: not archived, not with a deactivated person, not your note-to-self. Those
+    /// whose newest message (`latest`, when Slack sends it) is since `since` come first, newest first; the
+    /// others by when they were last updated or created. At most `limit`.
+    fileprivate static func directConversations(_ listed: [RawChannel], me: String, since: Date, limit: Int) -> [SlackChannel] {
+        var seen = Set<String>()
+        var recent: [(SlackChannel, TimeInterval)] = []
+        var unknown: [(SlackChannel, TimeInterval)] = []
+        let cutoff = since.timeIntervalSince1970
+        for raw in listed {
+            guard let channel = raw.channel, seen.insert(channel.id).inserted, raw.isArchived != true, raw.isUserDeleted != true,
+                  raw.isDirect || raw.isGroupDM, !(raw.isDirect && raw.user == me) else { continue }
+            var conversation = channel
+            // users.conversations names a DM after the person's id; the name isn't used for DMs.
+            conversation.isDirect = raw.isDirect && !raw.isGroupDM
+            if let latest = raw.latestTS.flatMap(TimeInterval.init) {
+                if latest >= cutoff { recent.append((conversation, latest)) }
+            } else {
+                unknown.append((conversation, max(raw.created.map(Self.seconds) ?? 0, raw.updated.map(Self.seconds) ?? 0)))
+            }
+        }
+        let ordered = recent.sorted { $0.1 > $1.1 } + unknown.sorted { $0.1 > $1.1 }
+        return ordered.prefix(max(0, limit)).map(\.0)
+    }
+
+    /// Slack's times in seconds: `created` is in seconds, `updated` in milliseconds.
+    private static func seconds(_ value: Double) -> TimeInterval {
+        value > 1e11 ? value / 1000 : value
+    }
+
+    /// Kinds of message a DM is suggested from: plain messages, files shared, /me. Not bots, joins, thread
+    /// broadcasts (the reply is in its thread already), edits or deletions.
+    static let directMessageSubtypes: Set<String> = ["file_share", "me_message"]
+
+    /// The newest message from someone else, among the ones after your last message (newest first or not).
+    /// Nil when you wrote last, or when nobody else wrote anything worth showing.
+    fileprivate static func newestFromOthers(_ messages: [RawMessage], me: String) -> RawMessage? {
+        let ordered = messages.filter { $0.ts.map(isTimestamp) == true }.sorted { compare($0.ts ?? "", $1.ts ?? "") > 0 }
+        for m in ordered {
+            // Your own message answers what came before, even one posted through an app (a reply from Docket).
+            if m.user == me, m.hidden != true, m.subtype.map(directMessageSubtypes.contains) ?? true { return nil }
+            guard m.isFromAPerson, m.user != me else { continue }
+            if !m.displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return m }
+        }
+        return nil
+    }
+
+    /// The people in a conversation, by id (conversations.members, one page of 50): for naming a group DM.
+    func members(of channel: String) async throws -> [String] {
+        let (reply, _) = try await call("conversations.members", [("channel", channel), ("limit", "50")], as: MembersReply.self)
+        return (reply.members ?? []).filter { !$0.isEmpty }
+    }
+
     /// Channels you're a member of (public and private), by name: the ones you can post a plan to.
     /// users.conversations lists only your own channels (conversations.list would page through every
     /// public channel in the workspace), with the same scopes.
@@ -807,6 +954,16 @@ private struct ConversationReply: Decodable {
     let channel: RawChannel?
 }
 
+/// conversations.history: newest first.
+private struct HistoryReply: Decodable {
+    let messages: [Lenient<RawMessage>]?
+    let hasMore: Bool?
+}
+
+private struct MembersReply: Decodable {
+    let members: [String]?
+}
+
 private struct UserReply: Decodable {
     struct User: Decodable {
         struct Profile: Decodable {
@@ -844,8 +1001,18 @@ private struct RawChannel: Decodable {
     var isPrivate: Bool?
     var isMember: Bool?
     var isArchived: Bool?
+    /// A DM's other person (users.conversations, conversations.info).
+    var user: String?
+    var isUserDeleted: Bool?
+    /// Seconds since 1970.
+    var created: Double?
+    /// Milliseconds since 1970, sometimes seconds.
+    var updated: Double?
+    /// The newest message's ts, when Slack sends it (as the message, or just its ts).
+    var latestTS: String?
 
-    private enum Keys: String, CodingKey { case id, name, isIm, isMpim, isPrivate, isMember, isArchived }
+    private enum Keys: String, CodingKey { case id, name, isIm, isMpim, isPrivate, isMember, isArchived, user, isUserDeleted, created, updated, latest }
+    private struct Latest: Decodable { let ts: String? }
 
     init(from decoder: Decoder) throws {
         if let single = try? decoder.singleValueContainer(), let id = try? single.decode(String.self) {
@@ -860,6 +1027,18 @@ private struct RawChannel: Decodable {
         isPrivate = try? c.decode(Bool.self, forKey: .isPrivate)
         isMember = try? c.decode(Bool.self, forKey: .isMember)
         isArchived = try? c.decode(Bool.self, forKey: .isArchived)
+        user = try? c.decode(String.self, forKey: .user)
+        isUserDeleted = try? c.decode(Bool.self, forKey: .isUserDeleted)
+        created = Self.number(c, .created)
+        updated = Self.number(c, .updated)
+        latestTS = ((try? c.decode(Latest.self, forKey: .latest))?.ts ?? (try? c.decode(String.self, forKey: .latest)))
+            .flatMap { SlackClient.isTimestamp($0) ? $0 : nil }
+    }
+
+    /// A number Slack may send as a number or as a string.
+    private static func number(_ c: KeyedDecodingContainer<Keys>, _ key: Keys) -> Double? {
+        let value = (try? c.decode(Double.self, forKey: key)) ?? (try? c.decode(String.self, forKey: key)).flatMap(Double.init)
+        return value.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
     }
 
     var isDirect: Bool { isIm == true || id?.hasPrefix("D") == true }
@@ -938,9 +1117,17 @@ private struct RawMessage: Decodable {
     /// The parent's ts for a reply in a thread; a parent with replies carries its own ts.
     let threadTs: String?
     let hidden: Bool?
+    let botId: String?
     let botProfile: BotProfile?
     /// Sent with some messages, so the sender needn't be looked up.
     let userProfile: UserProfile?
+
+    /// Written by a person (not a bot, Slackbot or an app), as a plain message, a file or /me: what a DM is
+    /// suggested from, and what counts as your answer.
+    var isFromAPerson: Bool {
+        guard hidden != true, botId == nil, botProfile == nil, let user, !user.isEmpty, user != "USLACKBOT" else { return false }
+        return subtype.map(SlackClient.directMessageSubtypes.contains) ?? true
+    }
 
     /// Whether `userID` reacted with `emoji` ("+1::skin-tone-2" counts as "+1").
     func hasReaction(_ emoji: String, by userID: String) -> Bool {
@@ -1240,6 +1427,9 @@ enum SlackManifest {
     /// `Integrations.missingSlackScopes` says which.
     static let contentScopes: Set<String> = ["files:read", "channels:history", "groups:history", "im:history", "mpim:history",
                                              "stars:read", "stars:write"]
+
+    /// What reading DMs and group DMs needs: listing them (the read scopes) and their messages (the history scopes).
+    static let directMessageScopes: Set<String> = ["im:read", "im:history", "mpim:read", "mpim:history"]
 
     static let description = "Turns Slack messages into tasks, shows files and threads, saves messages for later, posts your replies and plans, and sets focus status."
 

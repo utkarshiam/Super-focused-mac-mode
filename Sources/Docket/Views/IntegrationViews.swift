@@ -531,6 +531,7 @@ private struct SlackConnection: View {
     @Binding var updating: Bool
     @AppStorage(Prefs.Key.slackSaveEmoji) private var saveEmoji = SlackSaveEmoji.standard
     @AppStorage(Prefs.Key.slackMentions) private var mentions = true
+    @AppStorage(Prefs.Key.slackDirectMessages) private var directMessages = true
     @AppStorage(Prefs.Key.slackFocusStatus) private var focusStatus = true
     @AppStorage(Prefs.Key.setupTickedSlack) private var tickedRaw = ""
     @State private var token = ""
@@ -597,6 +598,11 @@ private struct SlackConnection: View {
                               : "Every message that @mentions you (last 3 days). Turn on AI to keep only the ones that need you.",
                           isOn: $mentions)
                     .help("Suggest tasks from messages that mention you")
+                ToggleRow(title: "Direct messages",
+                          subtitle: aiOn ? "What people send you in DMs and group DMs (last 3 days), the newest of each conversation. AI keeps only the ones that need you."
+                              : "What people send you in DMs and group DMs (last 3 days), the newest of each conversation. Turn on AI to keep only the ones that need you.",
+                          isOn: $directMessages)
+                    .help("Suggest tasks from direct and group messages people send you")
                 ToggleRow(title: "Focus status", subtitle: "During a focus session your status says “Heads down” 🎯 and notifications are paused.",
                           isOn: $focusStatus, divider: false)
                     .help("Set your Slack status and pause notifications while you focus")
@@ -604,6 +610,7 @@ private struct SlackConnection: View {
         }
         .onChange(of: saveEmoji) { _ in integrations.refresh() }
         .onChange(of: mentions) { _ in integrations.refresh() }
+        .onChange(of: directMessages) { _ in integrations.refresh() }
     }
 
     private var tickedBinding: Binding<Set<String>> {

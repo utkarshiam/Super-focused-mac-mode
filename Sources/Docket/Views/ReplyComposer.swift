@@ -23,11 +23,9 @@ enum ReplyText {
     static func place(of item: Suggestion) -> Place {
         let first = item.source.label.components(separatedBy: " · ").first?.trimmingCharacters(in: .whitespaces) ?? ""
         if first.hasPrefix("#"), first.count > 1 { return .channel(first) }
-        switch first {
-        case "Direct message": return .direct
-        case "Group message": return .group
-        default: return .unknown
-        }
+        if InboxText.isDirect(first) { return .direct }
+        if InboxText.isGroup(first) { return .group }
+        return .unknown
     }
 
     /// "Sam Lee <Sam@Northwind.example>" → "sam@northwind.example".
