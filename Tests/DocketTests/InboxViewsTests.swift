@@ -475,6 +475,37 @@ final class InboxViewsTests: XCTestCase {
         XCTAssertNil(MailHTML.trimmedText("> all of it quoted"))
     }
 
+    // MARK: The header's status line
+
+    func testTheStatusLineShowsATickOrTheProblemAndItsFix() {
+        var facts = InboxStatus.Facts(slackConnected: true, gmailConnected: true)
+        XCTAssertEqual(InboxStatus.parts(facts).map(\.text), ["Slack ✓", "Gmail ✓", "AI ✓"])
+        XCTAssertTrue(InboxStatus.parts(facts).allSatisfy { $0.fix == nil })
+
+        facts.slackPermissions = InboxItemText.slackPermissionBanner(missing: ["files:read"])
+        facts.gmailNeedsReconnect = true
+        facts.aiHasKey = false
+        var parts = InboxStatus.parts(facts)
+        XCTAssertEqual(parts.map(\.text), ["Slack needs permissions", "Reconnect Gmail", "AI needs a key"])
+        XCTAssertEqual(parts.map(\.fix), [.updateSlack, .reconnectGmail, .aiSettings])
+
+        // A refresh error wins over a missing permission; not connected wins over everything.
+        facts.slackProblem = "Slack said the token was revoked."
+        facts.gmailConnected = false
+        facts.aiOn = false
+        parts = InboxStatus.parts(facts)
+        XCTAssertEqual(parts.map(\.text), ["Slack error", "Gmail not connected", "AI off"])
+        XCTAssertEqual(parts.map(\.fix), [.connections, .connections, .aiSettings])
+        XCTAssertTrue(parts[0].help.hasPrefix("Slack said the token was revoked."))
+
+        let now = Date(timeIntervalSince1970: 1_791_200_000)
+        XCTAssertEqual(InboxStatus.updated(now, refreshing: true, now: now), "Checking…")
+        XCTAssertEqual(InboxStatus.updated(now.addingTimeInterval(-60), refreshing: false, now: now), "Updated \(Fmt.time(now.addingTimeInterval(-60)))")
+        XCTAssertEqual(InboxStatus.updated(now.addingTimeInterval(-3 * 86_400), refreshing: false, now: now),
+                       "Updated \(Fmt.dateTime(now.addingTimeInterval(-3 * 86_400)))")
+        XCTAssertNil(InboxStatus.updated(nil, refreshing: false, now: now))
+    }
+
     // MARK: The list
 
     func testTheOpenMessageFollowsTheListAndTheArrows() {

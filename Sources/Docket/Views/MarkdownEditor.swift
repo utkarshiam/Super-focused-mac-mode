@@ -7,11 +7,11 @@ struct MarkdownEditor: NSViewRepresentable {
     @Binding var text: String
     var onCreateTask: (String) -> Void
     var focusOnAppear = false
-    /// Lets the pane insert photos at the cursor.
+    /// Lets the pane insert photos, videos and PDFs at the cursor.
     var bridge: NoteBridge?
     /// A whole Markdown document was pasted into an empty note (the pane switches to Read).
     var onPastedDocument: (() -> Void)?
-    /// Photos or videos that finish copying after this editor has closed go to the end of the note.
+    /// Media that finishes copying after this editor has closed goes to the end of the note.
     var onAppend: ((String) -> Void)?
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
@@ -49,7 +49,7 @@ struct MarkdownEditor: NSViewRepresentable {
         tv.onCreateTask = { onCreateTask($0) }
         tv.onPastedDocument = onPastedDocument
         tv.onAppend = onAppend
-        tv.registerForDraggedTypes([.fileURL, .png, .tiff])
+        tv.updateDragTypeRegistration()
         tv.string = text
         bridge?.editor = tv
 
@@ -179,8 +179,8 @@ final class MarkdownTextView: NSTextView {
         if abs(textContainerInset.width - side) > 0.5 { textContainerInset = NSSize(width: side, height: 22) }
     }
 
-    /// Photos and videos paste in as attachments; a whole Markdown document pasted into an empty
-    /// note flips the note to its formatted view.
+    /// Photos, videos and PDFs paste in as attachments (a Markdown line of their own); a whole Markdown
+    /// document pasted into an empty note flips the note to its formatted view.
     override func paste(_ sender: Any?) {
         let pb = NSPasteboard.general
         let files = MediaLibrary.mediaFileURLs(on: pb)
@@ -210,13 +210,18 @@ final class MarkdownTextView: NSTextView {
         insertText((atLineStart ? "" : "\n") + text + "\n", replacementRange: range)
     }
 
-    /// Copies the files without holding up the app, then puts them where they were pasted or dropped.
-    /// If the user carried on meanwhile, nothing is replaced, they go in at the same offset, and the
-    /// caret stays where the user is typing.
+    /// Copies the files without holding up the app, then puts them where they were pasted.
     private func insertFiles(_ files: [URL], replacing range: NSRange) {
+        insertWhenReady(replacing: range) { MediaLibrary.importFilesInBackground(files, then: $0) }
+    }
+
+    /// Runs `start` (which copies media in the background) and puts the Markdown lines it produces
+    /// where they were pasted or dropped. If the user carried on meanwhile, nothing is replaced, they
+    /// go in at the same offset, and the caret stays where the user is typing.
+    private func insertWhenReady(replacing range: NSRange, _ start: (@escaping @MainActor ([String]) -> Void) -> Void) {
         let original = string
         let onAppend = onAppend
-        MediaLibrary.importFilesInBackground(files) { [weak self] lines in
+        start { [weak self] lines in
             guard !lines.isEmpty else {
                 NSSound.beep()
                 return
@@ -243,13 +248,26 @@ final class MarkdownTextView: NSTextView {
         }
     }
 
+    /// Text drops work as usual; photos, videos and PDFs (files, files promised by Photos or a browser,
+    /// image data, links to media on the web) are taken too.
+    override func updateDragTypeRegistration() {
+        super.updateDragTypeRegistration()
+        let types = Set(registeredDraggedTypes)
+        registerForDraggedTypes(registeredDraggedTypes + MediaLibrary.dropTypes.filter { !types.contains($0) })
+    }
+
+    /// The text view only registers its own (text) types once it's in a window.
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil { updateDragTypeRegistration() }
+    }
+
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        MediaLibrary.mediaFileURLs(on: sender.draggingPasteboard).isEmpty ? super.draggingEntered(sender) : .copy
+        MediaLibrary.dropHasMedia(sender.draggingPasteboard) ? .copy : super.draggingEntered(sender)
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        let files = MediaLibrary.mediaFileURLs(on: sender.draggingPasteboard)
-        guard !files.isEmpty else { return super.draggingUpdated(sender) }
+        guard MediaLibrary.dropHasMedia(sender.draggingPasteboard) else { return super.draggingUpdated(sender) }
         // Show where it will land.
         let index = characterIndexForInsertion(at: convert(sender.draggingLocation, from: nil))
         setSelectedRange(NSRange(location: index, length: 0))
@@ -257,11 +275,11 @@ final class MarkdownTextView: NSTextView {
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        let files = MediaLibrary.mediaFileURLs(on: sender.draggingPasteboard)
-        guard !files.isEmpty else { return super.performDragOperation(sender) }
+        let pb = sender.draggingPasteboard
+        guard MediaLibrary.dropHasMedia(pb) else { return super.performDragOperation(sender) }
         let index = characterIndexForInsertion(at: convert(sender.draggingLocation, from: nil))
         window?.makeFirstResponder(self)
-        insertFiles(files, replacing: NSRange(location: index, length: 0))
+        insertWhenReady(replacing: NSRange(location: index, length: 0)) { MediaLibrary.importDrop(pb, then: $0) }
         return true
     }
 

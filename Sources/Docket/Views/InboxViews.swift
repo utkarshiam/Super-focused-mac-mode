@@ -5,7 +5,7 @@ import Quartz
 import SwiftUI
 import UniformTypeIdentifiers
 
-// The Slack and Email tabs of "From Slack & Gmail": the message list (All · Starred, ☆ and S) and the message
+// The Slack and Email tabs of "Messages": the message list (All · Starred, ☆ and S) and the message
 // detail (header, the whole thread or conversation from ConversationViews.swift with each message's files,
 // notes, the suggested task and the reply). `SuggestionsView` in IntegrationViews.swift stays the entry point.
 
@@ -43,13 +43,6 @@ enum InboxItemText {
     static var historyScopes: Set<String> { InboxScopes.slackHistory }
     /// Saving starred messages for later in Slack (in `SlackManifest.contentScopes`).
     static let starScopes: Set<String> = ["stars:read", "stars:write"]
-
-    /// AI proposed a real task for it, not just the plain "Slack: …" / "Reply to Sam" stand-in.
-    static func hasSuggestedTask(_ s: Suggestion) -> Bool {
-        guard let draft = s.draft else { return false }
-        let title = draft.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        return !title.isEmpty && title != SuggestionDrafts.title(for: s)
-    }
 
     /// A Slack message that answers another one in a thread (not the thread's first message).
     static func isThreadReply(_ s: Suggestion) -> Bool {
@@ -616,6 +609,10 @@ private struct InboxList: View {
             let current = integrations.suggestion(item.id) ?? item
             withAnimation(Motion.gentle) { _ = integrations.add(current) }
         }
+        Button("Save as Note") {
+            NotificationCenter.default.post(name: InboxModel.saveEditsNow, object: nil)
+            InboxNotes.save(item: item.id, app: app)
+        }
         if item.source.url?.scheme == "https" {
             Button(SourceStyle.openTitle(item.source.kind)) { integrations.open(item) }
         }
@@ -624,7 +621,7 @@ private struct InboxList: View {
     }
 }
 
-/// One message in the list: who, where (or the subject), two lines of it, when, its star, and small chips.
+/// One message in the list: who, where (or the subject), two lines of it, when, its star, and one small chip.
 private struct InboxRow: View {
     let item: Suggestion
     let isSelected: Bool
@@ -702,35 +699,28 @@ private struct InboxRow: View {
         }
     }
 
+    /// At most one: Replied once you've answered it, else how many files it has.
     @ViewBuilder
     private var chips: some View {
         let files = InboxItemText.attachmentCount(item)
-        let suggested = InboxItemText.hasSuggestedTask(item)
-        if files > 0 || suggested || item.repliedAt != nil {
-            HStack(spacing: 6) {
-                if files > 0 {
-                    Badge(text: "\(files)", icon: "paperclip")
-                        .help(Fmt.plural(files, "attachment"))
-                }
-                if suggested {
-                    Badge(text: "Task suggested", icon: "checklist")
-                        .help(item.draft?.title ?? "")
-                }
-                if let replied = item.repliedAt {
-                    Badge(text: "Replied", tone: .success, icon: "arrowshape.turn.up.left")
-                        .help("You replied on \(Fmt.dateTime(replied))")
-                }
-            }
-            .padding(.top, 3)
+        if let replied = item.repliedAt {
+            Badge(text: "Replied", tone: .success, icon: "arrowshape.turn.up.left")
+                .help("You replied on \(Fmt.dateTime(replied))" + (files > 0 ? " · \(Fmt.plural(files, "attachment"))" : ""))
+                .padding(.top, 3)
+        } else if files > 0 {
+            Badge(text: "\(files)", icon: "paperclip")
+                .help(Fmt.plural(files, "attachment"))
+                .padding(.top, 3)
         }
     }
 }
 
 // MARK: - The message
 
-/// The open message: who and when, its whole thread or conversation (the message highlighted in it, every
-/// message with its files), then your notes, the suggested task and your reply. Notes and the reply are saved
-/// as you type (once typing pauses).
+/// The open message: who and when, one row of actions (Add task with the suggested task under it, Reply, Note,
+/// Dismiss), then its whole thread or conversation (the message highlighted in it, every message with its
+/// files). Notes and the reply composer show once asked for, or when there's already a note or a draft. Both
+/// are saved as you type (once typing pauses).
 struct InboxDetail: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var app: AppState
@@ -740,6 +730,8 @@ struct InboxDetail: View {
     static let plainTextKey = "inboxMailPlainText"
     /// The reply composer's scroll id: a message's Reply brings it into view.
     private static let composerID = "inbox-reply-composer"
+    /// The notes' scroll id: Note brings them into view.
+    private static let notesID = "inbox-notes"
 
     let item: Suggestion
     let paneHeight: CGFloat
@@ -761,6 +753,12 @@ struct InboxDetail: View {
     @StateObject private var quickLook = QuickLookController()
     @StateObject private var conversation: ConversationModel
     @FocusState private var noteFocused: Bool
+    /// The notes editor is out: Note was clicked, or the message already has notes.
+    @State private var showsNotes: Bool
+    /// The reply composer is out: Reply (here or on a message of the thread) was clicked, or there's a draft.
+    @State private var showsComposer: Bool
+    /// The composer came out because it was asked for, so it takes the keyboard.
+    @State private var composerAsked = false
 
     /// How long typing has to pause before notes or the reply are saved.
     private static let saveDelay: UInt64 = 600_000_000
@@ -775,11 +773,21 @@ struct InboxDetail: View {
         _savedNote = State(initialValue: item.note)
         _reply = State(initialValue: item.replyDraft)
         _savedReply = State(initialValue: item.replyDraft)
+        _showsNotes = State(initialValue: !item.note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        _showsComposer = State(initialValue: !item.replyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         // One per open message (the panes give each message its own detail).
         _conversation = StateObject(wrappedValue: ConversationModel(itemID: item.id))
     }
 
     private var content: MessageContent? { item.content ?? loaded }
+
+    /// Messages in the thread as it shows (1 until it's in).
+    private var messageCount: Int { ThreadImportance.messageCount(item, thread: conversation.thread) }
+
+    /// Changes when the thread comes in or changes, or the item is starred: time to look at its summary again.
+    private var summaryTrigger: String {
+        "\(conversation.phase) \(ThreadImportance.fingerprint(item, thread: conversation.thread)) \(item.isStarred)"
+    }
     private var isEmail: Bool { item.source.kind == .gmail }
     /// Gmail needs a sign-in that allows sending; Slack only needs to be connected.
     private var canSend: Bool { isEmail ? integrations.gmailCanCompose : integrations.isSlackConnected }
@@ -787,18 +795,35 @@ struct InboxDetail: View {
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                VStack(alignment: .leading, spacing: Space.xl) {
+                VStack(alignment: .leading, spacing: Space.lg) {
                     header
+                    InboxActionBar(item: item, leads: !ReplyText.sendLeads(reply, canSend: canSend), saveEdits: flush,
+                                   reply: { conversation.requestComposer() },
+                                   note: { openNotes(proxy) },
+                                   messageCount: messageCount,
+                                   saveAsNote: { message in
+                                       flush()
+                                       InboxNotes.save(item: item.id, message: message, app: app)
+                                   })
+                    ThreadSummaryCard(itemID: item.id)
                     ConversationSection(conversation: conversation, item: item, content: content, contentLoading: loading,
                                         contentProblem: loadProblem, retryContent: { Task { await load() } },
                                         quickLook: quickLook, paneHeight: paneHeight, updateSlack: updateSlack,
                                         reveal: { id in withAnimation(Motion.gentle) { proxy.scrollTo(id, anchor: .top) } })
-                    Rectangle().fill(Color.hair).frame(height: 1)
-                    notes
-                    SuggestedTaskSection(item: item, leads: !ReplyText.sendLeads(reply, canSend: canSend), saveEdits: flush)
-                    ReplyComposer(item: item, text: $reply, content: content, canSend: canSend, conversation: conversation,
-                                  flush: flush, reconnectGmail: { integrations.connectGmail() })
-                        .id(Self.composerID)
+                    if showsNotes || showsComposer {
+                        Rectangle().fill(Color.hair).frame(height: 1)
+                    }
+                    if showsNotes {
+                        notes
+                            .id(Self.notesID)
+                            .transition(.opacity)
+                    }
+                    if showsComposer {
+                        ReplyComposer(item: item, text: $reply, content: content, canSend: canSend, conversation: conversation,
+                                      takesFocus: composerAsked, flush: flush, reconnectGmail: { integrations.connectGmail() })
+                            .id(Self.composerID)
+                            .transition(.opacity)
+                    }
                 }
                 .frame(maxWidth: InboxLayout.readingWidth, alignment: .leading)
                 .padding(.horizontal, Space.xl)
@@ -807,13 +832,30 @@ struct InboxDetail: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .onChange(of: conversation.composerRequests) { _ in
-                // A message's Reply: the composer comes into view, pointed at that message.
-                withAnimation(Motion.gentle) { proxy.scrollTo(Self.composerID, anchor: .bottom) }
+                // Reply (here or on a message of the thread): the composer comes out and into view.
+                if !showsComposer {
+                    composerAsked = true
+                    withAnimation(Motion.gentle) { showsComposer = true }
+                }
+                DispatchQueue.main.async {
+                    withAnimation(Motion.gentle) { proxy.scrollTo(Self.composerID, anchor: .bottom) }
+                }
             }
         }
         .background(Color.paper)
         .background(QuickLookAnchor(controller: quickLook).frame(width: 0, height: 0))
         .task(id: item.id) { await load() }
+        // An important thread is summarized once it's in, and again when it changes.
+        .task(id: summaryTrigger) {
+            guard conversation.phase != .waiting && conversation.phase != .loading else { return }
+            await integrations.summarizeIfImportant(item.id)
+        }
+        .onAppear {
+            conversation.saveAsNote = { message in
+                flush()
+                InboxNotes.save(item: item.id, message: message, app: app)
+            }
+        }
         .onChange(of: note) { _ in scheduleSave(note: true) }
         .onChange(of: reply) { _ in scheduleSave(note: false) }
         .onDisappear(perform: flush)
@@ -847,6 +889,11 @@ struct InboxDetail: View {
                         .foregroundStyle(Color.ink)
                         .fixedSize(horizontal: false, vertical: true)
                     dateLine
+                    if let at = item.repliedAt {
+                        Badge(text: "Replied \(Fmt.dateTime(at))", tone: .success, icon: "checkmark")
+                            .help("You replied from Docket")
+                            .padding(.top, 2)
+                    }
                 }
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -922,15 +969,20 @@ struct InboxDetail: View {
     // MARK: Notes
 
     private var notes: some View {
-        VStack(alignment: .leading, spacing: Space.sm) {
-            Eyebrow(text: "Your notes")
-            GrowingTextEditor(text: $note, placeholder: "Add notes: what to do, what to say back…",
-                              minHeight: 56, maxHeight: 240, focus: $noteFocused)
-                .help("Your notes on this message. They go into the task if you add one, and AI follows them when it drafts a reply.")
-            Text("Saved as you type. They go into the task if you add one, and AI follows them when it drafts a reply.")
-                .textStyle(.footnote)
-                .foregroundStyle(Color.ink3)
-                .fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: Space.xs) {
+            Eyebrow(text: "Note")
+            GrowingTextEditor(text: $note, placeholder: "What to do, what to say back…",
+                              minHeight: 44, maxHeight: 200, focus: $noteFocused)
+                .help("Saved as you type. Your note goes into the task if you add one, and AI follows it when it drafts a reply.")
+        }
+    }
+
+    /// Note: the editor comes out, into view, with the keyboard.
+    private func openNotes(_ proxy: ScrollViewProxy) {
+        if !showsNotes { withAnimation(Motion.gentle) { showsNotes = true } }
+        DispatchQueue.main.async {
+            noteFocused = true
+            withAnimation(Motion.gentle) { proxy.scrollTo(Self.notesID, anchor: .center) }
         }
     }
 
@@ -1442,10 +1494,11 @@ final class QuickLookAnchorView: NSView, QLPreviewPanelDataSource, QLPreviewPane
     }
 }
 
-// MARK: - The suggested task
+// MARK: - The actions
 
-/// The task the message could become (drawn like a task line), with Add task, Edit… and Dismiss.
-private struct SuggestedTaskSection: View {
+/// The one row of actions under the message's header: Add task (the primary until there's a reply to send),
+/// Reply, Note and Dismiss; under it, the suggested task on one line (title, date, duration) with Edit….
+private struct InboxActionBar: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var app: AppState
     @ObservedObject private var integrations = Integrations.shared
@@ -1454,6 +1507,14 @@ private struct SuggestedTaskSection: View {
     let leads: Bool
     /// Saves notes still being typed: they go into the task.
     let saveEdits: () -> Void
+    /// Brings out the reply composer.
+    let reply: () -> Void
+    /// Brings out the notes.
+    let note: () -> Void
+    /// Messages in the thread: "Save Thread as Note" and "Save This Message as Note" when there's more than one.
+    let messageCount: Int
+    /// Saves the whole thread (nil) or one message of it as a note.
+    let saveAsNote: (String?) -> Void
 
     /// The message as it is now, once `saveEdits` has run: this view's copy can be a keystroke behind
     /// the notes, and they go into the task.
@@ -1461,101 +1522,130 @@ private struct SuggestedTaskSection: View {
 
     var body: some View {
         let draft = item.draft ?? SuggestionDrafts.fallback(for: item)
-        VStack(alignment: .leading, spacing: Space.md) {
-            Eyebrow(text: "Suggested task")
-            proposal(draft)
-            HStack(spacing: Space.sm) {
-                Button {
-                    saveEdits()
-                    withAnimation(Motion.gentle) { _ = integrations.add(current) }
-                } label: { Label("Add task", systemImage: "plus") }
-                    .buttonStyle(LeadPill(primary: leads, height: 32))
-                    .help("Add this as a task, with your notes and a link back to the message")
-                Button("Edit…") {
-                    saveEdits()
-                    integrations.edit(current)
+        VStack(alignment: .leading, spacing: 10) {
+            // The longest labels that fit, so nothing wraps in a narrow pane.
+            ViewThatFits(in: .horizontal) {
+                buttons(iconsOnly: false, dismissLabel: true)
+                buttons(iconsOnly: false, dismissLabel: false)
+                buttons(iconsOnly: true, dismissLabel: false)
+            }
+            taskLine(draft)
+        }
+        .padding(Space.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(RoundedRectangle(cornerRadius: Radius.md, style: .continuous).strokeBorder(Color.hair, lineWidth: 1))
+    }
+
+    private func buttons(iconsOnly: Bool, dismissLabel: Bool) -> some View {
+        HStack(spacing: Space.sm) {
+            Button {
+                saveEdits()
+                withAnimation(Motion.gentle) { _ = integrations.add(current) }
+            } label: { Label("Add task", systemImage: "plus") }
+                .buttonStyle(LeadPill(primary: leads, height: 32))
+                .help("Add the suggested task, with your note and a link back to the message")
+            secondary("Reply", icon: "arrowshape.turn.up.left", iconOnly: iconsOnly, action: reply)
+                .help(item.source.kind == .gmail ? "Write a reply to this email" : "Write a reply in the message's thread")
+            secondary("Note", icon: "square.and.pencil", iconOnly: iconsOnly, action: note)
+                .help("Add a note: it goes into the task, and AI follows it when it drafts a reply")
+            Spacer(minLength: 0)
+            more
+            secondary("Dismiss", icon: "xmark", iconOnly: !dismissLabel) {
+                withAnimation(Motion.gentle) { integrations.dismiss(item) }
+            }
+            .help("Take this message off the list (⌘Z brings it back)")
+        }
+    }
+
+    /// ⋯: save as a note (the whole thread, or just this message), summarize.
+    private var more: some View {
+        Menu {
+            Button(messageCount > 1 ? "Save Thread as Note" : "Save as Note") { saveAsNote(nil) }
+            if messageCount > 1 {
+                Button("Save This Message as Note") { saveAsNote(InboxThread.bareMessageID(item.id)) }
+            }
+            if integrations.showsSummaries {
+                Divider()
+                Button(integrations.summary(for: item.id) == nil ? "Summarize" : "Summarize Again") {
+                    Task { await integrations.summarize(item.id, force: true) }
                 }
+                .disabled(integrations.summarizing.contains(item.id))
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Color.ink)
+                .frame(width: 32, height: 32)
+        }
+        .menuChrome(Circle())
+        .help("Save as a note with its attachments, or summarize the thread")
+        .accessibilityLabel("More")
+    }
+
+    @ViewBuilder
+    private func secondary(_ title: String, icon: String, iconOnly: Bool, action: @escaping () -> Void) -> some View {
+        if iconOnly {
+            Button(action: action) { Image(systemName: icon).font(.system(size: 12.5, weight: .semibold)) }
+                .buttonStyle(IconButtonStyle(size: 32, filled: true))
+                .accessibilityLabel(title)
+        } else {
+            Button(action: action) { Label(title, systemImage: icon) }
                 .buttonStyle(SecondaryPill(height: 32))
-                .help("Change the task before adding it")
-                Button("Dismiss") { withAnimation(Motion.gentle) { integrations.dismiss(item) } }
-                    .buttonStyle(SecondaryPill(height: 32))
-                    .help("Take this message off the list (⌘Z brings it back)")
-                Spacer(minLength: 0)
-            }
         }
     }
 
-    /// Title on the left, date bold on the right, the duration pill (under the title when the pane is
-    /// narrow, as in a task list); then priority, list and the reason.
-    private func proposal(_ draft: TaskDraft) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .center, spacing: Space.sm) {
-                Image(systemName: "circle")
-                    .font(.system(size: 15, weight: .regular))
-                    .foregroundStyle(Color.ink3)
-                TitleWhenLayout(spacing: Space.md) {
-                    Text(draft.title)
-                        .font(.system(size: 15, weight: .semibold))
-                        .tracking(-0.2)
-                        .foregroundStyle(Color.ink)
-                        .lineLimit(2)
-                    HStack(spacing: Space.sm) {
-                        if let due = draft.due {
-                            Text(Fmt.due(due, hasTime: draft.dueHasTime, now: app.clock))
-                                .font(.system(size: 15, weight: .bold))
-                                .tracking(-0.2)
-                                .monospacedDigit()
-                                .foregroundStyle(Color.ink)
-                                .lineLimit(1)
-                        }
-                        if let minutes = draft.estimateMinutes, minutes > 0 {
-                            DurationPill(minutes: minutes)
-                        }
-                    }
+    /// "○ Send the Q3 deck to Lena   Mon 5 Oct · 10:00 AM  30m  Edit…": the title gives way first.
+    private func taskLine(_ draft: TaskDraft) -> some View {
+        HStack(alignment: .center, spacing: Space.sm) {
+            Image(systemName: "circle")
+                .font(.system(size: 12, weight: .regular))
+                .foregroundStyle(Color.ink3)
+            Text(draft.title)
+                .font(.system(size: 13.5, weight: .semibold))
+                .foregroundStyle(Color.ink)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .layoutPriority(-1)
+            Spacer(minLength: Space.xs)
+            if let due = draft.due {
+                Text(Fmt.due(due, hasTime: draft.dueHasTime, now: app.clock))
+                    .font(.system(size: 13, weight: .bold))
+                    .monospacedDigit()
+                    .foregroundStyle(Color.ink)
+                    .lineLimit(1)
                     .fixedSize()
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            let chips = details(draft)
-            if !chips.isEmpty || !(draft.reason ?? "").isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    if !chips.isEmpty {
-                        HStack(spacing: 6) {
-                            ForEach(chips, id: \.text) { chip in Chip(icon: chip.icon, text: chip.text, tone: chip.tone) }
-                        }
-                    }
-                    if let reason = draft.reason, !reason.isEmpty {
-                        Label(reason, systemImage: "sparkles")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(Color.ink3)
-                            .lineLimit(2)
-                    }
-                }
-                .padding(.leading, 15 + Space.sm)
+            if let minutes = draft.estimateMinutes, minutes > 0 {
+                DurationPill(minutes: minutes)
+                    .fixedSize()
             }
+            Button("Edit…") {
+                saveEdits()
+                integrations.edit(current)
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 12.5, weight: .semibold))
+            .foregroundStyle(Color.ink2)
+            .fixedSize()
+            .help("Change the task (title, date, duration, list) before adding it")
         }
-        .padding(.horizontal, Space.md)
-        .padding(.vertical, 10)
-        .background(RoundedRectangle(cornerRadius: Radius.md, style: .continuous).fill(Color.fill))
+        .help(summary(draft))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Suggested task")
     }
 
-    private struct Detail {
-        var icon: String
-        var text: String
-        var tone: Tone = .neutral
-    }
-
-    /// Priority, list, who it's waiting on, steps: whatever the draft has beyond its date and duration.
-    private func details(_ draft: TaskDraft) -> [Detail] {
-        var chips: [Detail] = []
-        if let tone = draft.priority.tone { chips.append(Detail(icon: "flag", text: draft.priority.label, tone: tone)) }
+    /// The tooltip: the task's title and whatever else it has (priority, list, who it waits on, steps, why).
+    private func summary(_ draft: TaskDraft) -> String {
+        var parts = ["Suggested task: \(draft.title)"]
+        if draft.priority.tone != nil { parts.append("\(draft.priority.label) priority") }
         let listName = (draft.listName ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "#").union(.whitespaces))
         if !listName.isEmpty,
            let list = store.lists.first(where: { $0.name.compare(listName, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }) {
-            chips.append(Detail(icon: list.icon, text: list.name))
+            parts.append("List: \(list.name)")
         }
-        if let who = draft.waitingOn?.trimmingCharacters(in: .whitespaces), !who.isEmpty { chips.append(Detail(icon: "hourglass", text: "Waiting on \(who)")) }
-        if !draft.subtasks.isEmpty { chips.append(Detail(icon: "checklist", text: Fmt.plural(draft.subtasks.count, "step"))) }
-        return chips
+        if let who = draft.waitingOn?.trimmingCharacters(in: .whitespaces), !who.isEmpty { parts.append("Waiting on \(who)") }
+        if !draft.subtasks.isEmpty { parts.append(Fmt.plural(draft.subtasks.count, "step")) }
+        if let reason = draft.reason, !reason.isEmpty { parts.append(reason) }
+        return parts.joined(separator: "\n")
     }
 }

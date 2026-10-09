@@ -13,13 +13,21 @@ struct TaskDetailView: View {
     @State private var showDuePicker = false
     @State private var customReminderDate: Date?
     @State private var customReminderAlarm = false
+    /// "+ Repeat" → Custom…: its own popover, anchored on the Add card (the chip goes away once it's set).
+    @State private var showAddCustomRepeat = false
+    /// Optional rows the user asked for with an Add chip before they hold anything.
+    @State private var revealed: Set<Extra> = []
+    @FocusState private var field: Field?
+
+    private enum Extra: Hashable { case steps, tags, waiting }
+    private enum Field: Hashable { case step, tag }
 
     var body: some View {
         let binding = store.binding(forTask: taskID)
         let task = binding.wrappedValue
 
         ScrollView {
-            VStack(alignment: .leading, spacing: Space.xl) {
+            VStack(alignment: .leading, spacing: Space.lg) {
                 HStack(alignment: .top, spacing: Space.md) {
                     CheckCircle(done: task.isCompleted, priority: task.priority, size: 26) {
                         app.toggle(taskID, in: store)
@@ -36,22 +44,23 @@ struct TaskDetailView: View {
                         .help("Close")
                 }
 
-                whenHero(task, binding)
                 SlipNudge(taskID: taskID)
+                whenHero(task, binding)
+                focusRow(task)
+                essentialsSection(task, binding)
 
                 TextField("Add notes", text: binding.notes, axis: .vertical)
                     .textFieldStyle(.plain)
                     .font(.system(size: 14))
                     .foregroundStyle(Color.bodyText)
-                    .lineLimit(2...14)
-                    .padding(Space.md)
+                    .lineLimit(1...14)
+                    .padding(.horizontal, Space.md)
+                    .padding(.vertical, 10)
                     .background(RoundedRectangle(cornerRadius: Radius.md, style: .continuous).fill(Color.fill))
 
-                timeSection(task, binding)
-                scheduleSection(task, binding)
-                remindersSection(task, binding)
-                detailsSection(task, binding)
-                checklistSection(task, binding)
+                setSection(task, binding)
+                if showsChecklist(task) { checklistSection(task, binding) }
+                addSection(task, binding)
 
                 SourceLinkButton(taskID: taskID)
                 if let noteID = task.linkedNoteID, let note = store.note(noteID) {
@@ -69,6 +78,30 @@ struct TaskDetailView: View {
             .padding(Space.xl)
         }
         .background(Color.paper)
+        .onChange(of: taskID) { _ in
+            revealed = []
+            newSubtask = ""
+            newTag = ""
+        }
+    }
+
+    private func showsChecklist(_ task: TaskItem) -> Bool {
+        !task.subtasks.isEmpty || revealed.contains(.steps)
+    }
+
+    private func showsTags(_ task: TaskItem) -> Bool {
+        !task.tags.isEmpty || revealed.contains(.tags)
+    }
+
+    private func showsWaiting(_ task: TaskItem) -> Bool {
+        Delegation.normalized(task.waitingOn) != nil || revealed.contains(.waiting)
+    }
+
+    /// Shows an optional row and, once it's on screen, puts the cursor in it.
+    private func reveal(_ extra: Extra, focusing target: Field? = nil) {
+        withAnimation(Motion.base) { _ = revealed.insert(extra) }
+        guard let target else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { field = target }
     }
 
     // MARK: When (the one Panel)
@@ -79,16 +112,16 @@ struct TaskDetailView: View {
         Button { showDuePicker = true } label: {
             Panel {
                 HStack(alignment: .center) {
-                    VStack(alignment: .leading, spacing: 4) {
+                    VStack(alignment: .leading, spacing: 3) {
                         Text(task.dueDate == nil ? "No deadline" : (task.isOverdue(now: now) ? "Overdue" : "Due"))
                             .textStyle(.eyebrow)
                             .foregroundStyle(task.isOverdue(now: now) ? Color(nsColor: Palette.dangerFg) : Color.onDark58)
                         if let due = task.dueDate {
                             if task.dueHasTime {
-                                BigTime(date: due, size: 34, color: .white)
+                                BigTime(date: due, size: 30, color: .white)
                             } else {
                                 Text(Fmt.absoluteDay(due, now: now))
-                                    .font(.system(size: 34, weight: .bold))
+                                    .font(.system(size: 30, weight: .bold))
                                     .tracking(-0.8)
                                     .foregroundStyle(Color.white)
                             }
@@ -109,7 +142,7 @@ struct TaskDetailView: View {
                             .foregroundStyle(Color.onDark58)
                         } else {
                             Text("Set a date")
-                                .font(.system(size: 26, weight: .bold))
+                                .font(.system(size: 22, weight: .bold))
                                 .tracking(-0.6)
                                 .foregroundStyle(Color.white)
                         }
@@ -117,10 +150,10 @@ struct TaskDetailView: View {
                     .layoutPriority(1)
                     Spacer()
                     if let est = task.estimateMinutes {
-                        VStack(alignment: .trailing, spacing: 4) {
+                        VStack(alignment: .trailing, spacing: 3) {
                             Text("Takes").textStyle(.eyebrow).foregroundStyle(Color.onDark58)
                             Text(Fmt.duration(minutes: est))
-                                .font(.system(size: 22, weight: .bold))
+                                .font(.system(size: 20, weight: .bold))
                                 .tracking(-0.4)
                                 .monospacedDigit()
                                 .foregroundStyle(Color.white)
@@ -144,11 +177,60 @@ struct TaskDetailView: View {
         return f.localizedString(for: date, relativeTo: now)
     }
 
-    // MARK: Time & focus
+    // MARK: Focus (the one primary action)
 
     @ViewBuilder
-    private func timeSection(_ task: TaskItem, _ binding: Binding<TaskItem>) -> some View {
-        DetailSection("Time") {
+    private func focusRow(_ task: TaskItem) -> some View {
+        if focus.taskID == taskID {
+            TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                HStack(spacing: Space.md) {
+                    Text(focus.clock(at: ctx.date))
+                        .font(.system(size: 22, weight: .bold))
+                        .tracking(-0.4)
+                        .monospacedDigit()
+                        .foregroundStyle(Color.ink)
+                    Spacer()
+                    Button { focus.togglePause() } label: { Image(systemName: focus.isPaused ? "play.fill" : "pause.fill") }
+                        .buttonStyle(IconButtonStyle(filled: true))
+                        .help(focus.isPaused ? "Resume" : "Pause")
+                    Button("Done") { focus.stop(markDone: true) }
+                        .buttonStyle(PrimaryPill(height: 32))
+                        .help("Stop, log the time and tick it off")
+                    Button { focus.stop(markDone: false) } label: { Image(systemName: "stop.fill") }
+                        .buttonStyle(IconButtonStyle(filled: true))
+                        .help("Stop and log time")
+                }
+                .padding(.horizontal, Space.md)
+                .padding(.vertical, 8)
+                .hairlineCard(radius: Radius.lg)
+            }
+        } else if !task.isCompleted {
+            let minutes = task.remainingMinutes > 0 ? task.remainingMinutes : Prefs.focusMinutes
+            HStack(spacing: Space.sm) {
+                Button { focus.start(taskID: taskID, minutes: minutes) } label: {
+                    Label("Focus \(Fmt.duration(minutes: minutes))", systemImage: "play.fill")
+                }
+                .buttonStyle(PrimaryPill(height: 32))
+                .help("Start a \(Fmt.duration(minutes: minutes)) focus session on it")
+                Button { focus.start(taskID: taskID, minutes: nil) } label: { Image(systemName: "stopwatch") }
+                    .buttonStyle(IconButtonStyle(filled: true))
+                    .help("Stopwatch: count up with no time limit")
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    // MARK: Essentials (always shown)
+
+    @ViewBuilder
+    private func essentialsSection(_ task: TaskItem, _ binding: Binding<TaskItem>) -> some View {
+        DetailSection("") {
+            DetailRow(icon: "flag.checkered", label: "Deadline") {
+                DateChooser(date: binding.dueDate, hasTime: binding.dueHasTime, allowsTime: true, placeholder: "None", title: "Deadline")
+            }
+            DetailRow(icon: "sun.max", label: "Do on") {
+                DateChooser(date: binding.scheduledDate, hasTime: .constant(false), allowsTime: false, placeholder: "Anytime", title: "Do on")
+            }
             DetailRow(icon: "hourglass", label: "Estimate") {
                 Menu {
                     Button("No estimate") { binding.wrappedValue.estimateMinutes = nil }
@@ -178,81 +260,88 @@ struct TaskDetailView: View {
                     ValueLabel(Fmt.duration(seconds: task.trackedSeconds))
                 }
             }
-            if focus.taskID == taskID {
-                TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                    HStack(spacing: Space.md) {
-                        Text(focus.clock(at: ctx.date))
-                            .font(.system(size: 22, weight: .bold))
-                            .tracking(-0.4)
-                            .monospacedDigit()
-                            .foregroundStyle(Color.ink)
-                        Spacer()
-                        Button { focus.togglePause() } label: { Image(systemName: focus.isPaused ? "play.fill" : "pause.fill") }
-                            .buttonStyle(IconButtonStyle(filled: true))
-                        Button("Done") { focus.stop(markDone: true) }
-                            .buttonStyle(PrimaryPill(height: 32))
-                        Button { focus.stop(markDone: false) } label: { Image(systemName: "stop.fill") }
-                            .buttonStyle(IconButtonStyle(filled: true))
-                            .help("Stop and log time")
-                    }
-                    .padding(.horizontal, Space.md)
-                    .padding(.vertical, 10)
-                }
-            } else if !task.isCompleted {
-                HStack(spacing: Space.sm) {
-                    let minutes = task.remainingMinutes > 0 ? task.remainingMinutes : Prefs.focusMinutes
-                    Button { focus.start(taskID: taskID, minutes: minutes) } label: {
-                        Label("Focus \(Fmt.duration(minutes: minutes))", systemImage: "play.fill")
-                    }
-                    .buttonStyle(PrimaryPill(height: 32))
-                    Button("25m") { focus.start(taskID: taskID, minutes: 25) }
-                        .buttonStyle(SecondaryPill(height: 32))
-                    Button { focus.start(taskID: taskID, minutes: nil) } label: { Image(systemName: "stopwatch") }
-                        .buttonStyle(IconButtonStyle(filled: true))
-                        .help("Stopwatch: count up with no time limit")
-                }
-                .padding(.horizontal, Space.md)
-                .padding(.vertical, 10)
-            }
-        }
-    }
-
-    // MARK: Schedule
-
-    @ViewBuilder
-    private func scheduleSection(_ task: TaskItem, _ binding: Binding<TaskItem>) -> some View {
-        DetailSection("Schedule") {
-            DetailRow(icon: "flag.checkered", label: "Deadline") {
-                DateChooser(date: binding.dueDate, hasTime: binding.dueHasTime, allowsTime: true, placeholder: "None", title: "Deadline")
-            }
-            DetailRow(icon: "sun.max", label: "Do on") {
-                DateChooser(date: binding.scheduledDate, hasTime: .constant(false), allowsTime: false, placeholder: "Anytime", title: "Do on")
-            }
-            DetailRow(icon: "repeat", label: "Repeat") {
+            DetailRow(icon: store.list(task.listID)?.icon ?? "tray", label: "List") {
                 Menu {
-                    Button("Never") { setRecurrence(nil, binding) }
-                    Divider()
-                    Button("Every day") { setRecurrence(.daily, binding) }
-                    Button("Every weekday") { setRecurrence(.weekdaysOnly, binding) }
-                    Button("Every week") { setRecurrence(weeklyOnDueDay(task), binding) }
-                    Button("Every 2 weeks") { setRecurrence(Recurrence(frequency: .weekly, interval: 2), binding) }
-                    Button("Every month") { setRecurrence(.monthly, binding) }
-                    Button("Every year") { setRecurrence(.yearly, binding) }
-                    Divider()
-                    Button("Custom…") { showCustomRepeat = true }
+                    Button("Inbox") { binding.wrappedValue.listID = nil }
+                    ForEach(store.lists) { list in
+                        Button(list.name) { binding.wrappedValue.listID = list.id }
+                    }
                 } label: {
-                    ValueLabel(task.recurrence?.summary ?? "Never", muted: task.recurrence == nil)
+                    ValueLabel(store.list(task.listID)?.name ?? "Inbox")
                         .padding(.horizontal, 6)
                         .frame(height: 26)
                 }
                 .menuChrome(RoundedRectangle(cornerRadius: Radius.xs, style: .continuous), fill: .clear, hoverFill: .pressedTint, truncates: true)
                 .padding(.trailing, -6)
-                .help(task.recurrence?.summary ?? "Doesn't repeat")
-                .popover(isPresented: $showCustomRepeat) {
-                    CustomRepeatEditor(initial: task.recurrence ?? .weekly) { setRecurrence($0, binding) }
+                .help(store.list(task.listID)?.name ?? "Inbox")
+            }
+            DetailRow(icon: "flag", label: "Priority") {
+                Menu {
+                    ForEach(Priority.allCases.reversed()) { p in
+                        Button(p.label) { binding.wrappedValue.priority = p }
+                    }
+                } label: {
+                    Text(task.priority.label)
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(task.priority.tone?.fg ?? (task.priority == .none ? Color.ink3 : Color.ink))
+                        .padding(.horizontal, task.priority.tone == nil ? 0 : 9)
+                        .frame(height: 24)
                 }
+                .menuChrome(Capsule(), fill: task.priority.tone?.bg ?? .clear, hoverFill: task.priority.tone?.border ?? .pressedTint)
+                .help("Priority")
             }
         }
+    }
+
+    // MARK: Set (only the optional things this task has)
+
+    @ViewBuilder
+    private func setSection(_ task: TaskItem, _ binding: Binding<TaskItem>) -> some View {
+        let any = task.recurrence != nil || !task.reminders.isEmpty || showsWaiting(task) || showsTags(task)
+        if any {
+            VStack(alignment: .leading, spacing: 0) {
+                if task.recurrence != nil { repeatRow(task, binding) }
+                reminderRows(task, binding)
+                if showsWaiting(task) { DelegateRow(taskID: taskID, focusOnAppear: revealed.contains(.waiting)) }
+                if showsTags(task) { tagsRow(task, binding) }
+            }
+            .hairlineCard(radius: Radius.lg)
+            .transition(.opacity)
+        }
+    }
+
+    private func repeatRow(_ task: TaskItem, _ binding: Binding<TaskItem>) -> some View {
+        DetailRow(icon: "repeat", label: "Repeat") {
+            Menu {
+                repeatChoices(task, binding) { showCustomRepeat = true }
+            } label: {
+                ValueLabel(task.recurrence?.summary ?? "Never", muted: task.recurrence == nil)
+                    .padding(.horizontal, 6)
+                    .frame(height: 26)
+            }
+            .menuChrome(RoundedRectangle(cornerRadius: Radius.xs, style: .continuous), fill: .clear, hoverFill: .pressedTint, truncates: true)
+            .padding(.trailing, -6)
+            .help(task.recurrence?.summary ?? "Doesn't repeat")
+            .popover(isPresented: $showCustomRepeat) {
+                CustomRepeatEditor(initial: task.recurrence ?? .weekly) { setRecurrence($0, binding) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func repeatChoices(_ task: TaskItem, _ binding: Binding<TaskItem>, custom: @escaping () -> Void) -> some View {
+        if task.recurrence != nil {
+            Button("Never") { setRecurrence(nil, binding) }
+            Divider()
+        }
+        Button("Every day") { setRecurrence(.daily, binding) }
+        Button("Every weekday") { setRecurrence(.weekdaysOnly, binding) }
+        Button("Every week") { setRecurrence(weeklyOnDueDay(task), binding) }
+        Button("Every 2 weeks") { setRecurrence(Recurrence(frequency: .weekly, interval: 2), binding) }
+        Button("Every month") { setRecurrence(.monthly, binding) }
+        Button("Every year") { setRecurrence(.yearly, binding) }
+        Divider()
+        Button("Custom…", action: custom)
     }
 
     private func weeklyOnDueDay(_ task: TaskItem) -> Recurrence {
@@ -272,67 +361,49 @@ struct TaskDetailView: View {
 
     // MARK: Reminders
 
-    @ViewBuilder
-    private func remindersSection(_ task: TaskItem, _ binding: Binding<TaskItem>) -> some View {
-        DetailSection("Reminders and alarms") {
-            ForEach(task.reminders) { r in
-                let fire = r.fireDate(for: task, allDayHour: Prefs.allDayHour)
-                HStack(spacing: Space.md) {
-                    Button {
-                        if let i = binding.wrappedValue.reminders.firstIndex(where: { $0.id == r.id }) {
-                            withAnimation(Motion.snappy) { binding.wrappedValue.reminders[i].isAlarm.toggle() }
-                        }
-                    } label: {
-                        Image(systemName: r.isAlarm ? "alarm.fill" : "bell.fill")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(r.isAlarm ? Color.onPrimary : Color.ink)
-                            .frame(width: 28, height: 28)
-                            .background(Circle().fill(r.isAlarm ? Color.primaryFill : Color.fill))
+    private func reminderRows(_ task: TaskItem, _ binding: Binding<TaskItem>) -> some View {
+        ForEach(task.reminders) { r in
+            let fire = r.fireDate(for: task, allDayHour: Prefs.allDayHour)
+            HStack(spacing: Space.md) {
+                Button {
+                    if let i = binding.wrappedValue.reminders.firstIndex(where: { $0.id == r.id }) {
+                        withAnimation(Motion.snappy) { binding.wrappedValue.reminders[i].isAlarm.toggle() }
                     }
-                    .buttonStyle(PressScale(scale: 0.9))
-                    .help(r.isAlarm ? "Alarm. Click to make it a quiet notification" : "Notification. Click to make it a loud alarm")
-                    VStack(alignment: .leading, spacing: 2) {
-                        let kind = r.isAlarm ? "Alarm" : "Reminder"
-                        Text((r.isSnooze ? "snoozed" : r.describe(for: task)).map { "\(kind) · \($0)" } ?? kind)
-                            .textStyle(.subheadStrong)
-                            .foregroundStyle(Color.ink)
-                        if let fire {
-                            Text(Fmt.dateTime(fire))
-                                .textStyle(.caption)
-                                .foregroundStyle(fire < Date() ? Color.dangerText : Color.ink2)
-                        } else {
-                            Text("Needs a deadline").textStyle(.caption).foregroundStyle(Color.dangerText)
-                        }
-                    }
-                    Spacer()
-                    Button {
-                        withAnimation(Motion.base) { binding.wrappedValue.reminders.removeAll { $0.id == r.id } }
-                    } label: { Image(systemName: "xmark") }
-                        .buttonStyle(IconButtonStyle(size: 24))
+                } label: {
+                    Image(systemName: r.isAlarm ? "alarm.fill" : "bell.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(r.isAlarm ? Color.onPrimary : Color.ink)
+                        .frame(width: 28, height: 28)
+                        .background(Circle().fill(r.isAlarm ? Color.primaryFill : Color.fill))
                 }
-                .padding(.horizontal, Space.md)
-                .padding(.vertical, 8)
-                .transition(.opacity.combined(with: .move(edge: .top)))
-            }
-
-            HStack(spacing: Space.sm) {
-                addReminderMenu(task, binding, alarm: false)
-                addReminderMenu(task, binding, alarm: true)
+                .buttonStyle(PressScale(scale: 0.9))
+                .help(r.isAlarm ? "Alarm. Click to make it a quiet notification" : "Notification. Click to make it a loud alarm")
+                VStack(alignment: .leading, spacing: 2) {
+                    let kind = r.isAlarm ? "Alarm" : "Reminder"
+                    Text((r.isSnooze ? "snoozed" : r.describe(for: task)).map { "\(kind) · \($0)" } ?? kind)
+                        .textStyle(.subheadStrong)
+                        .foregroundStyle(Color.ink)
+                    if let fire {
+                        Text(Fmt.dateTime(fire))
+                            .textStyle(.caption)
+                            .foregroundStyle(fire < Date() ? Color.dangerText : Color.ink2)
+                    } else {
+                        Text("Needs a deadline").textStyle(.caption).foregroundStyle(Color.dangerText)
+                    }
+                }
                 Spacer()
+                Button {
+                    withAnimation(Motion.base) { binding.wrappedValue.reminders.removeAll { $0.id == r.id } }
+                } label: { Image(systemName: "xmark") }
+                    .buttonStyle(IconButtonStyle(size: 24))
+                    .help(r.isAlarm ? "Remove this alarm" : "Remove this reminder")
             }
             .padding(.horizontal, Space.md)
-            .padding(.vertical, 10)
-            .popover(isPresented: $showCustomReminder, arrowEdge: .bottom) {
-                DatePopover(date: $customReminderDate, hasTime: .constant(true), allowsTime: true,
-                            title: customReminderAlarm ? "Alarm at" : "Remind me at", timeRequired: true,
-                            confirmLabel: customReminderAlarm ? "Add alarm" : "Add reminder",
-                            close: { showCustomReminder = false }) {
-                    guard let when = customReminderDate else { return }
-                    withAnimation(Motion.base) {
-                        binding.wrappedValue.reminders.append(Reminder(trigger: .absolute(when), isAlarm: customReminderAlarm))
-                    }
-                }
+            .padding(.vertical, 8)
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(Color.hair).frame(height: 1).padding(.leading, 42)
             }
+            .transition(.opacity.combined(with: .move(edge: .top)))
         }
     }
 
@@ -364,13 +435,10 @@ struct TaskDetailView: View {
                 }
             }
         } label: {
-            Label(alarm ? "Alarm" : "Reminder", systemImage: "plus")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(Color.ink)
-                .padding(.horizontal, 12)
-                .frame(height: 30)
+            chipLabel(alarm ? "Alarm" : "Reminder")
         }
         .menuChrome(Capsule())
+        .help(alarm ? "Add a loud alarm" : "Add a quiet reminder")
     }
 
     private func todayAt(_ hour: Int, plusDays: Int = 0) -> Date {
@@ -387,86 +455,118 @@ struct TaskDetailView: View {
         }
     }
 
-    // MARK: Details
+    // MARK: Tags
 
-    @ViewBuilder
-    private func detailsSection(_ task: TaskItem, _ binding: Binding<TaskItem>) -> some View {
-        DetailSection("Details") {
-            DetailRow(icon: "flag", label: "Priority") {
-                Menu {
-                    ForEach(Priority.allCases.reversed()) { p in
-                        Button(p.label) { binding.wrappedValue.priority = p }
+    private func tagsRow(_ task: TaskItem, _ binding: Binding<TaskItem>) -> some View {
+        VStack(alignment: .leading, spacing: Space.sm) {
+            HStack(alignment: .firstTextBaseline, spacing: Space.md) {
+                Image(systemName: "number")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Color.ink2)
+                    .frame(width: 18)
+                Text("Tags").textStyle(.subhead).foregroundStyle(Color.ink2).lineLimit(1).fixedSize()
+                TextField("Add tag", text: $newTag)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13, weight: .medium))
+                    .multilineTextAlignment(.trailing)
+                    .focused($field, equals: .tag)
+                    .onSubmit {
+                        let tag = newTag.trimmingCharacters(in: CharacterSet(charactersIn: "# ")).replacingOccurrences(of: " ", with: "-")
+                        if !tag.isEmpty, !binding.wrappedValue.tags.contains(tag) {
+                            withAnimation(Motion.base) { binding.wrappedValue.tags.append(tag) }
+                        }
+                        newTag = ""
                     }
-                } label: {
-                    Text(task.priority.label)
-                        .font(.system(size: 12.5, weight: .semibold))
-                        .foregroundStyle(task.priority.tone?.fg ?? (task.priority == .none ? Color.ink3 : Color.ink))
-                        .padding(.horizontal, task.priority.tone == nil ? 0 : 9)
+            }
+            // Chips get the row's full width under the label and wrap as needed.
+            if !task.tags.isEmpty {
+                FlowLayout(spacing: 4, lineSpacing: 6) {
+                    ForEach(task.tags, id: \.self) { tag in
+                        HStack(spacing: 4) {
+                            Text("#\(tag)").lineLimit(1).truncationMode(.middle)
+                            Button { withAnimation(Motion.base) { binding.wrappedValue.tags.removeAll { $0 == tag } } } label: {
+                                Image(systemName: "xmark").font(.system(size: 8, weight: .bold))
+                                    .padding(6).contentShape(Rectangle()).padding(-6)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Remove #\(tag)")
+                        }
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.ink)
+                        .padding(.horizontal, 9)
                         .frame(height: 24)
-                }
-                .menuChrome(Capsule(), fill: task.priority.tone?.bg ?? .clear, hoverFill: task.priority.tone?.border ?? .pressedTint)
-            }
-            DetailRow(icon: store.list(task.listID)?.icon ?? "tray", label: "List") {
-                Menu {
-                    Button("Inbox") { binding.wrappedValue.listID = nil }
-                    ForEach(store.lists) { list in
-                        Button(list.name) { binding.wrappedValue.listID = list.id }
+                        .background(Capsule().fill(Color.fill))
                     }
-                } label: {
-                    ValueLabel(store.list(task.listID)?.name ?? "Inbox")
-                        .padding(.horizontal, 6)
-                        .frame(height: 26)
                 }
-                .menuChrome(RoundedRectangle(cornerRadius: Radius.xs, style: .continuous), fill: .clear, hoverFill: .pressedTint, truncates: true)
-                .padding(.trailing, -6)
-                .help(store.list(task.listID)?.name ?? "Inbox")
+                .padding(.leading, 18 + Space.md)
             }
-            DelegateRow(taskID: taskID)
-            VStack(alignment: .leading, spacing: Space.sm) {
-                HStack(alignment: .firstTextBaseline, spacing: Space.md) {
-                    Image(systemName: "number")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(Color.ink2)
-                        .frame(width: 18)
-                    Text("Tags").textStyle(.subhead).foregroundStyle(Color.ink2).lineLimit(1).fixedSize()
-                    TextField("Add tag", text: $newTag)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13, weight: .medium))
-                        .multilineTextAlignment(.trailing)
-                        .onSubmit {
-                            let tag = newTag.trimmingCharacters(in: CharacterSet(charactersIn: "# ")).replacingOccurrences(of: " ", with: "-")
-                            if !tag.isEmpty, !binding.wrappedValue.tags.contains(tag) {
-                                withAnimation(Motion.base) { binding.wrappedValue.tags.append(tag) }
-                            }
-                            newTag = ""
-                        }
-                }
-                // Chips get the row's full width under the label and wrap as needed.
-                if !task.tags.isEmpty {
-                    FlowLayout(spacing: 4, lineSpacing: 6) {
-                        ForEach(task.tags, id: \.self) { tag in
-                            HStack(spacing: 4) {
-                                Text("#\(tag)").lineLimit(1).truncationMode(.middle)
-                                Button { withAnimation(Motion.base) { binding.wrappedValue.tags.removeAll { $0 == tag } } } label: {
-                                    Image(systemName: "xmark").font(.system(size: 8, weight: .bold))
-                                        .padding(6).contentShape(Rectangle()).padding(-6)
-                                }
-                                .buttonStyle(.plain)
-                                .help("Remove #\(tag)")
-                            }
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(Color.ink)
-                            .padding(.horizontal, 9)
-                            .frame(height: 24)
-                            .background(Capsule().fill(Color.fill))
-                        }
-                    }
-                    .padding(.leading, 18 + Space.md)
-                }
-            }
-            .padding(.horizontal, Space.md)
-            .padding(.vertical, 12)
         }
+        .padding(.horizontal, Space.md)
+        .padding(.vertical, 12)
+    }
+
+    // MARK: Add (what isn't set yet)
+
+    private func addSection(_ task: TaskItem, _ binding: Binding<TaskItem>) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            FlowLayout(spacing: Space.sm, lineSpacing: Space.sm) {
+                addReminderMenu(task, binding, alarm: false)
+                addReminderMenu(task, binding, alarm: true)
+                if task.recurrence == nil {
+                    Menu {
+                        repeatChoices(task, binding) { showAddCustomRepeat = true }
+                    } label: {
+                        chipLabel("Repeat")
+                    }
+                    .menuChrome(Capsule())
+                    .help("Make it repeat")
+                }
+                if !showsChecklist(task) {
+                    addChip("Step", help: "Add a checklist step") { reveal(.steps, focusing: .step) }
+                }
+                if !showsTags(task) {
+                    addChip("Tag", help: "Add a tag") { reveal(.tags, focusing: .tag) }
+                }
+                if !showsWaiting(task) {
+                    addChip("Waiting on", help: "Note who's doing it. It moves to Waiting.") { reveal(.waiting) }
+                }
+            }
+            .padding(Space.md)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .popover(isPresented: $showCustomReminder, arrowEdge: .bottom) {
+                DatePopover(date: $customReminderDate, hasTime: .constant(true), allowsTime: true,
+                            title: customReminderAlarm ? "Alarm at" : "Remind me at", timeRequired: true,
+                            confirmLabel: customReminderAlarm ? "Add alarm" : "Add reminder",
+                            close: { showCustomReminder = false }) {
+                    guard let when = customReminderDate else { return }
+                    withAnimation(Motion.base) {
+                        binding.wrappedValue.reminders.append(Reminder(trigger: .absolute(when), isAlarm: customReminderAlarm))
+                    }
+                }
+            }
+            // Once there's a checklist, the AI row lives at its foot instead.
+            if !showsChecklist(task) { AIBreakdownRow(taskID: taskID) }
+        }
+        .hairlineCard(radius: Radius.lg)
+        .popover(isPresented: $showAddCustomRepeat) {
+            CustomRepeatEditor(initial: task.recurrence ?? .weekly) { setRecurrence($0, binding) }
+        }
+    }
+
+    private func chipLabel(_ title: String) -> some View {
+        Label(title, systemImage: "plus")
+            .font(.system(size: 12.5, weight: .semibold))
+            .foregroundStyle(Color.ink)
+            .lineLimit(1)
+            .padding(.horizontal, 11)
+            .frame(height: 28)
+    }
+
+    private func addChip(_ title: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) { chipLabel(title) }
+            .buttonStyle(MenuChromeStyle(shape: Capsule(), fill: .fill, hoverFill: .fillStrong))
+            .fixedSize()
+            .help(help)
     }
 
     // MARK: Checklist
@@ -501,6 +601,7 @@ struct TaskDetailView: View {
                 TextField("Add a step", text: $newSubtask)
                     .textFieldStyle(.plain)
                     .font(.system(size: 14, weight: .medium))
+                    .focused($field, equals: .step)
                     .onSubmit {
                         let title = newSubtask.trimmingCharacters(in: .whitespaces)
                         guard !title.isEmpty else { return }
@@ -540,7 +641,7 @@ struct TaskDetailView: View {
 
 // MARK: - Building blocks
 
-/// Eyebrow over a hairline card of rows.
+/// Eyebrow over a hairline card of rows. An empty title gives the card alone.
 struct DetailSection<Content: View>: View {
     var title: String
     @ViewBuilder var content: Content
@@ -552,8 +653,10 @@ struct DetailSection<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.sm) {
-            Eyebrow(text: title)
-                .padding(.leading, 4)
+            if !title.isEmpty {
+                Eyebrow(text: title)
+                    .padding(.leading, 4)
+            }
             VStack(alignment: .leading, spacing: 0) {
                 content
             }

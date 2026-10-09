@@ -471,8 +471,8 @@ final class InboxTests: XCTestCase {
 
         let saved = try Data(contentsOf: dir.appendingPathComponent("integrations.json"))
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: saved) as? [String: Any])
-        XCTAssertEqual(json["version"] as? Int, 3)
-        XCTAssertEqual(IntegrationsFile.currentVersion, 3)
+        XCTAssertEqual(json["version"] as? Int, 4)
+        XCTAssertEqual(IntegrationsFile.currentVersion, 4)
 
         let again = relaunch(store)
         let slack = try XCTUnwrap(again.suggestion(Sample.threadReplyID))

@@ -1,14 +1,106 @@
 import AppKit
 import SwiftUI
 
-// MARK: - From Slack & Gmail
+// MARK: - Messages
 
-/// Sidebar "From Slack & Gmail": the Slack messages and emails that need you, in two tabs. A message opens
-/// complete (its files and earlier messages), with your notes, the task it could become and your reply.
+/// What the header's status line says: Slack, Gmail and AI each with ✓ or what's wrong (and the way to fix
+/// it), then when Docket last checked. Pure, so it's easy to test.
+enum InboxStatus {
+    /// Where clicking a problem goes.
+    enum Fix: Equatable {
+        /// The Connections sheet.
+        case connections
+        /// Create the Docket app in Slack again with the new permissions.
+        case updateSlack
+        /// Sign in to Google again (for starring, sending and drafts).
+        case reconnectGmail
+        /// Settings → AI.
+        case aiSettings
+    }
+
+    struct Part: Equatable, Identifiable {
+        var name: String
+        /// What's wrong, in a few words ("Slack not connected"); nil when all is well.
+        var problem: String?
+        /// The tooltip: the whole story.
+        var help: String
+        var fix: Fix?
+
+        var id: String { name }
+        var isOK: Bool { problem == nil }
+        /// "Slack ✓", or the problem.
+        var text: String { problem ?? "\(name) ✓" }
+    }
+
+    struct Facts {
+        var slackConnected = false
+        var slackAccount: String?
+        var slackProblem: String?
+        /// Why the Docket app in Slack needs to be made again (missing permissions), if it does.
+        var slackPermissions: String?
+        var gmailConnected = false
+        var gmailAddress: String?
+        var gmailProblem: String?
+        /// Signed in before Docket asked to star and reply.
+        var gmailNeedsReconnect = false
+        var aiOn = true
+        var aiHasKey = true
+        var aiProblem: String?
+    }
+
+    static func parts(_ f: Facts) -> [Part] {
+        let slack: Part
+        if !f.slackConnected {
+            slack = Part(name: "Slack", problem: "Slack not connected", help: "Click to connect Slack", fix: .connections)
+        } else if let problem = f.slackProblem {
+            slack = Part(name: "Slack", problem: "Slack error", help: problem + " Click to open Connections.", fix: .connections)
+        } else if let permissions = f.slackPermissions {
+            slack = Part(name: "Slack", problem: "Slack needs permissions", help: permissions + " Click to update the Docket app in Slack.", fix: .updateSlack)
+        } else {
+            slack = Part(name: "Slack", help: f.slackAccount.map { "Slack is connected as \($0)" } ?? "Slack is connected")
+        }
+
+        let gmail: Part
+        if !f.gmailConnected {
+            gmail = Part(name: "Gmail", problem: "Gmail not connected", help: "Click to connect Gmail", fix: .connections)
+        } else if let problem = f.gmailProblem {
+            gmail = Part(name: "Gmail", problem: "Gmail error", help: problem + " Click to open Connections.", fix: .connections)
+        } else if f.gmailNeedsReconnect {
+            gmail = Part(name: "Gmail", problem: "Reconnect Gmail",
+                         help: "Click to sign in to Google again, so Docket can star emails, send your replies and save drafts", fix: .reconnectGmail)
+        } else {
+            gmail = Part(name: "Gmail", help: f.gmailAddress.map { "Gmail is connected as \($0)" } ?? "Gmail is connected")
+        }
+
+        let ai: Part
+        if !f.aiOn {
+            ai = Part(name: "AI", problem: "AI off", help: "AI is off: no suggested tasks or drafted replies. Click to open Settings → AI.", fix: .aiSettings)
+        } else if !f.aiHasKey {
+            ai = Part(name: "AI", problem: "AI needs a key", help: "Add a Gemini API key in Settings → AI. Click to open it.", fix: .aiSettings)
+        } else if let problem = f.aiProblem {
+            ai = Part(name: "AI", problem: "AI error", help: problem + " Click to open Settings → AI.", fix: .aiSettings)
+        } else {
+            ai = Part(name: "AI", help: "AI suggests tasks and drafts replies")
+        }
+        return [slack, gmail, ai]
+    }
+
+    /// "Updated 11:36 PM" (today), "Updated Mon 5 Oct · 11:36 PM" (before), "Checking…" while it checks.
+    static func updated(_ last: Date?, refreshing: Bool, now: Date, calendar: Calendar = .current) -> String? {
+        if refreshing { return "Checking…" }
+        guard let last else { return nil }
+        return calendar.isDate(last, inSameDayAs: now) ? "Updated \(Fmt.time(last))" : "Updated \(Fmt.dateTime(last))"
+    }
+}
+
+/// Sidebar "Messages": the Slack messages and emails that need you, in two tabs. A message opens complete
+/// (its files and earlier messages), with one row of actions: add the suggested task, reply, note, dismiss.
 struct SuggestionsView: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var app: AppState
     @ObservedObject private var integrations = Integrations.shared
+    @ObservedObject private var ai = AIService.shared
+    @AppStorage(Prefs.Key.aiEnabled) private var aiEnabled = true
     /// The tab, remembered across launches: "slack" or "gmail" (empty until one is picked).
     @AppStorage(SuggestionsView.tabKey) private var tabName = ""
     @StateObject private var inbox = InboxModel()
@@ -19,15 +111,19 @@ struct SuggestionsView: View {
     var body: some View {
         let tab = currentTab
         VStack(alignment: .leading, spacing: 0) {
-            PageHeader(title: "From Slack & Gmail", subtitle: subtitle) { headerControls(tab) }
-            InboxBanners(kind: tab, updateSlack: updateSlack)
+            header(tab)
+            InboxBanners()
             Rectangle().fill(Color.hair).frame(height: 1)
             InboxPanes(model: inbox, kind: tab, connect: { sheet = .plain }, updateSlack: updateSlack)
                 .id(tab)
                 .transition(.opacity)
         }
         .background(Color.paper)
-        .sheet(item: $sheet) { opening in ConnectionsSheet(opening: opening) }
+        .sheet(item: $sheet) { opening in
+            ConnectionsSheet(opening: opening)
+                .environmentObject(store)
+                .environmentObject(app)
+        }
         .onAppear { inbox.startWatchingKeys(app: app) }
         .onDisappear { inbox.stopWatchingKeys() }
     }
@@ -64,24 +160,120 @@ struct SuggestionsView: View {
         if !added.isEmpty { app.showToast("Added \(Fmt.plural(added.count, "task"))") }
     }
 
-    private var sources: String? {
-        switch (integrations.isSlackConnected, integrations.isGmailConnected) {
-        case (true, true): "Slack and Gmail"
-        case (true, false): "Slack"
-        case (false, true): "Gmail"
-        case (false, false): nil
+    // MARK: Header
+
+    /// "Messages" over the status line, the tabs, refresh and ⋯ on the right (under, when it's narrow).
+    private func header(_ tab: TaskSource.Kind) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .center, spacing: Space.md) {
+                titleBlock
+                Spacer(minLength: Space.md)
+                headerControls(tab)
+            }
+            VStack(alignment: .leading, spacing: Space.md) {
+                titleBlock
+                headerControls(tab)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, Space.gutter)
+        .padding(.top, Space.lg)
+        .padding(.bottom, Space.lg)
+    }
+
+    private var titleBlock: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Messages")
+                .textStyle(.largeTitle)
+                .foregroundStyle(Color.ink)
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+            statusLine
         }
     }
 
-    private var subtitle: String {
-        guard integrations.isAnyConnected || !integrations.suggestions.isEmpty else { return "Slack messages and emails that need you" }
-        if integrations.isRefreshing, let sources { return "Checking \(sources)…" }
-        var parts: [String] = []
-        if let last = integrations.lastRefresh {
-            parts.append(Calendar.current.isDate(last, inSameDayAs: app.clock) ? "Updated \(Fmt.time(last))" : "Updated \(Fmt.dateTime(last))")
+    private var statusFacts: InboxStatus.Facts {
+        let permissions = InboxItemText.slackPermissionBanner(missing: integrations.missingSlackScopes) ?? integrations.slackScopeWarning
+        return InboxStatus.Facts(
+            slackConnected: integrations.isSlackConnected,
+            slackAccount: integrations.slackAccount.map { "@\($0.userName) in \($0.teamName)" },
+            slackProblem: integrations.slackProblem,
+            slackPermissions: permissions,
+            gmailConnected: integrations.isGmailConnected,
+            gmailAddress: integrations.gmailAddress,
+            gmailProblem: integrations.gmailProblem,
+            gmailNeedsReconnect: !integrations.gmailCanModify,
+            aiOn: aiEnabled,
+            // Screenshot mode never calls out, so it has no key to use: it shows AI as set up.
+            aiHasKey: ai.isConfigured || DebugSnapshot.isActive,
+            aiProblem: integrations.aiProblem)
+    }
+
+    /// "Slack ✓ · Gmail ✓ · AI ✓ · Updated 11:36 PM": a problem shows in place of its ✓, and a click fixes it.
+    /// When it doesn't fit, the ✓s go first.
+    private var statusLine: some View {
+        let parts = InboxStatus.parts(statusFacts)
+        let updated = InboxStatus.updated(integrations.lastRefresh, refreshing: integrations.isRefreshing, now: app.clock)
+        let problems = parts.filter { !$0.isOK }
+        return ViewThatFits(in: .horizontal) {
+            statusRow(parts, updated: updated)
+            statusRow(problems, updated: updated)
+            statusRow(problems, updated: nil)
+            statusRow(Array(problems.prefix(1)), updated: nil)
         }
-        if let sources { parts.append(sources) }
-        return parts.isEmpty ? "Slack messages and emails that need you" : parts.joined(separator: " · ")
+        .animation(Motion.base, value: parts)
+    }
+
+    private func statusRow(_ parts: [InboxStatus.Part], updated: String?) -> some View {
+        HStack(spacing: 6) {
+            ForEach(Array(parts.enumerated()), id: \.element.id) { i, part in
+                if i > 0 { Text("·").foregroundStyle(Color.ink3) }
+                statusPart(part)
+            }
+            if let updated {
+                if !parts.isEmpty { Text("·").foregroundStyle(Color.ink3) }
+                Text(updated)
+                    .monospacedDigit()
+                    .foregroundStyle(Color.ink2)
+                    .help(integrations.isRefreshing ? "Checking Slack and Gmail now" : "When Docket last checked Slack and Gmail")
+            }
+        }
+        .textStyle(.callout)
+        .lineLimit(1)
+        .fixedSize()
+    }
+
+    @ViewBuilder
+    private func statusPart(_ part: InboxStatus.Part) -> some View {
+        if let fix = part.fix, !part.isOK {
+            Button { perform(fix) } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text(part.text)
+                        .underline()
+                }
+                .foregroundStyle(Color.dangerText)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(fix == .reconnectGmail && integrations.isSigningInToGmail)
+            .help(part.help)
+        } else {
+            Text(part.text)
+                .foregroundStyle(Color.ink2)
+                .help(part.help)
+        }
+    }
+
+    private func perform(_ fix: InboxStatus.Fix) {
+        switch fix {
+        case .connections: sheet = .plain
+        case .updateSlack: updateSlack()
+        case .reconnectGmail: integrations.connectGmail()
+        case .aiSettings: SettingsView.show(.ai, app: app)
+        }
     }
 
     private func headerControls(_ tab: TaskSource.Kind) -> some View {
@@ -107,6 +299,7 @@ struct SuggestionsView: View {
                 Button(items.count >= 2 ? "Add All \(items.count) as Tasks" : "Add All as Tasks") { addAll(items) }
                     .disabled(items.count < 2)
                 Divider()
+                Button("Check Setup…") { sheet = .checkSetup }
                 Button("Connections…") { sheet = .plain }
             } label: {
                 Image(systemName: "ellipsis")
@@ -115,61 +308,33 @@ struct SuggestionsView: View {
                     .frame(width: 32, height: 32)
             }
             .menuChrome(Circle())
-            .help("Add all as tasks, or set up Slack and Gmail")
+            .help("Add all as tasks, check that everything works, or set up Slack and Gmail")
         }
     }
 }
 
-/// Under the header: what's wrong with the tab's service, and the permissions it still needs.
+/// Under the header, only while Gmail is being reconnected from the status line: waiting for the browser, the
+/// way to stop, and what to do when Google says "Access blocked". Every other problem is in the status line.
 private struct InboxBanners: View {
     @ObservedObject private var integrations = Integrations.shared
-    let kind: TaskSource.Kind
-    let updateSlack: () -> Void
 
     var body: some View {
-        let problems = self.problems
-        let permissions = kind == .slack ? InboxItemText.slackPermissionBanner(missing: integrations.missingSlackScopes) : nil
-        // Starring needs gmail.modify (it covers replying too): sign-ins from before Docket asked for it don't have it.
-        let reconnect = kind == .gmail && integrations.isGmailConnected && !integrations.gmailCanModify
+        let shown = integrations.isGmailConnected && integrations.isSigningInToGmail
         VStack(alignment: .leading, spacing: Space.sm) {
-            ForEach(problems, id: \.self) { ProblemLine(text: $0) }
-            if let permissions {
-                BannerLine(icon: "lock.open", text: permissions) {
-                    Button("Update the app", action: updateSlack)
+            if shown {
+                BannerLine(icon: "globe", text: "Finish signing in to Google in your browser.") {
+                    ProgressView().controlSize(.small)
+                    Button("Cancel") { integrations.cancelGmailSignIn() }
                         .buttonStyle(SecondaryPill(height: 28))
-                        .help("Opens Slack to create the Docket app again with the new permissions, then shows the two steps left")
+                        .help("Stop waiting for the browser")
                 }
-            }
-            if reconnect {
-                BannerLine(icon: "star",
-                           text: integrations.isSigningInToGmail ? "Finish signing in to Google in your browser." : "Reconnect Gmail to star and reply from Docket.") {
-                    if integrations.isSigningInToGmail {
-                        ProgressView().controlSize(.small)
-                        Button("Cancel") { integrations.cancelGmailSignIn() }
-                            .buttonStyle(SecondaryPill(height: 28))
-                            .help("Stop waiting for the browser")
-                    } else {
-                        Button("Reconnect") { integrations.connectGmail() }
-                            .buttonStyle(SecondaryPill(height: 28))
-                            .help("Sign in to Google again and allow Docket to star emails, send your replies and save drafts")
-                    }
-                }
-                if integrations.isSigningInToGmail { GmailSignInHint() }
+                GmailSignInHint()
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, Space.gutter)
-        .padding(.bottom, problems.isEmpty && permissions == nil && !reconnect ? 0 : Space.md)
-        .animation(Motion.base, value: problems)
-        .animation(Motion.base, value: integrations.isSigningInToGmail)
-    }
-
-    /// This tab's service, then AI; each once (they're also the ForEach ids).
-    private var problems: [String] {
-        let list = kind == .slack ? [integrations.slackProblem, integrations.slackScopeWarning, integrations.aiProblem]
-            : [integrations.gmailProblem, integrations.aiProblem]
-        var seen = Set<String>()
-        return list.compactMap { $0 }.filter { seen.insert($0).inserted }
+        .padding(.bottom, shown ? Space.md : 0)
+        .animation(Motion.base, value: shown)
     }
 }
 
@@ -264,9 +429,10 @@ private struct ProblemLine: View {
 
 /// The Connections page in a sheet over the main window, so connecting doesn't mean hunting through Settings.
 private struct ConnectionsSheet: View {
-    /// What it opens for: the page as it is, or with the steps for updating the Docket app in Slack.
+    /// What it opens for: the page as it is, with the steps for updating the Docket app in Slack, or running
+    /// "Check setup" at once.
     enum Opening: String, Identifiable {
-        case plain, updateSlack
+        case plain, updateSlack, checkSetup
         var id: String { rawValue }
     }
 
@@ -289,7 +455,7 @@ private struct ConnectionsSheet: View {
             .padding(.top, Space.xl)
             .padding(.bottom, Space.md)
             Rectangle().fill(Color.hair).frame(height: 1)
-            ConnectionsSettingsPage(updatingSlack: opening == .updateSlack)
+            ConnectionsSettingsPage(updatingSlack: opening == .updateSlack, checksOnAppear: opening == .checkSetup)
         }
         // The Settings window's size; short enough for the smallest main window (600 pt).
         .frame(width: 620, height: 540)
@@ -300,25 +466,60 @@ private struct ConnectionsSheet: View {
 
 // MARK: - Settings → Connections
 
-/// Settings → Connections: Slack and Gmail, what each one does, and how suggestions are found.
+/// Settings → Connections: "Check setup", then Slack and Gmail as guided checklists (once set up: who it's
+/// connected as and its switches), then how suggestions are found.
 struct ConnectionsSettingsPage: View {
+    @EnvironmentObject var app: AppState
     @ObservedObject private var integrations = Integrations.shared
     @ObservedObject private var ai = AIService.shared
-    /// The steps for updating the Docket app in Slack (new permissions) are open.
+    /// The Docket app in Slack is being made again (new permissions).
     @State private var updatingSlack: Bool
+    let checksOnAppear: Bool
 
-    init(updatingSlack: Bool = false) {
+    private static let slackID = "connections-slack"
+    private static let gmailID = "connections-gmail"
+
+    init(updatingSlack: Bool = false, checksOnAppear: Bool = false) {
         _updatingSlack = State(initialValue: updatingSlack)
+        self.checksOnAppear = checksOnAppear
     }
 
     var body: some View {
-        SettingsPage {
-            SlackConnection(integrations: integrations, aiOn: ai.isConfigured, updating: $updatingSlack)
-            // While the Slack update is under way, its Connect is the page's one primary button.
-            GmailConnection(integrations: integrations, aiOn: ai.isConfigured, isNextStep: integrations.isSlackConnected && !updatingSlack)
-            if integrations.isAnyConnected {
-                SuggestionSettings(integrations: integrations, aiOn: ai.isConfigured)
+        // Slack's next step is the page's primary button until Slack is done; then Gmail's.
+        let slackDone = integrations.isSlackConnected && SlackConnection.permissionsComplete(integrations)
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: Space.xxl) {
+                    SetupCheckSection(runOnAppear: checksOnAppear) { fix in perform(fix, proxy: proxy) }
+                    SlackConnection(integrations: integrations, aiOn: ai.isConfigured, leads: !slackDone, updating: $updatingSlack)
+                        .id(Self.slackID)
+                    GmailConnection(integrations: integrations, aiOn: ai.isConfigured, leads: slackDone)
+                        .id(Self.gmailID)
+                    if integrations.isAnyConnected {
+                        SuggestionSettings(integrations: integrations, aiOn: ai.isConfigured)
+                    }
+                }
+                .padding(.horizontal, Space.xxl)
+                .padding(.vertical, Space.xl)
             }
+        }
+    }
+
+    private func perform(_ fix: SetupCheckItem.Fix, proxy: ScrollViewProxy) {
+        switch fix {
+        case .setUpSlack:
+            withAnimation(Motion.gentle) { proxy.scrollTo(Self.slackID, anchor: .top) }
+        case .updateSlack:
+            NSWorkspace.shared.open(SlackManifest.createAppURL)
+            updatingSlack = true
+            withAnimation(Motion.gentle) { proxy.scrollTo(Self.slackID, anchor: .top) }
+        case .setUpGmail:
+            withAnimation(Motion.gentle) { proxy.scrollTo(Self.gmailID, anchor: .top) }
+        case .signInGmail:
+            withAnimation(Motion.gentle) { proxy.scrollTo(Self.gmailID, anchor: .top) }
+            if integrations.googleClient != nil { integrations.connectGmail() }
+        case .aiSettings:
+            SettingsView.show(.ai, app: app)
         }
     }
 }
@@ -326,52 +527,69 @@ struct ConnectionsSettingsPage: View {
 private struct SlackConnection: View {
     @ObservedObject var integrations: Integrations
     let aiOn: Bool
+    /// Its next step is the page's primary button.
+    let leads: Bool
     @Binding var updating: Bool
     @AppStorage(Prefs.Key.slackSaveEmoji) private var saveEmoji = SlackSaveEmoji.standard
     @AppStorage(Prefs.Key.slackMentions) private var mentions = true
     @AppStorage(Prefs.Key.slackFocusStatus) private var focusStatus = true
+    @AppStorage(Prefs.Key.setupTickedSlack) private var tickedRaw = ""
     @State private var token = ""
     @State private var connecting = false
     @State private var problem: String?
     /// The updated app's token was just connected: time to delete the old app.
     @State private var updated = false
+    @State private var showsSteps = false
 
-    private static let appsPage = URL(string: "https://api.slack.com/apps")!
+    /// The token has every permission Docket asks for (as far as Docket knows).
+    static func permissionsComplete(_ integrations: Integrations) -> Bool {
+        integrations.missingSlackScopes.isEmpty && integrations.slackScopeWarning == nil
+    }
+
+    private var steps: [SetupStep] {
+        SetupSteps.slack(SetupSteps.SlackFacts(connected: integrations.isSlackConnected,
+                                               permissionsComplete: Self.permissionsComplete(integrations)),
+                         ticked: SetupSteps.ticked(tickedRaw))
+    }
 
     var body: some View {
-        SettingsSection(title: "Slack", footer: "Docket uses a Slack app of your own, so messages go straight from Slack to this Mac. The token stays in your keychain.") {
+        let steps = self.steps
+        let complete = steps.allSatisfy(\.done)
+        SettingsSection(title: "Slack", footer: "Your own Slack app, so messages go straight from Slack to this Mac. The token stays on this Mac, in a file only you can read.") {
+            if let issue = integrations.slackProblem { IssueRow(text: issue) }
             if let account = integrations.slackAccount, integrations.isSlackConnected {
-                if let issue = integrations.slackProblem { IssueRow(text: issue) }
-                if let warning = integrations.slackScopeWarning { IssueRow(text: warning) }
-                SettingsRow(title: "Connected as @\(account.userName) in \(account.teamName)",
-                            subtitle: account.teamURL?.host) {
+                SettingsRow(title: "Connected as @\(account.userName) in \(account.teamName)", subtitle: account.teamURL?.host) {
                     Button("Disconnect") { withAnimation(Motion.base) { integrations.disconnectSlack() } }
                         .buttonStyle(SecondaryPill(height: 30))
-                        .help("Forget the Slack token and the Slack suggestions waiting")
+                        .help("Forget the Slack token and the Slack messages waiting")
                 }
-                if let missing = InboxItemText.slackPermissionBanner(missing: integrations.missingSlackScopes) {
-                    if updating {
-                        updateSteps
-                    } else {
-                        SettingsRow(title: missing, subtitle: InboxItemText.slackPermissionEffect(missing: integrations.missingSlackScopes)) {
-                            Button("Update the app") {
-                                NSWorkspace.shared.open(SlackManifest.createAppURL)
-                                withAnimation(Motion.base) { updating = true }
-                            }
-                            .buttonStyle(SecondaryPill(height: 30))
-                            .help("Opens Slack to create the Docket app again with the new permissions")
-                        }
-                    }
-                } else if updated {
-                    SettingsRow(title: "Updated. Now delete the old Docket app",
-                                subtitle: "On your Slack apps page, open the old Docket app and click Delete App at the bottom of Basic Information.") {
-                        Button { NSWorkspace.shared.open(Self.appsPage) } label: { Label("Your apps", systemImage: "arrow.up.right") }
-                            .buttonStyle(SecondaryPill(height: 30))
-                            .help("Opens your apps on api.slack.com in your browser")
+            }
+            if complete && !showsSteps && !updating {
+                SetupDoneRow(count: steps.count) { withAnimation(Motion.snappy) { showsSteps = true } }
+            } else {
+                SetupChecklist(steps: steps, leads: leads, ticked: tickedBinding, email: .constant(""),
+                               forceOpen: updating ? "slack.permissions" : nil) { step, leads in
+                    switch step.id {
+                    case "slack.token": tokenEntry(leads: leads, cancel: nil)
+                    case "slack.permissions" where integrations.isSlackConnected: permissionsExtra(leads: leads)
+                    default: EmptyView()
                     }
                 }
+                .overlay(alignment: .bottom) {
+                    if integrations.isSlackConnected || updated { Rectangle().fill(Color.hair).frame(height: 1).padding(.leading, Space.lg) }
+                }
+            }
+            if updated {
+                SettingsRow(title: "Updated. Now delete the old Docket app",
+                            subtitle: "On your Slack apps page, open the old Docket app, then Basic Information → Delete App at the bottom.") {
+                    Button { NSWorkspace.shared.open(SetupSteps.slackAppsPage) } label: { Label("Your apps", systemImage: "arrow.up.right") }
+                        .buttonStyle(SecondaryPill(height: 30))
+                        .help("Opens your apps on api.slack.com in your browser")
+                }
+            }
+            if integrations.isSlackConnected {
                 SettingsRow(title: "Save with a reaction",
-                            subtitle: "React to a message (from the last 30 days) with this and it shows up in From Slack & Gmail.") {
+                            subtitle: "React to a message (from the last 30 days) with this and it shows up in Messages.") {
                     ChoiceMenu(selection: $saveEmoji, options: emojiOptions)
                         .help("The reaction that saves a message to Docket")
                 }
@@ -383,78 +601,57 @@ private struct SlackConnection: View {
                 ToggleRow(title: "Focus status", subtitle: "During a focus session your status says “Heads down” 🎯 and notifications are paused.",
                           isOn: $focusStatus, divider: false)
                     .help("Set your Slack status and pause notifications while you focus")
-            } else {
-                if let issue = integrations.slackProblem { IssueRow(text: issue) }
-                StepRow(number: "1", title: "Create the Docket app in Slack",
-                        detail: "Opens Slack with everything filled in. Pick your workspace, then click Create.") {
-                    Button { NSWorkspace.shared.open(SlackManifest.createAppURL) } label: { Label("Create app", systemImage: "arrow.up.right") }
-                        .buttonStyle(SecondaryPill(height: 30))
-                        .help("Opens api.slack.com in your browser")
-                }
-                StepRow(number: "2", title: "Install it and paste the token",
-                        detail: "On the app's page, click Install to Workspace and allow it. Then copy the User OAuth Token (it starts with xoxp-).",
-                        divider: false) { EmptyView() }
-                tokenEntry(cancel: nil)
             }
         }
         .onChange(of: saveEmoji) { _ in integrations.refresh() }
         .onChange(of: mentions) { _ in integrations.refresh() }
     }
 
-    /// An app made before Docket showed files and threads: make it again from the new manifest (Slack was
-    /// opened with it already), paste its token, then delete the old app.
+    private var tickedBinding: Binding<Set<String>> {
+        Binding(get: { SetupSteps.ticked(tickedRaw) }, set: { tickedRaw = SetupSteps.raw($0) })
+    }
+
+    /// Making the app again: what's missing, the new token, and the way to the old app afterwards.
     @ViewBuilder
-    private var updateSteps: some View {
-        StepRow(number: "1", title: "Create and install the updated app",
-                detail: "Slack opened in your browser with the new permissions filled in. Pick your workspace, click Create, then Install to Workspace and allow it.") {
-            Button { NSWorkspace.shared.open(SlackManifest.createAppURL) } label: { Label("Open again", systemImage: "arrow.up.right") }
-                .buttonStyle(SecondaryPill(height: 30))
-                .help("Opens api.slack.com in your browser")
+    private func permissionsExtra(leads: Bool) -> some View {
+        if let missing = InboxItemText.slackPermissionBanner(missing: integrations.missingSlackScopes) ?? integrations.slackScopeWarning {
+            Text(missing + " " + InboxItemText.slackPermissionEffect(missing: integrations.missingSlackScopes))
+                .textStyle(.footnote)
+                .foregroundStyle(Color.ink)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        StepRow(number: "2", title: "Paste the new token, then delete the old app",
-                detail: "Copy the new app's User OAuth Token (it starts with xoxp-) and paste it below. Then delete the old Docket app from your Slack apps.",
-                divider: false) {
-            Button { NSWorkspace.shared.open(Self.appsPage) } label: { Label("Your apps", systemImage: "arrow.up.right") }
-                .buttonStyle(SecondaryPill(height: 30))
-                .help("Opens your apps on api.slack.com, where the old Docket app can be deleted")
-        }
-        tokenEntry(cancel: { withAnimation(Motion.base) { updating = false } })
+        tokenEntry(leads: leads, cancel: updating ? { withAnimation(Motion.base) { updating = false } } : nil)
     }
 
     /// The token field and Connect, with what went wrong under it.
     @ViewBuilder
-    private func tokenEntry(cancel: (() -> Void)?) -> some View {
-        HStack(spacing: Space.sm) {
-            SecureField("xoxp-…", text: $token)
-                .connectionField()
-                .onSubmit(connect)
-                .help("Paste the User OAuth Token from your Slack app")
-            if let cancel {
-                Button("Cancel") {
-                    token = ""
-                    problem = nil
-                    cancel()
+    private func tokenEntry(leads: Bool, cancel: (() -> Void)?) -> some View {
+        VStack(alignment: .leading, spacing: Space.xs) {
+            HStack(spacing: Space.sm) {
+                SecureField("xoxp-…", text: $token)
+                    .connectionField()
+                    .onSubmit(connect)
+                    .help("Paste the User OAuth Token from your Slack app (it starts with xoxp-)")
+                if let cancel {
+                    Button("Cancel") {
+                        token = ""
+                        problem = nil
+                        cancel()
+                    }
+                    .buttonStyle(SecondaryPill(height: 32))
+                    .help("Keep the app you have")
                 }
-                .buttonStyle(SecondaryPill(height: 32))
-                .help("Keep the app you have")
+                Button(connecting ? "Connecting…" : "Connect", action: connect)
+                    .buttonStyle(LeadPill(primary: leads, height: 32))
+                    .disabled(token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || connecting)
+                    .help("Check the token with Slack and connect")
             }
-            Button(connecting ? "Connecting…" : "Connect", action: connect)
-                .buttonStyle(PrimaryPill(height: 32))
-                .disabled(token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || connecting)
-                .help("Check the token with Slack and connect")
-        }
-        .padding(.leading, Space.lg + 22 + Space.md)
-        .padding(.trailing, Space.lg)
-        .padding(.bottom, problem == nil ? Space.lg : Space.sm)
-        if let problem {
-            Text(problem)
-                .textStyle(.footnote)
-                .foregroundStyle(Color.dangerText)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.leading, Space.lg + 22 + Space.md)
-                .padding(.trailing, Space.lg)
-                .padding(.bottom, Space.lg)
+            if let problem {
+                Text(problem)
+                    .textStyle(.footnote)
+                    .foregroundStyle(Color.dangerText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -471,17 +668,17 @@ private struct SlackConnection: View {
     private func connect() {
         let value = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty, !connecting else { return }
+        // A token for an app made again: afterwards, the old one is to be deleted.
+        let replacing = integrations.isSlackConnected
         connecting = true
         problem = nil
         Task {
             do {
                 try await integrations.connectSlack(token: value)
                 token = ""
-                if updating {
-                    withAnimation(Motion.base) {
-                        updating = false
-                        updated = true
-                    }
+                withAnimation(Motion.base) {
+                    updating = false
+                    if replacing { updated = true }
                 }
             } catch {
                 problem = error.localizedDescription
@@ -494,12 +691,15 @@ private struct SlackConnection: View {
 private struct GmailConnection: View {
     @ObservedObject var integrations: Integrations
     let aiOn: Bool
-    /// Slack is done, so connecting Gmail is the obvious next step (the page's primary button).
-    let isNextStep: Bool
+    /// Its next step is the page's primary button (Slack is done).
+    let leads: Bool
     @AppStorage(Prefs.Key.gmailNeedsReply) private var needsReply = true
+    @AppStorage(Prefs.Key.setupTickedGmail) private var tickedRaw = ""
+    @AppStorage(Prefs.Key.setupGoogleAddress) private var typedAddress = ""
     @State private var clientID = ""
     @State private var clientSecret = ""
     @State private var changingClient = false
+    @State private var showsSteps = false
 
     /// What Docket does with Gmail, in so many words.
     static let promise = "Docket reads your mail, stars what you star, and sends or saves a draft only when you click Send or Save draft. It never deletes or archives anything."
@@ -508,13 +708,20 @@ private struct GmailConnection: View {
     /// Docket starred emails can't star; ones from before it replied can't send either.
     private var connectedSubtitle: String {
         if integrations.gmailCanModify { return Self.promise }
-        if integrations.gmailCanCompose { return "Docket can read your mail and send your replies. Reconnect to star emails from Docket too." }
-        return "Docket can read your mail. Reconnect to star and reply from Docket too."
+        if integrations.gmailCanCompose { return "Docket can read your mail and send your replies. Sign in again to star emails from Docket too." }
+        return "Docket can read your mail. Sign in again to star and reply from Docket too."
+    }
+
+    private var steps: [SetupStep] {
+        SetupSteps.gmail(SetupSteps.GmailFacts(hasClient: integrations.googleClient != nil && !changingClient,
+                                               connected: integrations.isGmailConnected, canModify: integrations.gmailCanModify),
+                         ticked: SetupSteps.ticked(tickedRaw))
     }
 
     var body: some View {
-        let client = integrations.googleClient
-        SettingsSection(title: "Gmail", footer: footer(configured: client != nil)) {
+        let steps = self.steps
+        let complete = steps.allSatisfy(\.done)
+        SettingsSection(title: "Gmail", footer: "Your own Google sign-in, so mail goes straight from Google to this Mac. Docket never sees your password. While the Google app is in testing, Google signs Docket out every 7 days: just sign in again.") {
             if let issue = integrations.gmailProblem { IssueRow(text: issue) }
             if let email = integrations.gmailAddress, integrations.isGmailConnected {
                 SettingsRow(title: "Connected as \(email)", subtitle: connectedSubtitle) {
@@ -522,59 +729,36 @@ private struct GmailConnection: View {
                         .buttonStyle(SecondaryPill(height: 30))
                         .help("Sign Docket out of Gmail")
                 }
-                if !integrations.gmailCanModify {
-                    if integrations.isSigningInToGmail {
-                        SettingsRow(title: "Waiting for you in the browser…", subtitle: "Sign in with Google and allow Docket to star emails and send your replies.") {
-                            HStack(spacing: Space.sm) {
-                                ProgressView().controlSize(.small)
-                                Button("Cancel") { integrations.cancelGmailSignIn() }
-                                    .buttonStyle(SecondaryPill(height: 30))
-                                    .help("Stop waiting for the browser")
-                            }
-                        }
-                        GmailSignInHint(style: .settingsRow)
-                    } else {
-                        SettingsRow(title: "Reconnect Gmail to star and reply from Docket", subtitle: Self.promise) {
-                            Button("Reconnect") { integrations.connectGmail() }
-                                .buttonStyle(SecondaryPill(height: 30))
-                                .help("Sign in to Google again and allow Docket to star emails, send your replies and save drafts")
-                        }
+            }
+            if complete && !showsSteps && !changingClient {
+                SetupDoneRow(count: steps.count) { withAnimation(Motion.snappy) { showsSteps = true } }
+            } else {
+                SetupChecklist(steps: steps, leads: leads, ticked: tickedBinding, email: addressBinding,
+                               forceOpen: changingClient ? "gmail.paste" : nil) { step, leads in
+                    switch step.id {
+                    case "gmail.paste": clientEntry(leads: leads)
+                    case "gmail.signIn": signIn(leads: leads)
+                    default: EmptyView()
                     }
                 }
+                .overlay(alignment: .bottom) {
+                    if integrations.isGmailConnected || (integrations.googleClient != nil && !changingClient) {
+                        Rectangle().fill(Color.hair).frame(height: 1).padding(.leading, Space.lg)
+                    }
+                }
+            }
+            if integrations.isGmailConnected {
                 SettingsRow(title: "Starred emails",
-                            subtitle: "Emails you star (last 30 days) show up in From Slack & Gmail. Starring one in Docket stars it in Gmail too.") {
+                            subtitle: "Emails you star (last 30 days) show up in Messages. Starring one in Docket stars it in Gmail too.") {
                     Badge(text: "On", tone: .neutral, icon: "star")
                 }
                 ToggleRow(title: "Needs a reply",
                           subtitle: aiOn ? "Unread, important emails from the last 2 days. AI keeps only the ones that need you."
                               : "Unread, important emails from the last 2 days. Turn on AI to keep only the ones that need you.",
-                          isOn: $needsReply, divider: false)
+                          isOn: $needsReply)
                     .help("Suggest tasks from unread, important email")
-            } else if let client, !changingClient {
-                if integrations.isSigningInToGmail {
-                    SettingsRow(title: "Waiting for you in the browser…",
-                                subtitle: "Sign in with Google and allow Docket to read your mail, star emails and send your replies.") {
-                        HStack(spacing: Space.sm) {
-                            ProgressView().controlSize(.small)
-                            Button("Cancel") { integrations.cancelGmailSignIn() }
-                                .buttonStyle(SecondaryPill(height: 30))
-                                .help("Stop waiting for the browser")
-                        }
-                    }
-                    GmailSignInHint(style: .settingsRow)
-                } else {
-                    SettingsRow(title: "Connect Gmail", subtitle: "Sign in with Google in your browser. " + Self.promise) {
-                        if isNextStep {
-                            Button("Connect Gmail") { integrations.connectGmail() }
-                                .buttonStyle(PrimaryPill(height: 30))
-                                .help("Opens Google sign-in in your browser")
-                        } else {
-                            Button("Connect Gmail") { integrations.connectGmail() }
-                                .buttonStyle(SecondaryPill(height: 30))
-                                .help("Opens Google sign-in in your browser")
-                        }
-                    }
-                }
+            }
+            if let client = integrations.googleClient, !changingClient {
                 SettingsRow(title: "OAuth client", subtitle: client.id, divider: false) {
                     Button("Change…") {
                         clientID = client.id
@@ -585,64 +769,75 @@ private struct GmailConnection: View {
                     .disabled(integrations.isSigningInToGmail)
                     .help("Use a different Google OAuth client")
                 }
-            } else {
-                setup(canCancel: client != nil)
             }
         }
         .onChange(of: needsReply) { _ in integrations.refresh() }
     }
 
-    private func footer(configured: Bool) -> String {
-        configured
-            ? "If your OAuth app is External and in testing, Google signs Docket out every 7 days; just connect again. Docket never sees your password."
-            : "Gmail needs a free OAuth client of your own, so your mail goes straight from Google to this Mac. If the app is External and in testing, Google signs Docket out every 7 days; just connect again."
+    private var tickedBinding: Binding<Set<String>> {
+        Binding(get: { SetupSteps.ticked(tickedRaw) }, set: { tickedRaw = SetupSteps.raw($0) })
     }
 
-    @ViewBuilder
-    private func setup(canCancel: Bool) -> some View {
-        StepRow(number: "1", title: "Create a Google Cloud project", detail: nil) { link("https://console.cloud.google.com/projectcreate") }
-        StepRow(number: "2", title: "Turn on the Gmail API", detail: nil) {
-            link("https://console.cloud.google.com/apis/library/gmail.googleapis.com")
-        }
-        StepRow(number: "3", title: "Set up the OAuth consent screen",
-                detail: "Choose Internal if you use Google Workspace. Otherwise choose External and add your own address as a test user.") {
-            link("https://console.cloud.google.com/apis/credentials/consent")
-        }
-        StepRow(number: "4", title: "Create an OAuth client ID",
-                detail: "Application type: Desktop app. Then paste its client ID and secret below.", divider: false) {
-            link("https://console.cloud.google.com/apis/credentials/oauthclient")
-        }
-        VStack(spacing: Space.sm) {
-            TextField("Client ID", text: $clientID)
+    /// The address the copy buttons copy: the one typed, else the one Gmail is connected as.
+    private var addressBinding: Binding<String> {
+        Binding(get: { typedAddress.isEmpty ? (integrations.gmailAddress ?? "") : typedAddress },
+                set: { typedAddress = $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+    }
+
+    /// The client ID and secret, and Save.
+    private func clientEntry(leads: Bool) -> some View {
+        VStack(alignment: .leading, spacing: Space.sm) {
+            TextField("Client ID (ends in .apps.googleusercontent.com)", text: $clientID)
                 .connectionField()
-                .help("The client ID of your Desktop app OAuth client")
+                .help("The Client ID of your Desktop app client")
             SecureField("Client secret", text: $clientSecret)
                 .connectionField()
                 .onSubmit(saveClient)
-                .help("The client secret of the same OAuth client")
+                .help("The Client secret of the same client")
             HStack(spacing: Space.sm) {
                 Spacer()
-                if canCancel {
+                if changingClient {
                     Button("Cancel") { withAnimation(Motion.base) { changingClient = false } }
                         .buttonStyle(SecondaryPill(height: 30))
                         .help("Keep the current OAuth client")
                 }
-                if isNextStep {
-                    Button("Save", action: saveClient)
-                        .buttonStyle(PrimaryPill(height: 30))
-                        .disabled(!canSave)
-                        .help("Keep the client ID and secret in your keychain")
-                } else {
-                    Button("Save", action: saveClient)
-                        .buttonStyle(SecondaryPill(height: 30))
-                        .disabled(!canSave)
-                        .help("Keep the client ID and secret in your keychain")
-                }
+                Button("Save", action: saveClient)
+                    .buttonStyle(LeadPill(primary: leads, height: 30))
+                    .disabled(!canSave)
+                    .help("Save the Client ID and secret on this Mac")
             }
         }
-        .padding(.leading, Space.lg + 22 + Space.md)
-        .padding(.trailing, Space.lg)
-        .padding(.bottom, Space.lg)
+    }
+
+    /// Sign in (or again), what Google will say on the way, and what to do when it says "Access blocked".
+    @ViewBuilder
+    private func signIn(leads: Bool) -> some View {
+        if integrations.isSigningInToGmail {
+            HStack(spacing: Space.sm) {
+                ProgressView().controlSize(.small)
+                Text("Finish signing in in your browser…")
+                    .textStyle(.footnote)
+                    .foregroundStyle(Color.ink)
+                Spacer(minLength: Space.sm)
+                Button("Cancel") { integrations.cancelGmailSignIn() }
+                    .buttonStyle(SecondaryPill(height: 30))
+                    .help("Stop waiting for the browser")
+            }
+        } else {
+            Button(integrations.isGmailConnected ? "Sign in again" : "Sign in with Google") { integrations.connectGmail() }
+                .buttonStyle(LeadPill(primary: leads, height: 30))
+                .disabled(integrations.googleClient == nil)
+                .help("Opens Google sign-in in your browser")
+        }
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: "questionmark.circle")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.ink2)
+            Text(GmailSignInHint.text)
+                .textStyle(.footnote)
+                .foregroundStyle(Color.ink2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     private var canSave: Bool {
@@ -652,16 +847,9 @@ private struct GmailConnection: View {
     private func saveClient() {
         guard canSave else { return }
         integrations.saveGoogleClient(id: clientID, secret: clientSecret)
+        clientID = ""
         clientSecret = ""
         withAnimation(Motion.base) { changingClient = false }
-    }
-
-    private func link(_ address: String) -> some View {
-        Button {
-            if let url = URL(string: address) { NSWorkspace.shared.open(url) }
-        } label: { Label("Open", systemImage: "arrow.up.right") }
-            .buttonStyle(SecondaryPill(height: 30))
-            .help("Opens Google Cloud Console in your browser")
     }
 }
 
@@ -695,46 +883,6 @@ private struct SuggestionSettings: View {
             text += Calendar.current.isDateInToday(last) ? " Last checked \(Fmt.time(last))." : " Last checked \(Fmt.dateTime(last))."
         }
         return text
-    }
-}
-
-/// A numbered setup step inside a settings card.
-private struct StepRow<Trailing: View>: View {
-    var number: String
-    var title: String
-    var detail: String?
-    var divider = true
-    @ViewBuilder var trailing: Trailing
-
-    var body: some View {
-        HStack(alignment: .top, spacing: Space.md) {
-            Text(number)
-                .font(.system(size: 12, weight: .bold))
-                .monospacedDigit()
-                .foregroundStyle(Color.ink)
-                .frame(width: 22, height: 22)
-                .background(Circle().fill(Color.fill))
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(Color.ink)
-                if let detail {
-                    Text(detail)
-                        .textStyle(.footnote)
-                        .foregroundStyle(Color.ink2)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            .padding(.top, 2)
-            Spacer(minLength: Space.md)
-            trailing
-        }
-        .padding(.horizontal, Space.lg)
-        .padding(.vertical, 11)
-        .frame(minHeight: 48)
-        .overlay(alignment: .bottom) {
-            if divider { Rectangle().fill(Color.hair).frame(height: 1).padding(.leading, Space.lg) }
-        }
     }
 }
 

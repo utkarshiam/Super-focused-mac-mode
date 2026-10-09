@@ -314,8 +314,188 @@ final class MarkdownRendererTests: XCTestCase {
         XCTAssertEqual(MediaLibrary.kind(ofExtension: "mp4"), .video)
         XCTAssertEqual(MediaLibrary.kind(ofExtension: "heic"), .image)
         XCTAssertEqual(MediaLibrary.kind(ofExtension: "png"), .image)
-        XCTAssertNil(MediaLibrary.kind(ofExtension: "pdf"))
+        XCTAssertEqual(MediaLibrary.kind(ofExtension: "pdf"), .pdf)
         XCTAssertNil(MediaLibrary.kind(ofExtension: "mp3"))
+    }
+
+    func testPDFsRenderAsCards() throws {
+        try withMediaSandbox { dir in
+            let original = dir.appendingPathComponent("Q3 Deck.pdf")
+            try MediaFixtures.writePDF(pages: 2, to: original)
+            let line = try XCTUnwrap(MediaLibrary.importFiles([original]).first)
+
+            var cells = render("Intro\n\n\(line)\n\nAfter").mediaCells
+            XCTAssertEqual(cells.count, 1)
+            var card = try XCTUnwrap(cells.first?.cell as? MediaCardCell)
+            XCTAssertEqual(card.cardTitle, "Q3 Deck")
+            XCTAssertEqual(card.cardSubtitle, "PDF", "pages are counted in the background")
+            let opens = try XCTUnwrap(cells.first?.opens)
+            XCTAssertTrue(opens.isFileURL, "a click opens the copy in Quick Look")
+            XCTAssertEqual(opens.deletingLastPathComponent().lastPathComponent, "attachments")
+
+            waitForMedia { MediaCache.shared.pdf(for: opens) != nil }
+            cells = render("Intro\n\n\(line)\n\nAfter").mediaCells
+            card = try XCTUnwrap(cells.first?.cell as? MediaCardCell)
+            XCTAssertEqual(card.cardSubtitle, "PDF · 2 pages")
+            XCTAssertNotNil(card.thumbnail)
+
+            // An export doesn't wait: the card is complete at once.
+            let exported = try XCTUnwrap(MarkdownRenderer.render(line, forExport: true).mediaCells.first?.cell as? MediaCardCell)
+            XCTAssertEqual(exported.cardSubtitle, "PDF · 2 pages")
+        }
+    }
+
+    @MainActor
+    func testFormattedCopyNamesPDFsRatherThanDroppingThem() throws {
+        try withMediaSandbox { dir in
+            let original = dir.appendingPathComponent("Q3 Deck.pdf")
+            try MediaFixtures.writePDF(pages: 2, to: original)
+            let line = try XCTUnwrap(MediaLibrary.importFiles([original]).first)
+            let flavors = Dictionary(MarkdownExport.formattedData("Intro\n\n\(line)\n\nEnd"), uniquingKeysWith: { first, _ in first })
+            let rtf = try XCTUnwrap(NSAttributedString(rtf: try XCTUnwrap(flavors[.rtf]), documentAttributes: nil))
+            XCTAssertTrue(rtf.string.contains("PDF: Q3 Deck"), rtf.string)
+            XCTAssertTrue(String(decoding: try XCTUnwrap(flavors[.html]), as: UTF8.self).contains("PDF: Q3 Deck"))
+        }
+    }
+
+    func testBareMediaLinksOnTheirOwnLine() {
+        func detects(_ line: String) -> Bool { MarkdownRenderer.bareMediaURL(line) != nil }
+        XCTAssertTrue(detects("https://example.com/shots/chart.png"))
+        XCTAssertTrue(detects("  <https://example.com/clip.mp4>  "))
+        XCTAssertTrue(detects("https://example.com/report.pdf?dl=1"))
+        XCTAssertTrue(detects("http://example.com/a.JPEG"))
+        XCTAssertFalse(detects("https://example.com/about"))
+        XCTAssertFalse(detects("See https://example.com/chart.png for details"))
+        XCTAssertFalse(detects("[chart](https://example.com/chart.png)"))
+        XCTAssertFalse(detects("- https://example.com/chart.png"))
+        XCTAssertFalse(detects("/Users/me/chart.png"))
+        XCTAssertFalse(detects("https://"))
+    }
+
+    func testMediaOnTheWebLoadsThenShows() throws {
+        let web = MediaFixtures.FakeWeb(data: try MediaFixtures.png(width: 60, height: 30), mimeType: "image/png")
+        try withMediaSandbox(web: web) { _ in
+            let titled = URL(string: "https://example.com/chart.png")!
+            let bare = URL(string: "https://example.com/photo.jpg")!
+            let note = "Numbers\n![Chart](\(titled.absoluteString))\nSee the team:\n\(bare.absoluteString)\nThat's all."
+
+            // While loading: a placeholder card each, and the text around them keeps its own paragraphs.
+            var s = render(note)
+            var cells = s.mediaCells
+            XCTAssertEqual(cells.count, 2)
+            XCTAssertEqual((cells[0].cell as? MediaCardCell)?.cardTitle, "Chart")
+            XCTAssertEqual((cells[1].cell as? MediaCardCell)?.cardTitle, "photo")
+            XCTAssertEqual(cells.map(\.opens), [titled, bare], "a click while loading opens the link")
+            XCTAssertTrue(s.string.contains("See the team:\n"))
+            XCTAssertFalse(s.string.contains("https://"), "the bare link is shown as media, not text")
+
+            waitForMedia { !render(note).mediaCells.contains { $0.cell is MediaCardCell } }
+            s = render(note)
+            cells = s.mediaCells
+            XCTAssertEqual(cells.count, 2)
+            for (cell, opens) in cells {
+                let picture = try XCTUnwrap(cell as? MediaAttachmentCell)
+                XCTAssertEqual(picture.picture?.size.width, 60)
+                XCTAssertEqual(opens?.deletingLastPathComponent().lastPathComponent, "MediaCache", "Quick Look opens the cached copy")
+            }
+            XCTAssertEqual(Set(web.requests), [titled, bare])
+
+            // Links in a sentence and in a list stay links, and nothing is fetched for them.
+            let before = web.requests.count
+            let inline = render("See https://example.com/other.png for details\n\n- https://example.com/third.png")
+            XCTAssertTrue(inline.mediaCells.isEmpty)
+            XCTAssertEqual(web.requests.count, before)
+
+            // Exports keep media on the web as links, without fetching.
+            let exported = MarkdownRenderer.render("![Fresh](https://example.com/fresh.png)\n\nhttps://example.com/fresh2.png", forExport: true)
+            XCTAssertTrue(exported.mediaCells.isEmpty)
+            XCTAssertTrue(exported.string.contains("Image: Fresh"))
+            XCTAssertTrue(exported.string.contains("https://example.com/fresh2.png"))
+            XCTAssertEqual(web.requests.count, before)
+        }
+    }
+
+    func testMediaThatFailsToLoadFallsBackToLinks() throws {
+        try withMediaSandbox(web: .init(data: nil), posters: nil) { _ in
+            let note = "![Chart](https://example.com/chart.png)\n\nhttps://example.com/deck.pdf\n\n![Demo](https://example.com/demo.mp4)"
+            XCTAssertEqual(render(note).mediaCells.count, 3, "placeholders while loading")
+            waitForMedia { render(note).mediaCells.isEmpty }
+            let s = render(note)
+            func link(of text: String) -> URL? {
+                let r = (s.string as NSString).range(of: text)
+                guard r.location != NSNotFound else { return nil }
+                return s.attribute(.link, at: r.location, effectiveRange: nil) as? URL
+            }
+            XCTAssertTrue(s.string.contains("Image: Chart"))
+            XCTAssertEqual(link(of: "Chart"), URL(string: "https://example.com/chart.png"))
+            XCTAssertEqual(link(of: "https://example.com/deck.pdf"), URL(string: "https://example.com/deck.pdf"))
+            XCTAssertTrue(s.string.contains("Video: Demo"))
+            XCTAssertEqual(link(of: "Demo"), URL(string: "https://example.com/demo.mp4"))
+        }
+    }
+
+    func testVideosOnTheWebShowTheirPosterAndOpenTheLink() throws {
+        let poster = NSImage(size: NSSize(width: 320, height: 180), flipped: false) { r in
+            NSColor.darkGray.setFill()
+            r.fill()
+            return true
+        }
+        try withMediaSandbox(posters: poster) { _ in
+            let url = URL(string: "https://example.com/demo.mov")!
+            XCTAssertTrue(render(url.absoluteString).mediaCells.first?.cell is MediaCardCell)
+            waitForMedia { render(url.absoluteString).mediaCells.first?.cell is MediaAttachmentCell }
+            let cells = render(url.absoluteString).mediaCells
+            let cell = try XCTUnwrap(cells.first?.cell as? MediaAttachmentCell)
+            XCTAssertTrue(cell.isVideo)
+            XCTAssertEqual(cell.picture?.size.width, 320)
+            XCTAssertEqual(cells.first?.opens, url, "a click plays it in the browser")
+        }
+    }
+
+    func testVideoLinksBecomeCardsWithTheirTitle() throws {
+        func endpoint(_ s: String) -> String? { RemoteMedia.embedEndpoint(for: URL(string: s)!)?.provider }
+        XCTAssertEqual(endpoint("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), "YouTube")
+        XCTAssertEqual(endpoint("https://youtu.be/dQw4w9WgXcQ"), "YouTube")
+        XCTAssertEqual(endpoint("https://m.youtube.com/shorts/abc123"), "YouTube")
+        XCTAssertEqual(endpoint("https://vimeo.com/76979871"), "Vimeo")
+        XCTAssertEqual(endpoint("https://www.loom.com/share/0123abcd"), "Loom")
+        XCTAssertNil(endpoint("https://www.youtube.com/"))
+        XCTAssertNil(endpoint("https://www.youtube.com/@channel"))
+        XCTAssertNil(endpoint("https://vimeo.com/about"))
+        XCTAssertNil(endpoint("https://example.com/watch?v=1"))
+        XCTAssertNil(MarkdownRenderer.bareVideoLink("Watch https://youtu.be/dQw4w9WgXcQ later"))
+
+        let web = MediaFixtures.FakeWeb(data: nil)
+        web.hosts["www.youtube.com"] = (Data(#"{"title":"Launch keynote","provider_name":"YouTube","thumbnail_url":"https://i.ytimg.com/vi/x/hqdefault.jpg"}"#.utf8), "application/json")
+        web.hosts["i.ytimg.com"] = (try MediaFixtures.png(width: 64, height: 36), "image/jpeg")
+        try withMediaSandbox(web: web) { _ in
+            let link = "https://youtu.be/dQw4w9WgXcQ"
+            XCTAssertEqual((render(link).mediaCells.first?.cell as? MediaCardCell)?.cardSubtitle, "Loading…")
+            waitForMedia { (render(link).mediaCells.first?.cell as? MediaCardCell)?.thumbnail != nil }
+            let cells = render(link).mediaCells
+            let card = try XCTUnwrap(cells.first?.cell as? MediaCardCell)
+            XCTAssertEqual(card.cardTitle, "Launch keynote")
+            XCTAssertEqual(card.cardSubtitle, "YouTube · Video")
+            XCTAssertEqual(cells.first?.opens, URL(string: link))
+            XCTAssertTrue(web.requests.contains { $0.absoluteString.hasPrefix("https://www.youtube.com/oembed?") })
+
+            // A site that can't describe the video leaves the link as it was.
+            let other = "https://vimeo.com/76979871"
+            waitForMedia { render(other).mediaCells.isEmpty }
+            let s = render(other)
+            XCTAssertNotNil(s.attribute(.link, at: 0, effectiveRange: nil))
+            XCTAssertEqual(s.string, other)
+        }
+    }
+
+    func testPicturesThatCantBeDecodedBecomeLinks() throws {
+        try withMediaSandbox { _ in
+            let broken = MediaLibrary.folder.appendingPathComponent("BROKEN-1.png")
+            try Data("not a picture".utf8).write(to: broken)
+            let s = render("![Scan](attachments/BROKEN-1.png)")
+            XCTAssertTrue(s.mediaCells.isEmpty, "no empty box")
+            XCTAssertTrue(s.string.contains("Attachment: Scan"))
+        }
     }
 
     func testGarbageCollectionKeepsReferencedAndRecentFiles() throws {

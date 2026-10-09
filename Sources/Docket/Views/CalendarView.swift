@@ -44,8 +44,9 @@ struct CalendarView: View {
                             overdue > 0 ? "\(overdue) overdue" : nil].compactMap { $0 }.joined(separator: " · ")
             PageHeader(title: "Calendar", subtitle: subtitle) {
                 HStack(spacing: Space.sm) {
+                    // Its popover lives inside the button, so it can't move into the "⋯" menu.
                     OrderMyDayButton()
-                    CompactRowsToggle()
+                    ViewOptionsMenu()
                     SegmentedControl(selection: $app.calendarMode, options: [(.agenda, "List"), (.month, "Month")])
                 }
             }

@@ -108,7 +108,7 @@ enum MainMenu {
         ])
 
         // Go (the order matches AppDelegate.go(_:)'s targets)
-        let places = ["Calendar", "Inbox", "Notes", "Important", "All Tasks", "Completed", "Insights", "Waiting", "From Slack & Gmail"]
+        let places = ["Calendar", "Inbox", "Notes", "Important", "All Tasks", "Completed", "Insights", "Waiting", "Messages"]
         var goItems = places.enumerated().map { i, name in item(name, #selector(AppDelegate.go(_:)), "\(i + 1)", tag: i) }
         goItems += [
             .separator(),

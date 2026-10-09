@@ -170,4 +170,189 @@ final class MediaLibraryTests: XCTestCase {
             XCTAssertEqual(try Data(contentsOf: MediaLibrary.folder.appendingPathComponent("KEPT-3.png")), Data("library copy".utf8))
         }
     }
+
+    // MARK: PDFs
+
+    func testPDFsImportAndKnowTheirPages() throws {
+        try withMediaSandbox { dir in
+            XCTAssertEqual(MediaLibrary.kind(ofExtension: "pdf"), .pdf)
+            XCTAssertEqual(MediaLibrary.kind(ofExtension: "PDF"), .pdf)
+            let original = dir.appendingPathComponent("Board Deck.pdf")
+            try MediaFixtures.writePDF(pages: 3, to: original)
+
+            let lines = MediaLibrary.importFiles([original])
+            XCTAssertEqual(lines.count, 1)
+            let line = try XCTUnwrap(lines.first)
+            XCTAssertTrue(line.hasPrefix("![Board Deck](attachments/"), line)
+            XCTAssertTrue(line.hasSuffix(".pdf)"), line)
+            let name = try XCTUnwrap(MediaLibrary.referencedNames(in: lines).first)
+            let copy = MediaLibrary.folder.appendingPathComponent(name)
+            XCTAssertEqual(MediaLibrary.kind(of: copy), .pdf)
+
+            let summary = try XCTUnwrap(PDFSummary.make(for: copy))
+            XCTAssertEqual(summary.pageCount, 3)
+            XCTAssertEqual(summary.subtitle, "PDF · 3 pages")
+            XCTAssertNotNil(summary.thumbnail)
+            XCTAssertEqual(PDFSummary(pageCount: 1, thumbnail: nil).subtitle, "PDF · 1 page")
+            XCTAssertNil(PDFSummary.make(for: dir.appendingPathComponent("nothing.pdf")))
+
+            XCTAssertEqual(Note(body: line).title, "PDF: Board Deck")
+            XCTAssertEqual(Note(body: "![Clip](https://example.com/clip.mp4?t=3)").title, "Video: Clip")
+        }
+    }
+
+    func testPastedPDFFilesAreMedia() throws {
+        try withMediaSandbox { dir in
+            let pb = NSPasteboard(name: NSPasteboard.Name("docket-test-\(UUID().uuidString)"))
+            defer { pb.releaseGlobally() }
+            let pdf = dir.appendingPathComponent("Memo.pdf")
+            try MediaFixtures.writePDF(pages: 1, to: pdf)
+            pb.clearContents()
+            guard pb.writeObjects([pdf as NSURL]) else { throw XCTSkip("No pasteboard server in this session") }
+            // Finder also puts the file's name on the pasteboard as text: it's still a file paste.
+            pb.setString("Memo.pdf", forType: .string)
+            XCTAssertEqual(MediaLibrary.mediaFileURLs(on: pb), [pdf])
+            XCTAssertTrue(MediaLibrary.pasteboardHasMedia(pb))
+            XCTAssertTrue(MediaLibrary.dropHasMedia(pb))
+            let line = try XCTUnwrap(MediaLibrary.importFromPasteboard(pb)?.first)
+            XCTAssertTrue(line.hasPrefix("![Memo](attachments/") && line.hasSuffix(".pdf)"), line)
+
+            // A link to a picture on the web is media too; a link to a page and plain text aren't.
+            pb.clearContents()
+            pb.writeObjects([URL(string: "https://example.com/shots/Q3%20chart.PNG")! as NSURL])
+            XCTAssertTrue(MediaLibrary.dropHasMedia(pb))
+            XCTAssertEqual(MediaLibrary.remoteMediaURLs(on: pb).map(MediaLibrary.markdown(forRemote:)),
+                           ["![Q3 chart](https://example.com/shots/Q3%20chart.PNG)"])
+            pb.clearContents()
+            pb.writeObjects([URL(string: "https://example.com/about")! as NSURL])
+            XCTAssertFalse(MediaLibrary.dropHasMedia(pb))
+            pb.clearContents()
+            pb.setString("just words", forType: .string)
+            XCTAssertFalse(MediaLibrary.dropHasMedia(pb))
+        }
+    }
+
+    // MARK: Media on the web
+
+    func testRemoteKindsComeFromTheExtension() {
+        func kind(_ s: String) -> MediaLibrary.Kind? { MediaLibrary.remoteKind(of: URL(string: s)!) }
+        XCTAssertEqual(kind("https://example.com/a.png"), .image)
+        XCTAssertEqual(kind("https://example.com/a/B.JPG?w=800"), .image)
+        XCTAssertEqual(kind("http://example.com/a.webp"), .image)
+        XCTAssertEqual(kind("https://example.com/a.heic"), .image)
+        XCTAssertEqual(kind("https://example.com/a.gif#x"), .image)
+        XCTAssertEqual(kind("https://cdn.example.com/v/clip.mp4"), .video)
+        XCTAssertEqual(kind("https://example.com/clip.MOV"), .video)
+        XCTAssertEqual(kind("https://example.com/report.pdf?dl=1"), .pdf)
+        XCTAssertNil(kind("https://example.com/watch?v=abc"))
+        XCTAssertNil(kind("https://example.com/"))
+        XCTAssertNil(kind("https://example.com/a.mkv"))
+        XCTAssertNil(kind("ftp://example.com/a.png"))
+        XCTAssertNil(MediaLibrary.remoteKind(of: URL(fileURLWithPath: "/tmp/a.png")))
+    }
+
+    func testCacheNamesAreStableAndKeepTheFormat() {
+        let url = URL(string: "https://example.com/Photos/Team.JPG?size=large")!
+        let key = RemoteMedia.cacheKey(for: url)
+        XCTAssertEqual(key.count, 32)
+        XCTAssertTrue(key.allSatisfy { $0.isHexDigit && !$0.isUppercase })
+        XCTAssertEqual(RemoteMedia.cacheKey(for: URL(string: "https://example.com/Photos/Team.JPG?size=large")!), key, "same link, same file")
+        XCTAssertNotEqual(RemoteMedia.cacheKey(for: URL(string: "https://example.com/Photos/Team.JPG?size=small")!), key)
+        XCTAssertEqual(RemoteMedia.cacheName(for: url, mimeType: "text/html"), "\(key).jpg", "the link's own extension wins")
+        // No extension in the link: the server's type decides, and a web page isn't media.
+        let bare = URL(string: "https://images.example.com/photo-123")!
+        let bareKey = RemoteMedia.cacheKey(for: bare)
+        XCTAssertEqual(RemoteMedia.cacheName(for: bare, mimeType: "image/png"), "\(bareKey).png")
+        XCTAssertEqual(RemoteMedia.cacheName(for: bare, mimeType: "application/pdf"), "\(bareKey).pdf")
+        XCTAssertNil(RemoteMedia.cacheName(for: bare, mimeType: "text/html"))
+        XCTAssertNil(RemoteMedia.cacheName(for: bare, mimeType: nil))
+        XCTAssertEqual(RemoteMedia.posterName(for: url), "\(key)-poster.png")
+    }
+
+    func testFetchedMediaIsCachedInTheDataFolder() throws {
+        let web = MediaFixtures.FakeWeb(data: try MediaFixtures.png(), mimeType: "image/png")
+        try withMediaSandbox(web: web) { dir in
+            let url = URL(string: "https://example.com/chart.png")!
+            let remote = RemoteMedia.shared
+            XCTAssertEqual(remote.file(for: url), .loading)
+            waitForMedia { remote.file(for: url) != .loading }
+            let expected = dir.appendingPathComponent("MediaCache/\(RemoteMedia.cacheKey(for: url)).png")
+            XCTAssertEqual(remote.file(for: url), .ready(expected))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: expected.path))
+            XCTAssertEqual(web.requests, [url], "fetched once")
+
+            // Next launch (a fresh cache object) finds it on disk without the network.
+            let offline = MediaFixtures.FakeWeb(data: nil)
+            let relaunched = RemoteMedia(loader: offline.loader)
+            XCTAssertEqual(relaunched.file(for: url), .ready(expected))
+            XCTAssertTrue(offline.requests.isEmpty)
+        }
+    }
+
+    func testFailedFetchesReportFailure() throws {
+        let web = MediaFixtures.FakeWeb(data: nil)
+        try withMediaSandbox(web: web) { _ in
+            let url = URL(string: "https://example.com/gone.png")!
+            XCTAssertEqual(RemoteMedia.shared.file(for: url), .loading)
+            waitForMedia { RemoteMedia.shared.file(for: url) != .loading }
+            XCTAssertEqual(RemoteMedia.shared.file(for: url), .failed)
+            XCTAssertEqual(web.requests.count, 1, "not retried on every redraw")
+
+            // A link without an extension that turns out to be a web page isn't kept.
+            web.data = Data("<html></html>".utf8)
+            web.mimeType = "text/html"
+            let page = URL(string: "https://example.com/photo-page")!
+            XCTAssertEqual(RemoteMedia.shared.file(for: page), .loading)
+            waitForMedia { RemoteMedia.shared.file(for: page) != .loading }
+            XCTAssertEqual(RemoteMedia.shared.file(for: page), .failed)
+        }
+    }
+
+    func testCacheTrimDropsTheLeastRecentlyUsedFirst() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("docket-trim-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        for (name, age) in [("old", 30.0), ("middle", 10.0), ("new", 1.0)] {
+            let url = dir.appendingPathComponent(name)
+            try Data(count: 1000).write(to: url)
+            try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-age * 86_400)], ofItemAtPath: url.path)
+        }
+        RemoteMedia.trim(dir, to: 2500)
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: dir.path)), ["middle", "new"])
+        // The file just fetched stays even if it's the oldest.
+        RemoteMedia.trim(dir, to: 1500, keeping: dir.appendingPathComponent("middle"))
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: dir.path)), ["middle"])
+    }
+
+    func testNoteViewsTakeMediaDropsAndTheEditorStillTakesText() {
+        func make<T: NSTextView>(_ type: T.Type) -> T {
+            let storage = NSTextStorage()
+            let layout = NSLayoutManager()
+            storage.addLayoutManager(layout)
+            let container = NSTextContainer(size: NSSize(width: 400, height: CGFloat.greatestFiniteMagnitude))
+            layout.addTextContainer(container)
+            return T(frame: NSRect(x: 0, y: 0, width: 400, height: 300), textContainer: container)
+        }
+        let promised = NSPasteboard.PasteboardType(NSFilePromiseReceiver.readableDraggedTypes.first ?? "com.apple.NSFilePromiseItemMetaData")
+
+        let reader = make(ReaderTextView.self)
+        reader.isEditable = false
+        reader.updateDragTypeRegistration()
+        for type in [NSPasteboard.PasteboardType.fileURL, .URL, .tiff, promised] {
+            XCTAssertTrue(reader.registeredDraggedTypes.contains(type), "Read mode takes \(type.rawValue)")
+        }
+
+        let editor = make(MarkdownTextView.self)
+        editor.isRichText = false
+        editor.updateDragTypeRegistration()
+        // As in the app: registered before it's shown, then again once it's in a window.
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: true)
+        window.contentView = editor
+        defer { window.contentView = nil }
+        for type in [NSPasteboard.PasteboardType.fileURL, promised] {
+            XCTAssertTrue(editor.registeredDraggedTypes.contains(type), "Edit mode takes \(type.rawValue)")
+        }
+        XCTAssertTrue(editor.registeredDraggedTypes.contains(NSPasteboard.PasteboardType("NSStringPboardType"))
+            || editor.registeredDraggedTypes.contains(.string), "text can still be dragged into the editor")
+    }
 }

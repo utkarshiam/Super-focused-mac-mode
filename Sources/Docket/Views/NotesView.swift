@@ -240,7 +240,7 @@ struct NoteEditorPane: View {
 
                 Button { addMedia(mode: mode) } label: { Image(systemName: "photo.badge.plus") }
                     .buttonStyle(IconButtonStyle(filled: true))
-                    .help("Add photos or videos (or drop them on the note)")
+                    .help("Add photos, videos or PDFs (or drop them on the note)")
 
                 Spacer(minLength: Space.sm)
 
@@ -256,7 +256,7 @@ struct NoteEditorPane: View {
                             Button(t.label) { append(t.body()) }
                         }
                     }
-                    Button("Add Photos or Videos…") { addMedia(mode: mode) }
+                    Button("Add Photos, Videos or PDFs…") { addMedia(mode: mode) }
                     Divider()
                     Button("Copy as Formatted Text") {
                         MarkdownExport.copyFormatted(note.body)
@@ -331,7 +331,7 @@ struct NoteEditorPane: View {
                     .lineLimit(1)
                 Spacer()
                 Text(verbatim: mode == .read
-                     ? "⌘E to edit · click a checkbox to tick it · drop photos or videos here"
+                     ? "⌘E to edit · click a checkbox to tick it · drop photos, videos or PDFs here"
                      : "⌘E to read · **bold**  *italic*  # heading  - [ ] checkbox")
                     .lineLimit(1)
             }
@@ -397,7 +397,7 @@ struct NoteEditorPane: View {
                 .frame(width: 56, height: 56)
                 .background(Circle().fill(Color.fill))
             Text("Nothing here yet").textStyle(.title3).foregroundStyle(Color.ink)
-            Text("Paste Markdown to see it formatted, drop in photos or videos, or start writing.")
+            Text("Paste Markdown to see it formatted, drop in photos, videos or PDFs, or start writing.")
                 .textStyle(.callout)
                 .foregroundStyle(Color.ink2)
                 .multilineTextAlignment(.center)
@@ -415,8 +415,14 @@ struct NoteEditorPane: View {
         .contentShape(Rectangle())
         .dropDestination(for: URL.self) { urls, _ in
             let files = urls.filter { $0.isFileURL && MediaLibrary.kind(of: $0) != nil }
-            guard !files.isEmpty else { return false }
-            addFiles(files)
+            if !files.isEmpty {
+                addFiles(files)
+                return true
+            }
+            // Links to pictures, videos or PDFs on the web show as media too.
+            let links = urls.filter { MediaLibrary.remoteKind(of: $0) != nil }
+            guard !links.isEmpty else { return false }
+            append(links.map(MediaLibrary.markdown(forRemote:)).joined(separator: "\n\n"))
             return true
         }
     }
@@ -461,21 +467,21 @@ struct NoteEditorPane: View {
 
     private func addMedia(mode: AppState.NoteMode) {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.image, .movie, .video]
+        panel.allowedContentTypes = [.image, .movie, .video, .pdf]
         panel.allowsMultipleSelection = true
-        panel.message = "Choose photos or videos to add to this note"
+        panel.message = "Choose photos, videos or PDFs to add to this note"
         panel.prompt = "Add"
         guard panel.runModal() == .OK else { return }
         addFiles(panel.urls, atCursor: mode == .edit)
     }
 
-    /// Copies photos or videos without holding up the app (a big video from another disk can take
+    /// Copies photos, videos or PDFs without holding up the app (a big video from another disk can take
     /// a while), then puts them at the editor's cursor if asked and it's still open, else at the end.
     private func addFiles(_ urls: [URL], atCursor: Bool = false) {
         let bridge = bridge
         MediaLibrary.importFilesInBackground(urls) { lines in
             guard !lines.isEmpty else {
-                app.showToast("Couldn't add the photos or videos")
+                app.showToast("Couldn't add those files. Docket takes photos, videos and PDFs.")
                 return
             }
             let snippet = lines.joined(separator: "\n\n")
@@ -490,7 +496,7 @@ struct NoteEditorPane: View {
         panel.nameFieldStringValue = note.title.replacingOccurrences(of: "/", with: "-") + ".md"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         try? note.body.write(to: url, atomically: true, encoding: .utf8)
-        // Photos and videos travel with it, so the Markdown's links keep working.
+        // Photos, videos and PDFs travel with it, so the Markdown's links keep working.
         MediaLibrary.copyReferencedMedia(for: [note.body], to: url.deletingLastPathComponent())
     }
 }

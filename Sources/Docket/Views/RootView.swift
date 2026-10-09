@@ -116,7 +116,18 @@ struct SidebarView: View {
     @ObservedObject private var integrations = Integrations.shared
     @State private var editingList: TaskList?
     @State private var listToDelete: TaskList?
+    /// The "More" and "Tags" sections start collapsed; the choice is remembered.
+    @AppStorage("sidebarMoreExpanded") private var moreExpanded = false
+    @AppStorage("sidebarTagsExpanded") private var tagsExpanded = false
     @Namespace private var ns
+
+    /// Rows that live under "More". While one is selected the section stays open.
+    private static let moreItems: Set<SidebarItem> = [.important, .all, .completed, .insights]
+
+    private func isTag(_ item: SidebarItem) -> Bool {
+        if case .tag = item { return true }
+        return false
+    }
 
     var body: some View {
         let overdue = store.overdueCount(now: app.clock)
@@ -145,12 +156,10 @@ struct SidebarView: View {
                     navRow(.calendar, "Calendar", "calendar", count: store.count(for: .calendar), alert: overdue > 0)
                     navRow(.inbox, "Inbox", "tray", count: store.count(for: .inbox), dropToList: .some(nil))
                     navRow(.waiting, "Waiting", "hourglass", count: store.count(for: .waiting))
-                    navRow(.important, "Important", "flag", count: store.count(for: .important))
-                    navRow(.all, "All tasks", "square.stack", count: nil)
-                    navRow(.completed, "Completed", "checkmark.circle", count: nil)
                     if integrations.isAnyConnected || integrations.pendingCount > 0 {
-                        navRow(.suggestions, "From Slack & Gmail", "tray.and.arrow.down", count: integrations.pendingCount)
+                        navRow(.suggestions, "Messages", "tray.and.arrow.down", count: integrations.pendingCount)
                     }
+                    navRow(.notes, "Notes", "doc.text", count: store.notes.count)
 
                     sectionLabel("Lists") {
                         Button {
@@ -172,15 +181,24 @@ struct SidebarView: View {
 
                     let tags = store.allTags
                     if !tags.isEmpty {
-                        sectionLabel("Tags") { EmptyView() }
-                        ForEach(tags, id: \.self) { tag in
-                            navRow(.tag(tag), tag, "number", count: store.count(for: .tag(tag)))
+                        let showTags = tagsExpanded || isTag(app.selection)
+                        disclosureLabel("Tags", count: tags.count, expanded: showTags) { tagsExpanded = !showTags }
+                        if showTags {
+                            ForEach(tags, id: \.self) { tag in
+                                navRow(.tag(tag), tag, "number", count: store.count(for: .tag(tag)))
+                            }
                         }
                     }
 
-                    sectionLabel("Notes & review") { EmptyView() }
-                    navRow(.notes, "Notes", "doc.text", count: store.notes.count)
-                    navRow(.insights, "Insights", "chart.bar", count: nil)
+                    // The views you visit less often, out of the way until asked for.
+                    let showMore = moreExpanded || Self.moreItems.contains(app.selection)
+                    disclosureLabel("More", count: nil, expanded: showMore) { moreExpanded = !showMore }
+                    if showMore {
+                        navRow(.important, "Important", "flag", count: store.count(for: .important))
+                        navRow(.all, "All tasks", "square.stack", count: nil)
+                        navRow(.completed, "Completed", "checkmark.circle", count: nil)
+                        navRow(.insights, "Insights", "chart.bar", count: nil)
+                    }
                 }
                 .padding(.horizontal, Space.md)
                 .padding(.bottom, Space.lg)
@@ -239,6 +257,37 @@ struct SidebarView: View {
         .padding(.trailing, 4)
         .padding(.top, Space.xl)
         .padding(.bottom, Space.xs)
+    }
+
+    /// A section label that opens and closes its section: the title, a chevron, and (when given) how many it holds.
+    private func disclosureLabel(_ title: String, count: Int?, expanded: Bool, toggle: @escaping () -> Void) -> some View {
+        Button {
+            withAnimation(Motion.snappy) { toggle() }
+        } label: {
+            HStack(spacing: 6) {
+                Eyebrow(text: title)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Color.ink3)
+                    .rotationEffect(.degrees(expanded ? 90 : 0))
+                Spacer()
+                if let count {
+                    Text("\(count)")
+                        .font(.system(size: 12, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(Color.ink3)
+                }
+            }
+            .padding(.leading, 10)
+            .padding(.trailing, 10)
+            .padding(.top, Space.xl)
+            .padding(.bottom, Space.xs)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(expanded ? "Hide \(title)" : "Show \(title)")
+        .accessibilityLabel(title)
+        .accessibilityValue(expanded ? "Expanded" : "Collapsed")
     }
 
     /// `dropToList`: nil = not a drop target; .some(nil) = Inbox; .some(id) = that list.

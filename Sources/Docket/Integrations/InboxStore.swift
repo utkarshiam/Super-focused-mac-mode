@@ -658,6 +658,8 @@ extension Integrations {
             inbox.sentReplies[s.id] = nil
             inbox.rechecks.removeValue(forKey: s.id)?.cancel()
             wholeThreads[s.id] = nil
+            threadSummaries[s.id] = nil
+            summaryProblems[s.id] = nil
         }
         let ids = Set(items.map(\.id))
         if starProblems.keys.contains(where: { ids.contains(StarTarget.item(ofKey: $0)) }) {
@@ -1033,12 +1035,12 @@ extension Integrations {
     }
 
     /// Slack, as the inbox reaches it: the stand-in from `inboxClients` (tests), else the client for the
-    /// token in the keychain.
+    /// token in the secrets file.
     func slackInbox() throws -> any SlackInbox {
         guard isSlackConnected else { throw IntegrationError.notConnected(.slack) }
         if let stand = inboxClients.slack { return stand }
         guard let token = slackToken() else {
-            throw IntegrationError.api(.slack, "Docket couldn't read the Slack token from your keychain. Try again, or connect Slack again in Settings → Connections.")
+            throw IntegrationError.api(.slack, "Docket couldn't read the Slack token from this Mac. Try again, or connect Slack again in Settings → Connections.")
         }
         return SlackClient(token: token, transport: transport, sleep: sleep)
     }
@@ -1048,7 +1050,7 @@ extension Integrations {
         guard isGmailConnected else { throw IntegrationError.notConnected(.gmail) }
         if let stand = inboxClients.gmail { return stand }
         guard let session = googleSession() else {
-            throw IntegrationError.api(.gmail, "Docket couldn't read the Gmail sign-in from your keychain. Try again, or connect Gmail again in Settings → Connections.")
+            throw IntegrationError.api(.gmail, "Docket couldn't read the Gmail sign-in from this Mac. Try again, or connect Gmail again in Settings → Connections.")
         }
         return GmailClient(session: session, transport: transport)
     }
@@ -1100,6 +1102,7 @@ extension Integrations {
         wholeThreads = samples.wholeThreads
         starProblems = [:]
         suggestions = samples.items.sorted { $0.receivedAt > $1.receivedAt }
+        threadSummaries = samples.summaries
     }
 }
 
@@ -1251,6 +1254,10 @@ struct InboxMemory {
     /// Screenshot mode: attachments backed by local files, by cache key, and by attachment id.
     var localFiles: [String: URL] = [:]
     var sampleFiles: [String: URL] = [:]
+    /// Summaries being written, by item id; the background pass after a check, and when it last ran.
+    var summaryLoads: [String: Task<ThreadSummary?, Never>] = [:]
+    var backgroundSummaries: Task<Void, Never>?
+    var lastBackgroundSummaries: Date?
 }
 
 /// The Slack permissions the complete message needs (all in `SlackManifest.contentScopes`).
@@ -1583,6 +1590,8 @@ private struct InboxSamples {
     /// Local files standing in for attachments: by cache key, and by attachment id.
     var files: [String: URL] = [:]
     var filesByAttachment: [String: URL] = [:]
+    /// Summaries of the important threads, as AI would write them.
+    var summaries: [String: ThreadSummary] = [:]
 
     init(imageFile: URL?, documentFile: URL?, now: Date) {
         let calendar = Calendar.current
@@ -1789,6 +1798,21 @@ private struct InboxSamples {
                     highlighted: 0), for: venues.id)
 
         items = [budget, copy, launch, redlines, intro, venues]
+
+        // The six-message #leadership thread and the starred redlines are important: they come summarized.
+        func summarized(_ s: Suggestion, _ bullets: [String], needs: String?) {
+            summaries[s.id] = ThreadSummary(SummaryText(bullets: bullets, needsFromYou: needs),
+                                            fingerprint: ThreadImportance.fingerprint(s, thread: wholeThreads[s.id]), madeAt: ago(3))
+        }
+        summarized(budget, ["Board call moved to Thursday at 10:00; the deck goes out Wednesday night",
+                            "Priya needs the Q3 numbers from the metrics-v2 export before the call",
+                            "Jordan offered to cover the product slides; the August churn dip is in the appendix"],
+                   needs: "Send Priya the Q3 numbers before Thursday's board call")
+        summarized(redlines, ["Northwind's legal team sent redlines on the MSA",
+                              "Section 4: liability cap moves to 12 months of fees",
+                              "Section 7: termination for convenience on 60 days' notice",
+                              "Lena can join a call Friday morning to walk through Section 7"],
+                   needs: "Review sections 4 and 7 by Friday")
     }
 
     /// Where Slack would have the file (never fetched: screenshot mode reads the local copy).

@@ -1103,7 +1103,7 @@ final class IntegrationsFlowTests: XCTestCase {
     }
 
     func testAnUnreadableKeychainNeverDisconnects() async throws {
-        // Connected, but the keychain gives nothing back right now (locked, or access refused at a prompt).
+        // Connected, but the saved token can't be read right now.
         var file = IntegrationsFile()
         file.slack = Fixture.account
         file.gmailAddress = Fixture.address
@@ -1112,7 +1112,7 @@ final class IntegrationsFlowTests: XCTestCase {
         await integrations.refreshNow(now: Date())
         XCTAssertTrue(integrations.isSlackConnected)
         XCTAssertTrue(integrations.isGmailConnected)
-        XCTAssertTrue(integrations.slackProblem?.contains("keychain") == true)
+        XCTAssertTrue(integrations.slackProblem?.contains("this Mac") == true)
         XCTAssertTrue(integrations.gmailProblem?.contains("OAuth client") == true)
         XCTAssertTrue(server.requests.isEmpty)
         XCTAssertNil(integrations.lastRefresh)

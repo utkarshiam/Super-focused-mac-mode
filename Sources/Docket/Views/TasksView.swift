@@ -41,21 +41,33 @@ struct TasksView: View {
     }
 }
 
-/// The header button for dense one-line rows (same as View ▸ Compact Rows, ⌥⌘C). Filled while it's on.
-struct CompactRowsToggle: View {
+/// The header's one "⋯" menu: page options first (`extra`), then Compact Rows (same as View ▸ Compact Rows, ⌥⌘C).
+struct ViewOptionsMenu<Extra: View>: View {
     @EnvironmentObject var app: AppState
+    @ViewBuilder var extra: Extra
 
     var body: some View {
-        Button {
-            withAnimation(Motion.snappy) { app.compactRows.toggle() }
+        Menu {
+            extra
+            Toggle("Compact Rows", isOn: Binding(
+                get: { app.compactRows },
+                set: { on in withAnimation(Motion.snappy) { app.compactRows = on } }
+            ))
+            .keyboardShortcut("c", modifiers: [.command, .option])
         } label: {
-            Image(systemName: app.compactRows ? "list.dash" : "list.bullet")
+            Image(systemName: "ellipsis")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Color.ink)
+                .frame(width: 32, height: 32)
         }
-        .buttonStyle(IconButtonStyle(filled: app.compactRows))
-        .help("Compact rows (⌥⌘C)")
-        .accessibilityLabel("Compact rows")
-        .accessibilityValue(app.compactRows ? "On" : "Off")
+        .menuChrome(Circle())
+        .help("View options")
+        .accessibilityLabel("View options")
     }
+}
+
+extension ViewOptionsMenu where Extra == EmptyView {
+    init() { self.init { EmptyView() } }
 }
 
 /// Large title (34pt, tight tracking) with an optional two-tone completion, subtitle and trailing controls.
@@ -121,14 +133,15 @@ struct TaskListPane: View {
         VStack(alignment: .leading, spacing: 0) {
             PageHeader(title: title, subtitle: subtitle(sections)) {
                 HStack(spacing: Space.sm) {
-                    if case .list = app.selection {
-                        Button(showCompleted ? "Hide done" : "Show done") {
-                            withAnimation(Motion.base) { showCompleted.toggle() }
+                    ViewOptionsMenu {
+                        if case .list = app.selection {
+                            Toggle("Show Completed Tasks", isOn: Binding(
+                                get: { showCompleted },
+                                set: { on in withAnimation(Motion.base) { showCompleted = on } }
+                            ))
+                            Divider()
                         }
-                        .buttonStyle(SecondaryPill(height: 32))
-                        .help(showCompleted ? "Hide this list's finished tasks" : "Show this list's finished tasks")
                     }
-                    CompactRowsToggle()
                     Menu {
                         Picker("Sort by", selection: $sortRaw) {
                             ForEach(SortMode.allCases) { Text($0.label).tag($0.rawValue) }

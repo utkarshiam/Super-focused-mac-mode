@@ -201,6 +201,11 @@ enum DebugSnapshot {
                 d.showSettings()
             }),
             ("40-settings-connections", { UserDefaults.standard.set(SettingsView.Tab.connections.rawValue, forKey: SettingsView.tabKey) }),
+            // The setup guide from scratch: nothing connected yet.
+            ("41-setup-fresh", {
+                Integrations.shared.disconnectSlack()
+                Integrations.shared.disconnectGmail()
+            }),
             ("18-pickers-light", {
                 NSApp.windows.first { $0.title == "Docket Settings" }?.close()
                 UserDefaults.standard.set(SettingsView.Tab.general.rawValue, forKey: SettingsView.tabKey)

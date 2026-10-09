@@ -88,7 +88,7 @@ enum GoogleOAuth {
         ], refreshing: false, transport: transport, now: now)
     }
 
-    /// A new access token from the refresh token (kept in the keychain).
+    /// A new access token from the refresh token (saved on this Mac).
     static func refresh(_ refreshToken: String, client: Client, transport: @escaping IntegrationHTTP.Transport, now: Date = Date()) async throws -> Tokens {
         var tokens = try await tokenRequest([
             ("client_id", client.id),

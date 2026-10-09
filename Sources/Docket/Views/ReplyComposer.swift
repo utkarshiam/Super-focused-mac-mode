@@ -1,9 +1,9 @@
 import AppKit
 import SwiftUI
 
-// Replying from the message detail: a plain editor that's always there, Draft with AI as an optional helper
-// (tone and an instruction), the message of the thread being answered ("Replying to Priya · 10:42 AM"), and
-// Send (always after a confirmation), Save as Gmail draft, or Copy.
+// Replying from the message detail (it comes out on Reply, or when there's a draft): one editor, Draft with
+// AI as an optional helper on one row (tone, an instruction), the message of the thread being answered
+// ("Replying to Priya · 10:42 AM"), and Send (always after a confirmation), Save as Gmail draft, or Copy.
 //
 // Nothing is ever sent without the confirmation: the Send button and ⌘↩ both only ask, and the reply goes to
 // exactly what the confirmation named.
@@ -90,21 +90,20 @@ enum ReplyText {
         }
     }
 
-    /// The line above the editor: where the reply will go. `to`: who an email goes to first, when known;
-    /// `others`: how many more it goes to.
+    /// Next to "Reply": where it will go, in a few words ("To Sam and 2 others", "In thread · #leadership").
+    /// `to`: who an email goes to first, when known; `others`: how many more it goes to.
     static func destination(for item: Suggestion, to first: String? = nil, others: Int) -> String {
         switch item.source.kind {
         case .gmail:
             var line = "To \(first ?? item.from)"
             if others > 0 { line += " and \(Fmt.plural(others, "other"))" }
-            if let subject = item.subject.map(MailText.cleanSubject), !subject.isEmpty { line += " · Re: \(subject)" }
             return line
         case .slack, .ai:
             switch place(of: item) {
-            case .channel(let name): return "In the message's thread in \(name), as you"
-            case .direct: return "In the message's thread, in your messages with \(item.from), as you"
-            case .group: return "In the message's thread, in the group message, as you"
-            case .unknown: return "In the message's thread, as you"
+            case .channel(let name): return "In thread · \(name)"
+            case .direct: return "In thread · DM with \(item.from)"
+            case .group: return "In thread · group message"
+            case .unknown: return "In thread"
             }
         }
     }
@@ -153,6 +152,8 @@ struct ReplyComposer: View {
     let canSend: Bool
     /// The open message's thread: which of its messages the reply answers.
     @ObservedObject var conversation: ConversationModel
+    /// It came out because Reply was clicked: the editor takes the keyboard as it shows.
+    let takesFocus: Bool
     /// Saves whatever is typed but not saved yet: the notes before AI reads them, the reply before it goes.
     let flush: () -> Void
     let reconnectGmail: () -> Void
@@ -253,43 +254,28 @@ struct ReplyComposer: View {
     var body: some View {
         let others = self.others
         let sendingTo = self.sendingTo(others: others)
-        VStack(alignment: .leading, spacing: Space.md) {
-            HStack(alignment: .center, spacing: Space.sm) {
-                Eyebrow(text: "Reply")
-                Spacer(minLength: Space.sm)
-                if let at = item.repliedAt {
-                    Badge(text: "Replied \(Fmt.dateTime(at))", tone: .success, icon: "checkmark")
-                        .help("You replied from Docket")
-                }
-            }
+        VStack(alignment: .leading, spacing: Space.sm) {
+            headerRow(others: others, sendingTo: sendingTo)
 
             if let picked { replyingRow(picked) }
 
-            destination(others: others, sendingTo: sendingTo)
-
             // Optional: the editor below works without AI.
-            if aiEnabled {
-                SegmentedControl(selection: Binding(get: { tone }, set: { toneRaw = $0.rawValue }),
-                                 options: ReplyTone.allCases.map { ($0, $0.label) })
-                    .disabled(busy)
-                    .help("How the AI draft should sound")
-                instructionRow
-            }
+            if aiEnabled { aiRow }
 
             GrowingTextEditor(text: $text, placeholder: "Write a reply…",
-                              minHeight: 96, maxHeight: 340, focus: $editorFocused, disabled: busy)
-                .help("Your reply. ⌘↩ sends it, after asking.")
+                              minHeight: 80, maxHeight: 340, focus: $editorFocused, disabled: busy)
+                .help("Your reply, saved as you type. ⌘↩ sends it, after asking.")
 
             status
 
             actions
 
             if isEmail && !canSend {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                HStack(alignment: .center, spacing: 6) {
                     Image(systemName: "lock")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(Color.ink3)
-                    Text("To send or save a draft from Docket, reconnect Gmail. Copy works now.")
+                    Text("Reconnect Gmail to send from Docket.")
                         .textStyle(.footnote)
                         .foregroundStyle(Color.ink2)
                         .fixedSize(horizontal: false, vertical: true)
@@ -297,7 +283,7 @@ struct ReplyComposer: View {
                     Button("Reconnect", action: reconnectGmail)
                         .buttonStyle(SecondaryPill(height: 28))
                         .disabled(integrations.isSigningInToGmail)
-                        .help("Sign in to Google again and allow Docket to send your replies")
+                        .help("Sign in to Google again and allow Docket to send your replies and save drafts (Copy works now)")
                 }
             }
         }
@@ -323,6 +309,11 @@ struct ReplyComposer: View {
             setQuote(nil)
         }
         .onChange(of: conversation.composerRequests) { _ in editorFocused = true }
+        .onAppear {
+            // Out because Reply was clicked: the keyboard goes to the editor once it's on screen.
+            guard takesFocus else { return }
+            DispatchQueue.main.async { editorFocused = true }
+        }
         .onDisappear {
             // A draft being written goes with the message; a reply being sent finishes either way.
             drafting?.cancel()
@@ -396,8 +387,10 @@ struct ReplyComposer: View {
 
     // MARK: Pieces
 
-    private func destination(others: [String], sendingTo: [MailSender]?) -> some View {
+    /// "REPLY  To Sam and 2 others" with Reply all on the right (when there are others to add).
+    private func headerRow(others: [String], sendingTo: [MailSender]?) -> some View {
         HStack(alignment: .center, spacing: Space.sm) {
+            Eyebrow(text: "Reply")
             Text(destinationLine(others: others, sendingTo: sendingTo))
                 .textStyle(.footnote)
                 .foregroundStyle(Color.ink2)
@@ -446,8 +439,10 @@ struct ReplyComposer: View {
         return picked.isMine ? "the thread" : picked.name
     }
 
-    private var instructionRow: some View {
+    /// Tone, what the reply should say (optional) and Draft with AI, on one row.
+    private var aiRow: some View {
         HStack(spacing: Space.sm) {
+            toneMenu
             HStack(spacing: 6) {
                 Image(systemName: "text.bubble")
                     .font(.system(size: 11, weight: .semibold))
@@ -470,6 +465,31 @@ struct ReplyComposer: View {
                 draftButton(title: hasText ? "Redraft" : "Draft")
             }
         }
+    }
+
+    /// "Brief ⌄": how the AI draft should sound.
+    private var toneMenu: some View {
+        Menu {
+            Picker("Tone", selection: Binding(get: { tone }, set: { toneRaw = $0.rawValue })) {
+                ForEach(ReplyTone.allCases) { t in Text(t.label).tag(t) }
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
+        } label: {
+            HStack(spacing: 4) {
+                Text(tone.label)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8.5, weight: .bold))
+            }
+            .font(.system(size: 12.5, weight: .semibold))
+            .foregroundStyle(Color.ink)
+            .padding(.horizontal, 12)
+            .frame(height: 32)
+        }
+        .menuChrome(Capsule())
+        .disabled(busy)
+        .help("How the AI draft should sound: brief, friendly or formal")
+        .accessibilityLabel("Tone: \(tone.label)")
     }
 
     private func draftButton(title: String) -> some View {

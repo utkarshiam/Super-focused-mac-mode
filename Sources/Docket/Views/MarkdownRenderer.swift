@@ -66,8 +66,8 @@ enum MarkdownRenderer {
     private static let tableSeparator = re(#"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$"#)
     private static let setextH1 = re(#"^\s{0,3}=+\s*$"#)
     private static let setextH2 = re(#"^\s{0,3}-+\s*$"#)
-    /// A line that is only a picture/video: ![alt](path "optional title")
-    private static let mediaLine = re(#"^\s*!\[([^\]]*)\]\(<?([^)\s>]+)>?(?:\s+"[^"]*")?\)\s*$"#)
+    /// A line that is only a picture, video or PDF: ![alt](path "optional title"), or ![alt](<path with spaces>)
+    private static let mediaLine = re(#"^\s*!\[([^\]]*)\]\((?:<([^>\n]+)>|([^)\s]+))(?:\s+"[^"]*")?\)\s*$"#)
     /// A line that is only HTML comments (atomic, so a line of many can't backtrack for ever),
     /// and one that opens a comment closed on a later line.
     private static let commentLine = re(#"^\s*(?>(?:<!--.*?-->\s*))+$"#)
@@ -119,7 +119,7 @@ enum MarkdownRenderer {
         let l = lines[i]
         return match(fence, l) != nil || match(rule, l) != nil || match(heading, l) != nil
             || match(quote, l) != nil || match(listItem, l) != nil || isTableStart(lines, i) || match(mediaLine, l) != nil
-            || l.trimmingCharacters(in: .whitespaces).hasPrefix("<!--")
+            || bareMediaURL(l) != nil || bareVideoLink(l) != nil || l.trimmingCharacters(in: .whitespaces).hasPrefix("<!--")
     }
 
     // MARK: Blocks
@@ -163,9 +163,27 @@ enum MarkdownRenderer {
                 continue
             }
 
-            // A photo or video on its own line
+            // A photo, video or PDF on its own line
             if let m = match(mediaLine, line) {
-                appendMedia(path: m[2] ?? "", alt: m[1] ?? "", quotes: quotes, color: textColor, into: out, ctx: ctx)
+                appendMedia(path: m[2] ?? m[3] ?? "", alt: m[1] ?? "", quotes: quotes, into: out, ctx: ctx)
+                i += 1
+                continue
+            }
+
+            // A bare link to a picture, video or PDF on the web, or to a YouTube, Vimeo or Loom video,
+            // alone on its line. Exports keep it a link.
+            let media = bareMediaURL(line)
+            if let url = media ?? bareVideoLink(line) {
+                var shown = false
+                if !ctx.forExport {
+                    shown = media != nil ? appendRemote(url, alt: "", quotes: quotes, into: out) : appendVideoLink(url, quotes: quotes, into: out)
+                }
+                if !shown {
+                    let s = inline(line.trimmingCharacters(in: .whitespaces), font: font(bodySize), color: textColor)
+                    s.append(NSAttributedString(string: "\n"))
+                    s.addAttribute(.paragraphStyle, value: style(blocks: quotes), range: NSRange(location: 0, length: s.length))
+                    out.append(s)
+                }
                 i += 1
                 continue
             }
@@ -264,38 +282,184 @@ enum MarkdownRenderer {
         out.append(s)
     }
 
-    private static func appendMedia(path: String, alt: String, quotes: [NSTextBlock], color: NSColor,
-                                    into out: NSMutableAttributedString, ctx: Context) {
-        guard let url = MediaLibrary.resolve(path), FileManager.default.fileExists(atPath: url.path),
-              let kind = MediaLibrary.kind(of: url) else {
-            // Missing file, a web image, or a file Docket can't show (an .mkv, say): a link rather
-            // than a broken box. A local file opens in its own app.
-            let label = alt.isEmpty ? (URL(string: path)?.lastPathComponent ?? path) : alt
-            let local = MediaLibrary.resolve(path).flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
-            let prefix = local != nil ? "Attachment: " : "Image: "
-            let s = NSMutableAttributedString(string: prefix + label + "\n", attributes: [
-                .font: font(bodySize, .medium), .foregroundColor: Palette.ink2,
-                .paragraphStyle: style(blocks: quotes),
-            ])
-            if let link = local ?? URL(string: path).flatMap({ $0.scheme != nil ? $0 : nil }) {
-                s.addAttribute(.link, value: link, range: NSRange(location: (prefix as NSString).length, length: (label as NSString).length))
+    /// A line that is only a web address (optionally in <>) of a picture, video or PDF.
+    static func bareMediaURL(_ line: String) -> URL? {
+        var t = line.trimmingCharacters(in: .whitespaces)
+        if t.hasPrefix("<"), t.hasSuffix(">") { t = String(t.dropFirst().dropLast()) }
+        guard t.count > 10, !t.contains(where: \.isWhitespace), let url = URL(string: t),
+              MediaLibrary.remoteKind(of: url) != nil else { return nil }
+        return url
+    }
+
+    /// A line that is only a YouTube, Vimeo or Loom video link.
+    static func bareVideoLink(_ line: String) -> URL? {
+        var t = line.trimmingCharacters(in: .whitespaces)
+        if t.hasPrefix("<"), t.hasSuffix(">") { t = String(t.dropFirst().dropLast()) }
+        guard t.count > 10, !t.contains(where: \.isWhitespace), let url = URL(string: t),
+              RemoteMedia.embedEndpoint(for: url) != nil else { return nil }
+        return url
+    }
+
+    /// A card with the video's thumbnail and title; a click opens it in the browser. False (nothing
+    /// added) when the site couldn't describe it, so it stays a link.
+    private static func appendVideoLink(_ url: URL, quotes: [NSTextBlock], into out: NSMutableAttributedString) -> Bool {
+        let remote = RemoteMedia.shared
+        let cell: MediaCardCell
+        switch remote.embed(for: url) {
+        case .failed:
+            return false
+        case .loading:
+            cell = MediaCardCell(title: url.host ?? url.absoluteString, subtitle: "Loading…", thumbnail: nil,
+                                 symbol: "play.rectangle", landscape: true)
+        case let .ready(embed):
+            var thumbnail: NSImage?
+            if let link = embed.thumbnail, case let .ready(file) = remote.file(for: link) {
+                thumbnail = MediaCache.shared.image(for: file)
             }
-            out.append(s)
+            cell = MediaCardCell(title: embed.title, subtitle: "\(embed.provider) · Video", thumbnail: thumbnail,
+                                 symbol: "play.rectangle", landscape: true)
+        }
+        let attachment = NSTextAttachment()
+        attachment.attachmentCell = cell
+        appendAttachment(attachment, opening: url, label: "Video: \(cell.cardTitle)", tip: "Click to watch it in your browser",
+                         card: true, quotes: quotes, into: out)
+        return true
+    }
+
+    private static func appendMedia(path: String, alt: String, quotes: [NSTextBlock],
+                                    into out: NSMutableAttributedString, ctx: Context) {
+        if let url = MediaLibrary.resolve(path), FileManager.default.fileExists(atPath: url.path),
+           let kind = MediaLibrary.kind(of: url),
+           appendLocal(url, kind: kind, name: alt.isEmpty ? url.deletingPathExtension().lastPathComponent : alt,
+                       quotes: quotes, into: out, ctx: ctx) {
             return
         }
-        let picture = kind == .image ? MediaCache.shared.image(for: url) : MediaCache.shared.poster(for: url)
-        let attachment = NSTextAttachment()
-        if ctx.forExport, kind == .image, let data = try? Data(contentsOf: url) {
-            // Made from the bytes: a wrapper made from the URL also puts a large file icon into RTFD.
-            let file = FileWrapper(regularFileWithContents: data)
-            file.preferredFilename = url.lastPathComponent
-            attachment.fileWrapper = file
+        if !ctx.forExport, let url = URL(string: path), MediaLibrary.isWebURL(url),
+           appendRemote(url, alt: alt, quotes: quotes, into: out) {
+            return
         }
-        attachment.attachmentCell = MediaAttachmentCell(url: url, isVideo: kind == .video, picture: picture)
+        appendMediaLink(path: path, alt: alt, quotes: quotes, into: out)
+    }
+
+    /// A missing file, a file Docket can't show (an .mkv, say), media on the web in an export, or one
+    /// that couldn't be fetched: a link rather than a broken box. A local file opens in its own app.
+    private static func appendMediaLink(path: String, alt: String, quotes: [NSTextBlock], into out: NSMutableAttributedString) {
+        let web = URL(string: path).flatMap { $0.scheme != nil && !$0.isFileURL ? $0 : nil }
+        let label = alt.isEmpty ? (web?.absoluteString ?? URL(string: path)?.lastPathComponent ?? path) : alt
+        let local = MediaLibrary.resolve(path).flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
+        let ext = (web?.pathExtension ?? (path as NSString).pathExtension).lowercased()
+        let prefix: String
+        if local != nil {
+            prefix = "Attachment: "
+        } else {
+            switch MediaLibrary.kind(ofExtension: ext) {
+            case .video?: prefix = "Video: "
+            case .pdf?: prefix = "PDF: "
+            default: prefix = "Image: "
+            }
+        }
+        let s = NSMutableAttributedString(string: prefix + label + "\n", attributes: [
+            .font: font(bodySize, .medium), .foregroundColor: Palette.ink2,
+            .paragraphStyle: style(blocks: quotes),
+        ])
+        if let link = local ?? web {
+            s.addAttribute(.link, value: link, range: NSRange(location: (prefix as NSString).length, length: (label as NSString).length))
+        }
+        out.append(s)
+    }
+
+    /// A photo, video or PDF on this Mac. False (nothing added) for a picture that can't be decoded.
+    private static func appendLocal(_ url: URL, kind: MediaLibrary.Kind, name: String, quotes: [NSTextBlock],
+                                    into out: NSMutableAttributedString, ctx: Context) -> Bool {
+        let attachment = NSTextAttachment()
+        let tip: String
+        let label: String
+        switch kind {
+        case .image:
+            guard let picture = MediaCache.shared.image(for: url) else { return false }
+            if ctx.forExport, let data = try? Data(contentsOf: url) {
+                // Made from the bytes: a wrapper made from the URL also puts a large file icon into RTFD.
+                let file = FileWrapper(regularFileWithContents: data)
+                file.preferredFilename = url.lastPathComponent
+                attachment.fileWrapper = file
+            }
+            attachment.attachmentCell = MediaAttachmentCell(url: url, isVideo: false, picture: picture)
+            tip = "Click to see it full size"
+            label = "Image: \(name)"
+        case .video:
+            attachment.attachmentCell = MediaAttachmentCell(url: url, isVideo: true, picture: MediaCache.shared.poster(for: url))
+            tip = "Click to play"
+            label = "Video: \(name)"
+        case .pdf:
+            // An export is made in one go, so it reads the PDF now rather than waiting for the cache.
+            let summary = ctx.forExport ? PDFSummary.make(for: url) : MediaCache.shared.pdf(for: url)
+            attachment.attachmentCell = MediaCardCell(title: name, subtitle: summary?.subtitle ?? "PDF",
+                                                      thumbnail: summary?.thumbnail, symbol: "doc.richtext")
+            tip = "Click to read it in Quick Look"
+            label = "PDF: \(name)"
+        }
+        appendAttachment(attachment, opening: url, label: label, tip: tip, card: kind == .pdf, quotes: quotes, into: out)
+        return true
+    }
+
+    /// Media on the web: a placeholder card while it loads, then the picture, video poster or PDF card.
+    /// False (nothing added) once fetching it has failed.
+    private static func appendRemote(_ url: URL, alt: String, quotes: [NSTextBlock], into out: NSMutableAttributedString) -> Bool {
+        let hinted = MediaLibrary.remoteKind(of: url)
+        let last = url.deletingPathExtension().lastPathComponent
+        let name = alt.isEmpty ? ((last.isEmpty || last == "/") ? (url.host ?? url.absoluteString) : (last.removingPercentEncoding ?? last)) : alt
+        let remote = RemoteMedia.shared
+        if hinted == .video {
+            // Videos aren't downloaded: the poster comes from the web address, and a click opens it.
+            switch remote.poster(for: url) {
+            case let .ready(poster):
+                let attachment = NSTextAttachment()
+                attachment.attachmentCell = MediaAttachmentCell(url: url, isVideo: true, picture: poster)
+                appendAttachment(attachment, opening: url, label: "Video: \(name)", tip: "Click to play it in your browser",
+                                 card: false, quotes: quotes, into: out)
+                return true
+            case .loading:
+                appendPlaceholder(url, kind: .video, name: name, quotes: quotes, into: out)
+                return true
+            case .failed:
+                return false
+            }
+        }
+        switch remote.file(for: url) {
+        case let .ready(file):
+            guard let kind = MediaLibrary.kind(of: file) else { return false }
+            return appendLocal(file, kind: kind, name: name, quotes: quotes, into: out, ctx: Context(forExport: false))
+        case .loading:
+            appendPlaceholder(url, kind: hinted ?? .image, name: name, quotes: quotes, into: out)
+            return true
+        case .failed:
+            return false
+        }
+    }
+
+    private static func appendPlaceholder(_ url: URL, kind: MediaLibrary.Kind, name: String, quotes: [NSTextBlock],
+                                          into out: NSMutableAttributedString) {
+        let symbol: String
+        switch kind {
+        case .image: symbol = "photo"
+        case .video: symbol = "play.rectangle"
+        case .pdf: symbol = "doc.richtext"
+        }
+        let attachment = NSTextAttachment()
+        attachment.attachmentCell = MediaCardCell(title: name, subtitle: "Loading from \(url.host ?? "the web")…",
+                                                  thumbnail: nil, symbol: symbol)
+        appendAttachment(attachment, opening: url, label: name, tip: "Still loading. Click to open it in your browser",
+                         card: true, quotes: quotes, into: out)
+    }
+
+    /// The attachment on a line of its own; a click opens `url`.
+    private static func appendAttachment(_ attachment: NSTextAttachment, opening url: URL, label: String, tip: String, card: Bool,
+                                         quotes: [NSTextBlock], into out: NSMutableAttributedString) {
         let s = NSMutableAttributedString(attachment: attachment)
-        s.addAttributes([.docketMediaURL: url, .cursor: NSCursor.pointingHand], range: NSRange(location: 0, length: s.length))
+        s.addAttributes([.docketMediaURL: url, .docketMediaLabel: label, .cursor: NSCursor.pointingHand, .toolTip: tip],
+                        range: NSRange(location: 0, length: s.length))
         s.append(NSAttributedString(string: "\n"))
-        s.addAttribute(.paragraphStyle, value: style(before: 4, after: 14, lineSpacing: 0, blocks: quotes),
+        s.addAttribute(.paragraphStyle, value: style(before: 4, after: card ? 10 : 14, lineSpacing: 0, blocks: quotes),
                        range: NSRange(location: 0, length: s.length))
         out.append(s)
     }
@@ -667,7 +831,7 @@ enum MarkdownExport {
     static func formattedData(_ markdown: String) -> [(NSPasteboard.PasteboardType, Data)] {
         var flavors: [(NSPasteboard.PasteboardType, Data?)] = []
         NSAppearance(named: .aqua)?.performAsCurrentDrawingAppearance {
-            let rendered = resolved(MarkdownRenderer.render(markdown, forExport: true))
+            let rendered = resolved(namingUnembeddedMedia(MarkdownRenderer.render(markdown, forExport: true)))
             let range = NSRange(location: 0, length: rendered.length)
             func data(_ type: NSAttributedString.DocumentType) -> Data? {
                 try? rendered.data(from: range, documentAttributes: [.documentType: type])
@@ -744,6 +908,26 @@ enum MarkdownExport {
         op.showsPrintPanel = false
         op.showsProgressPanel = false
         op.run()
+    }
+
+    /// Rich text only carries attachments made from file bytes (photos). PDF cards and videos would
+    /// vanish, so they go in as their label ("PDF: Board deck") instead.
+    private static func namingUnembeddedMedia(_ s: NSAttributedString) -> NSAttributedString {
+        let m = NSMutableAttributedString(attributedString: s)
+        var replacements: [(NSRange, String)] = []
+        m.enumerateAttribute(.attachment, in: NSRange(location: 0, length: m.length)) { value, range, _ in
+            guard let attachment = value as? NSTextAttachment, attachment.fileWrapper == nil,
+                  let label = m.attribute(.docketMediaLabel, at: range.location, effectiveRange: nil) as? String else { return }
+            replacements.append((range, label))
+        }
+        for (range, label) in replacements.reversed() {
+            let style = m.attribute(.paragraphStyle, at: range.location, effectiveRange: nil)
+            var attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: MarkdownRenderer.bodySize, weight: .medium),
+                                                        .foregroundColor: Palette.ink2]
+            if let style { attrs[.paragraphStyle] = style }
+            m.replaceCharacters(in: range, with: NSAttributedString(string: label, attributes: attrs))
+        }
+        return m
     }
 
     /// Dynamic theme colours resolved to the current (light) appearance, for formats that store fixed colours.

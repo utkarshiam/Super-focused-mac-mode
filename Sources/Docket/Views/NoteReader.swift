@@ -18,24 +18,13 @@ final class NoteBridge: ObservableObject {
     }
 }
 
-extension MediaLibrary {
-    /// Copies the files on a background queue (a large video from another disk or from iCloud can
-    /// take a while) and hands their Markdown lines to `done` on the main queue: empty if none was added.
-    static func importFilesInBackground(_ urls: [URL], then done: @escaping @MainActor ([String]) -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let lines = importFiles(urls)
-            DispatchQueue.main.async { done(lines) }
-        }
-    }
-}
-
 /// Read mode: the note's Markdown rendered as a finished document. Checkboxes tick, links open,
-/// photos open full size and videos play (Quick Look). Photos and videos can be dropped in, and
-/// photos, videos or text pasted.
+/// photos open full size, videos play and PDFs page through (Quick Look); media on the web opens in
+/// the browser. Photos, videos and PDFs can be dropped in, and they or text pasted.
 struct MarkdownReader: NSViewRepresentable {
     var text: String
     var onToggleTask: (Int) -> Void
-    /// Photos or videos dropped on the page, or whatever is pasted: append it to the note.
+    /// Photos, videos or PDFs dropped on the page, or whatever is pasted: append it to the note.
     var onAppend: (String) -> Void
     var focusOnAppear = false
 
@@ -63,7 +52,7 @@ struct MarkdownReader: NSViewRepresentable {
         tv.drawsBackground = false
         tv.textContainerInset = NSSize(width: 34, height: 24)
         tv.linkTextAttributes = [.foregroundColor: Palette.ink, .underlineStyle: NSUnderlineStyle.single.rawValue, .cursor: NSCursor.pointingHand]
-        tv.registerForDraggedTypes([.fileURL, .png, .tiff])
+        tv.updateDragTypeRegistration()
         tv.onToggleTask = onToggleTask
         tv.onAppend = onAppend
 
@@ -106,17 +95,33 @@ struct MarkdownReader: NSViewRepresentable {
         weak var textView: ReaderTextView?
         var rendered: String?
         private var token: NSObjectProtocol?
+        private var redrawScheduled = false
 
         func render(_ text: String) {
             rendered = text
             textView?.textStorage?.setAttributedString(MarkdownRenderer.render(text))
         }
 
-        /// Video posters arrive after the first render; redraw when one lands.
+        /// Video posters, PDF pages and media from the web arrive after the first render; redraw when
+        /// they land (once for a burst of them), keeping the reader where it was.
         func observe() {
             token = NotificationCenter.default.addObserver(forName: MediaCache.didLoad, object: nil, queue: .main) { [weak self] _ in
-                guard let self, let text = self.rendered else { return }
-                self.render(text)
+                guard let self, !self.redrawScheduled else { return }
+                self.redrawScheduled = true
+                DispatchQueue.main.async {
+                    self.redrawScheduled = false
+                    guard let text = self.rendered, let tv = self.textView else { return }
+                    let clip = tv.enclosingScrollView?.contentView
+                    let origin = clip?.bounds.origin
+                    let selection = tv.selectedRanges
+                    self.render(text)
+                    if let clip, let origin {
+                        clip.scroll(to: origin)
+                        tv.enclosingScrollView?.reflectScrolledClipView(clip)
+                    }
+                    let length = tv.textStorage?.length ?? 0
+                    if selection.allSatisfy({ NSMaxRange($0.rangeValue) <= length }) { tv.selectedRanges = selection }
+                }
             }
         }
 
@@ -161,14 +166,18 @@ final class ReaderTextView: NSTextView, QLPreviewPanelDataSource, QLPreviewPanel
                 return
             }
             if let url = storage.attribute(.docketMediaURL, at: i, effectiveRange: nil) as? URL {
-                showPreview(url)
+                if url.isFileURL {
+                    showPreview(url)
+                } else {
+                    NSWorkspace.shared.open(url)
+                }
                 return
             }
         }
         super.mouseDown(with: event)
     }
 
-    // MARK: Quick Look (photos full size, videos play)
+    // MARK: Quick Look (photos full size, videos play, PDFs page through)
 
     private func showPreview(_ url: URL) {
         previewURL = url
@@ -204,14 +213,22 @@ final class ReaderTextView: NSTextView, QLPreviewPanelDataSource, QLPreviewPanel
     // MARK: Copy
 
     /// Plain text copies as it reads: the renderer's line separators (U+2028) become real line breaks,
-    /// and the stand-in characters for checkboxes, photos, videos and rules are left out.
+    /// media becomes its label, and the stand-in characters for checkboxes and rules are left out.
     override func writeSelection(to pboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Bool {
         // NSTextView asks for the legacy NSStringPboardType rather than .string.
         guard type == .string || type.rawValue == "NSStringPboardType", let storage = textStorage else {
             return super.writeSelection(to: pboard, type: type)
         }
-        let source = storage.string as NSString
-        let text = selectedRanges.map { source.substring(with: $0.rangeValue) }.joined(separator: "\n")
+        // Photos, videos and PDFs copy as their label ("PDF: Board deck").
+        let text = selectedRanges.map { value -> String in
+            let piece = NSMutableAttributedString(attributedString: storage.attributedSubstring(from: value.rangeValue))
+            var labels: [(NSRange, String)] = []
+            piece.enumerateAttribute(.docketMediaLabel, in: NSRange(location: 0, length: piece.length)) { label, range, _ in
+                if let label = label as? String { labels.append((range, label)) }
+            }
+            for (range, label) in labels.reversed() { piece.replaceCharacters(in: range, with: label) }
+            return piece.string
+        }.joined(separator: "\n")
         return pboard.setString(text.replacingOccurrences(of: "\u{2028}", with: "\n")
             .replacingOccurrences(of: "\u{FFFC}\t", with: "")
             .replacingOccurrences(of: "\u{FFFC}", with: "")
@@ -219,6 +236,18 @@ final class ReaderTextView: NSTextView, QLPreviewPanelDataSource, QLPreviewPanel
     }
 
     // MARK: Paste and drop
+
+    /// A text view that can't be edited takes no drops; this one takes photos, videos and PDFs
+    /// (files, files promised by Photos or a browser, image data, and links to media on the web).
+    override func updateDragTypeRegistration() {
+        super.updateDragTypeRegistration()
+        registerForDraggedTypes(MediaLibrary.dropTypes)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil { updateDragTypeRegistration() }
+    }
 
     override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
         if item.action == #selector(paste(_:)) {
@@ -242,22 +271,29 @@ final class ReaderTextView: NSTextView, QLPreviewPanelDataSource, QLPreviewPanel
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        MediaLibrary.mediaFileURLs(on: sender.draggingPasteboard).isEmpty ? super.draggingEntered(sender) : .copy
+        MediaLibrary.dropHasMedia(sender.draggingPasteboard) ? .copy : super.draggingEntered(sender)
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        MediaLibrary.mediaFileURLs(on: sender.draggingPasteboard).isEmpty ? super.draggingUpdated(sender) : .copy
+        MediaLibrary.dropHasMedia(sender.draggingPasteboard) ? .copy : super.draggingUpdated(sender)
     }
 
-    /// NSTextView turns every drop away while it isn't editable; photos and videos are welcome here.
+    /// NSTextView turns every drop away while it isn't editable; media is welcome here.
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        MediaLibrary.mediaFileURLs(on: sender.draggingPasteboard).isEmpty ? super.prepareForDragOperation(sender) : true
+        MediaLibrary.dropHasMedia(sender.draggingPasteboard) ? true : super.prepareForDragOperation(sender)
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        let files = MediaLibrary.mediaFileURLs(on: sender.draggingPasteboard)
-        guard !files.isEmpty else { return super.performDragOperation(sender) }
-        appendFiles(files)
+        let pb = sender.draggingPasteboard
+        guard MediaLibrary.dropHasMedia(pb) else { return super.performDragOperation(sender) }
+        let onAppend = onAppend
+        MediaLibrary.importDrop(pb) { lines in
+            guard !lines.isEmpty else {
+                NSSound.beep()
+                return
+            }
+            onAppend?(lines.joined(separator: "\n\n"))
+        }
         return true
     }
 

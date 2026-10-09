@@ -206,7 +206,7 @@ final class AIService: ObservableObject {
     private let model: () -> String
     private let enabled: @MainActor () -> Bool
 
-    /// Tests pass a fake transport and their own key, so nothing touches the network or the keychain.
+    /// Tests pass a fake transport and their own key, so nothing touches the network or the secrets file.
     init(transport: @escaping GeminiClient.Transport = GeminiClient.defaultTransport,
          apiKey: @escaping () -> String? = { Secrets.geminiAPIKey },
          model: @escaping () -> String = { Secrets.geminiModel },
@@ -351,6 +351,24 @@ extension AIService {
     }
 }
 
+// MARK: - Summarizing a thread
+
+extension AIService {
+    /// 2–4 bullets on a Slack thread or email conversation and what's waiting on the user, for the summary
+    /// card in Messages. `messages` oldest first (the prompt keeps the first and the newest that fit).
+    func summarizeThread(title: String, kind: TaskSource.Kind, messages: [ThreadMessage], myName: String?,
+                         now: Date = Date()) async throws -> SummaryText {
+        let client = try client()
+        guard !messages.isEmpty else { throw AIError.badResponse(AIAnswers.emptySummary) }
+        let calendar = Calendar.current
+        let answer = try await client.generate(
+            system: AIPrompts.summarySystem(kind, myName: AIPrompts.personName(myName), now: now, calendar: calendar),
+            prompt: AIPrompts.summaryInput(title: title, kind: kind, messages: messages, calendar: calendar),
+            schema: AIPrompts.summarySchema)
+        return try AIAnswers.summary(answer)
+    }
+}
+
 // MARK: - Reading answers
 
 /// Reads the model's JSON answers. Lenient on purpose: a missing or mistyped field falls back to
@@ -413,6 +431,26 @@ enum AIAnswers {
     }
 
     static let emptyReply = "Gemini didn't write a reply. Try again, or add a note on what to say."
+
+    /// {"bullets": […], "needsFromYou": "…"} → at most 4 clean bullets, and what's waiting on the user (nil
+    /// when nothing is, however the model says so). No bullets is a `badResponse`.
+    static func summary(_ data: Data) throws -> SummaryText {
+        let root = try object(data)
+        var seen = Set<String>()
+        let bullets = root.strings("bullets")
+            .map { title($0.trimmingCharacters(in: CharacterSet(charactersIn: "-•*·–— ").union(.whitespacesAndNewlines)), limit: 220) }
+            .filter { !$0.isEmpty && seen.insert(key($0)).inserted }
+        guard !bullets.isEmpty else { throw AIError.badResponse(emptySummary) }
+        var needs = root.text("needsFromYou").map { title($0, limit: 220) }
+        if let n = needs, nothingWaiting.contains(key(n).trimmingCharacters(in: CharacterSet(charactersIn: ".!"))) { needs = nil }
+        return SummaryText(bullets: Array(bullets.prefix(4)), needsFromYou: needs?.isEmpty == false ? needs : nil)
+    }
+
+    static let emptySummary = "Gemini didn't write a summary. Try again."
+
+    /// What models write instead of null when nothing is waiting.
+    private static let nothingWaiting: Set<String> = ["nothing", "none", "no", "nothing needed", "nothing from you", "no action needed",
+                                                      "no action", "n/a", "nothing is needed", "nothing right now"]
 
     /// Fixes the slips models make out of habit: line breaks escaped twice, Markdown bold (one asterisk in
     /// Slack, none in a plain-text email), Markdown links (as "text (url)", which both show as a link), a

@@ -265,14 +265,17 @@ struct Note: Codable, Identifiable, Hashable {
     private static let mediaPattern = try! NSRegularExpression(pattern: #"!\[([^\]]*)\]\(([^)]*)\)"#)
     private static let videoExtensions: Set<String> = ["mov", "mp4", "m4v", "avi", "mkv", "webm", "3gp", "mpg", "mpeg"]
 
-    /// "![Board deck](attachments/x.png)" reads as "Photo: Board deck" in titles and previews.
+    /// "![Board deck](attachments/x.png)" reads as "Photo: Board deck" in titles and previews
+    /// ("Video: …" and "PDF: …" for those).
     static func describingMedia(_ line: String) -> String {
         let ns = line as NSString
         var result = line
         for m in mediaPattern.matches(in: line, range: NSRange(location: 0, length: ns.length)).reversed() {
             let alt = ns.substring(with: m.range(at: 1))
-            let path = ns.substring(with: m.range(at: 2))
-            let kind = videoExtensions.contains((path as NSString).pathExtension.lowercased()) ? "Video" : "Photo"
+            let path = ns.substring(with: m.range(at: 2)).trimmingCharacters(in: CharacterSet(charactersIn: "<> "))
+            // A web address's extension comes before any "?query".
+            let ext = (URL(string: path)?.pathExtension ?? (path as NSString).pathExtension).lowercased()
+            let kind = ext == "pdf" ? "PDF" : (videoExtensions.contains(ext) ? "Video" : "Photo")
             let label = alt.isEmpty ? kind : "\(kind): \(alt)"
             result = (result as NSString).replacingCharacters(in: m.range, with: label)
         }

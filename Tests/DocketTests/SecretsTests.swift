@@ -35,6 +35,21 @@ final class SecretsTests: XCTestCase {
         XCTAssertNil(Keychain.string("slack-user-token"), "an empty string deletes too")
     }
 
+    func testSecretsFileIsPrivateAndRoundTrips() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("docket-secrets-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir); Keychain.useInMemoryStore() }
+        let file = dir.appendingPathComponent("secrets.json")
+        Keychain.useFile(file)
+        Keychain.set("xoxp-test", for: Keychain.Account.slackUserToken)
+        let mode = try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? Int
+        XCTAssertEqual(mode, 0o600, "only the user can read it")
+        Keychain.useFile(file) // a fresh launch reads it back
+        XCTAssertEqual(Keychain.string(Keychain.Account.slackUserToken), "xoxp-test")
+        Keychain.set(nil, for: Keychain.Account.slackUserToken)
+        XCTAssertNil(Keychain.string(Keychain.Account.slackUserToken))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path), "nothing stored, no file")
+    }
+
     func testInMemoryStoreStartsEmptyEachTime() {
         Keychain.set("refresh-token", for: Keychain.Account.googleRefreshToken)
         Keychain.useInMemoryStore()

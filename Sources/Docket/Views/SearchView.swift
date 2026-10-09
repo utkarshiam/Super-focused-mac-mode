@@ -161,7 +161,7 @@ private struct SearchResultsPane: View {
 }
 
 /// "Search" and what was found, laid out like the other pages' headers. Unlike theirs it never moves the
-/// compact-rows button onto a line of its own when the summary is long: the summary is cut short instead,
+/// "⋯" menu onto a line of its own when the summary is long: the summary is cut short instead,
 /// so the results don't jump around while you type.
 private struct SearchHeader: View {
     var subtitle: String?
@@ -182,7 +182,7 @@ private struct SearchHeader: View {
                     .accessibilityHidden(subtitle == nil)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            CompactRowsToggle()
+            ViewOptionsMenu()
         }
         .padding(.horizontal, Space.gutter)
         .padding(.top, Space.lg)

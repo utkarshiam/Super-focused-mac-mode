@@ -4,7 +4,7 @@ import Foundation
 
 // MARK: - Suggestions
 
-/// A Slack message or email that may deserve a task, shown in "From Slack & Gmail".
+/// A Slack message or email that may deserve a task, shown in Messages.
 struct Suggestion: Identifiable, Codable, Hashable {
     var id: String { source.externalID }
     var source: TaskSource
@@ -312,11 +312,12 @@ enum IntegrationHTTP {
 // MARK: - Saved state
 
 /// What Integrations remembers between launches, in integrations.json in the data folder.
-/// No tokens: those stay in the keychain.
+/// No tokens: those stay in the secrets file.
 struct IntegrationsFile: Codable {
     /// 2 added the inbox: notes, replies, complete messages, granted permissions. 3 added stars (on items and
-    /// on messages of their threads). Older files load as they are (the new fields start empty).
-    static let currentVersion = 3
+    /// on messages of their threads). 4 added thread summaries. Older files load as they are (the new fields
+    /// start empty).
+    static let currentVersion = 4
 
     var version = currentVersion
     var suggestions: [Suggestion] = []
@@ -339,12 +340,14 @@ struct IntegrationsFile: Codable {
     /// Slack turned saving messages for later down (an app made after Slack retired it, a workspace that
     /// doesn't allow it, or an app without stars:write): stars stay in Docket until Slack is connected again.
     var slackStarsStayInDocket = false
+    /// Summaries of important threads, by item id (`ThreadSummaries.swift`).
+    var summaries: [String: ThreadSummary] = [:]
 
     init() {}
 
     enum CodingKeys: String, CodingKey {
         case version, suggestions, handled, skipped, lastRefresh, slack, gmailAddress, focusStatus
-        case slackScopes, gmailScopes, slackNames, slackStarsStayInDocket
+        case slackScopes, gmailScopes, slackNames, slackStarsStayInDocket, summaries
     }
 
     init(from decoder: Decoder) throws {
@@ -362,6 +365,7 @@ struct IntegrationsFile: Codable {
         gmailScopes = c.value(.gmailScopes, default: nil)
         slackNames = c.value(.slackNames, default: [:])
         slackStarsStayInDocket = c.value(.slackStarsStayInDocket, default: false)
+        summaries = c.value(.summaries, default: [:])
     }
 
     static func load(from url: URL) -> IntegrationsFile {
@@ -381,7 +385,7 @@ private struct LenientSuggestion: Decodable {
 
 /// De-duplication rules for suggestions. Pure, so they're easy to test.
 enum SuggestionInbox {
-    /// At most this many wait in "From Slack & Gmail" (the oldest go first).
+    /// At most this many wait in Messages (the oldest go first).
     static let limit = 100
     /// Handled and skipped ids are kept this long: longer than any source looks back (30 days).
     static let memory: TimeInterval = 120 * 86_400
@@ -531,7 +535,7 @@ struct SeenMessages {
 /// message, its thread and attachments, notes, replies), sharing a plan, and the Slack focus status.
 ///
 /// Network calls run in the background and never block the UI; problems become a status line
-/// (`slackProblem`, `gmailProblem`, `aiProblem`). Tokens live in the keychain only and are never logged.
+/// (`slackProblem`, `gmailProblem`, `aiProblem`). Tokens live in the secrets file only and are never logged.
 /// Adding or dismissing a suggestion is part of the window's undo, like any task change.
 @MainActor
 final class Integrations: ObservableObject {
@@ -587,6 +591,12 @@ final class Integrations: ObservableObject {
     var slackStarsStayInDocket = false
     /// Names from the last launch of the people and channels the waiting Slack messages mention.
     var savedSlackNames: [String: String] = [:]
+    /// Summaries of important threads, by item id (saved; see ThreadSummaries.swift).
+    @Published var threadSummaries: [String: ThreadSummary] = [:]
+    /// Items whose summary is being written.
+    @Published var summarizing: Set<String> = []
+    /// Why the last summary of an item couldn't be written, in plain words.
+    @Published var summaryProblems: [String: String] = [:]
 
     // Dependencies. Tests swap them, so nothing reaches the network, Gemini or a browser.
     var transport: IntegrationHTTP.Transport
@@ -598,6 +608,8 @@ final class Integrations: ObservableObject {
     var inboxClients = InboxClients()
     /// Writes replies with AI.
     var replyWriter: ReplyWriter = .gemini
+    /// Summarizes important threads with AI.
+    var summarizer: ThreadSummarizer = .gemini
     /// The user's name, to sign a reply ("Maya Chen"): the Mac account's full name.
     var fullName: () -> String = { NSFullUserName() }
 
@@ -610,7 +622,7 @@ final class Integrations: ObservableObject {
     /// Without AI to pick out the ones that matter, at most this many mentions or emails per source per refresh.
     static let unsortedLimit = 15
 
-    private weak var store: Store?
+    private(set) weak var store: Store?
     /// For toasts.
     private(set) weak var app: AppState?
     private var fileURL: URL?
@@ -674,7 +686,7 @@ final class Integrations: ObservableObject {
             saver.quit()
         })
 
-        // After launch, so a keychain prompt never holds up the first window.
+        // After launch, so reading secrets never holds up the first window.
         Task { @MainActor [weak self] in await self?.resumeAfterLaunch() }
     }
 
@@ -699,6 +711,7 @@ final class Integrations: ObservableObject {
         grantedGmailScopes = file.gmailScopes.map(Set.init)
         savedSlackNames = file.slackNames
         slackStarsStayInDocket = file.slackStarsStayInDocket
+        threadSummaries = file.summaries
         // Attachments of messages that are gone, and a cache grown too big.
         pruneInboxCache()
 
@@ -711,7 +724,7 @@ final class Integrations: ObservableObject {
     }
 
     private func resumeAfterLaunch() async {
-        // Accounts whose state file went missing come back from the keychain by themselves.
+        // Accounts whose state file went missing come back from this Mac by themselves.
         if slackAccount == nil, let token = Keychain.string(Keychain.Account.slackUserToken) {
             try? await connectSlack(token: token, refreshAfter: false)
         } else if isSlackConnected {
@@ -739,6 +752,8 @@ final class Integrations: ObservableObject {
         refreshTask = Task { @MainActor [weak self] in
             await self?.refreshNow()
             self?.refreshTask = nil
+            // In the app only (tests attach without starting): the newest important threads get summaries.
+            if self?.started == true { self?.summarizeImportantInBackground() }
         }
     }
 
@@ -883,10 +898,10 @@ final class Integrations: ObservableObject {
         -> (found: [SuggestionCandidate], wholeMessages: [Suggestion], checked: Bool) {
         guard isSlackConnected, let account = slackAccount else { return ([], [], false) }
         if let until = slackPausedUntil, until > now { return ([], [], false) }
-        // Unreadable isn't gone: the keychain may be locked, or access was refused this time. Only Slack
+        // Unreadable isn't gone: the secrets file may be locked, or access was refused this time. Only Slack
         // turning the token down disconnects.
         guard let token = slackToken() else {
-            slackProblem = "Docket couldn't read the Slack token from your keychain. If it was removed, disconnect Slack and connect it again in Settings → Connections."
+            slackProblem = "Docket couldn't read the Slack token from this Mac. If it was removed, disconnect Slack and connect it again in Settings → Connections."
             return ([], [], false)
         }
         let unfilled = Set(suggestions.lazy.filter { $0.source.kind == .slack && $0.content == nil }.map(\.id))
@@ -988,7 +1003,7 @@ final class Integrations: ObservableObject {
         }
     }
 
-    /// Checks the token with Slack (auth.test), then keeps it in the keychain. Throws a readable error.
+    /// Checks the token with Slack (auth.test), then keeps it in the secrets file. Throws a readable error.
     func connectSlack(token raw: String) async throws {
         try await connectSlack(token: raw, refreshAfter: true)
     }
@@ -1031,16 +1046,21 @@ final class Integrations: ObservableObject {
     /// Asks Slack which permissions the token has now (auth.test), for the warnings and `missingSlackScopes`.
     /// Quietly does nothing when Slack can't be reached.
     func checkSlackPermissions() async {
-        guard isSlackConnected, let account = slackAccount, let token = slackToken(),
-              let identity = try? await slackClient(token).identity(),
-              isSlackConnected, identity.0.userID == account.userID, var current = slackAccount else { return }
-        current.missingScopes = Self.missingCoreScopes(granted: identity.scopes)
+        guard isSlackConnected, let token = slackToken(), let identity = try? await slackClient(token).identity() else { return }
+        noteSlackIdentity(identity.0, scopes: identity.scopes)
+    }
+
+    /// What auth.test just said about the token (the account it belongs to, its permissions), kept for the
+    /// warnings and `missingSlackScopes`. Ignored when it's about another account than the one connected.
+    func noteSlackIdentity(_ account: SlackAccount, scopes: Set<String>?) {
+        guard isSlackConnected, var current = slackAccount, current.userID == account.userID else { return }
+        current.missingScopes = Self.missingCoreScopes(granted: scopes)
         slackAccount = current
         // Allowed to save messages for later now: Slack is asked again.
-        if identity.scopes?.contains(InboxStarRules.slackWrite) == true, grantedSlackScopes?.contains(InboxStarRules.slackWrite) == false {
+        if scopes?.contains(InboxStarRules.slackWrite) == true, grantedSlackScopes?.contains(InboxStarRules.slackWrite) == false {
             slackStarsStayInDocket = false
         }
-        grantedSlackScopes = identity.scopes
+        grantedSlackScopes = scopes
         refusedSlackScopes = []
         save()
     }
@@ -1126,11 +1146,11 @@ final class Integrations: ObservableObject {
     private func collectGmail(settings: IntegrationSettings, seen: SeenMessages, now: Date) async -> (found: [SuggestionCandidate], checked: Bool) {
         guard isGmailConnected, let address = gmailAddress else { return ([], false) }
         if let until = gmailPausedUntil, until > now { return ([], false) }
-        // As for Slack: an unreadable keychain item doesn't disconnect; Google refusing the sign-in does.
+        // As for Slack: an unreadable secret doesn't disconnect; Google refusing the sign-in does.
         guard let session = googleSession() else {
             gmailProblem = googleClient == nil
                 ? "Docket couldn't find your Google OAuth client. Disconnect Gmail in Settings → Connections, add the client again, then connect."
-                : "Docket couldn't read the Gmail sign-in from your keychain. If it was removed, disconnect Gmail and connect it again in Settings → Connections."
+                : "Docket couldn't read the Gmail sign-in from this Mac. If it was removed, disconnect Gmail and connect it again in Settings → Connections."
             return ([], false)
         }
         let client = GmailClient(session: session, transport: transport)
@@ -1453,7 +1473,7 @@ final class Integrations: ObservableObject {
     // MARK: Screenshot mode
 
     /// Both services connected as made-up accounts with every permission, checked a few minutes ago. Nothing
-    /// is read from the keychain or the network (see `debugSeed`).
+    /// is read from this Mac or the network (see `debugSeed`).
     func showSampleAccounts(slack account: SlackAccount, gmail address: String, refreshedAt: Date) {
         slackAccount = account
         isSlackConnected = true
@@ -1487,6 +1507,7 @@ final class Integrations: ObservableObject {
         file.gmailScopes = grantedGmailScopes?.sorted()
         file.slackNames = savedSlackNames
         file.slackStarsStayInDocket = slackStarsStayInDocket
+        file.summaries = summariesToKeep
         saver.save(file, to: fileURL, after: soon ? IntegrationsSaver.typingPause : 0)
     }
 

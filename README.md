@@ -78,7 +78,7 @@ Press **⌘J**, write a brain dump, and review the tasks Docket proposes: titles
   <img src="docs/images/search.png" alt="Search results for 'board' across tasks and notes" width="80%">
 </p>
 
-### Slack and email, without leaving Docket
+### Messages: Slack and email, without leaving Docket
 
 Connect Slack and Gmail in **Settings → Connections**, and the messages that matter land in two tabs: messages you react to with 📌 and ones that @mention you, starred emails, and emails waiting on your reply.
 
@@ -133,7 +133,7 @@ The first launch includes a **Welcome to Docket** note with a cheat sheet, and a
 ## Set up AI (optional)
 
 1. Get a free API key from [Google AI Studio](https://aistudio.google.com/apikey).
-2. Paste it into **Settings → AI**. It's stored in your macOS keychain and never shown again.
+2. Paste it into **Settings → AI**. It's saved on your Mac in a file only your user account can read, and never shown again.
 3. Press **⌘J** and write something like *"board meeting thursday 10am, deck by wednesday, dry run with Sam before that"*.
 
 The default model is `gemini-3.5-flash`; you can change it in the same place. Only the text you send to an AI feature (plus your list and tag names) leaves your Mac. With Slack or Gmail connected, new messages are sent too, so Docket can tell which ones need a task, and **Draft with AI** sends the message, its thread and your notes for that message.
@@ -171,7 +171,7 @@ Docket asks for `gmail.modify`: it reads your mail, stars what you star, and sen
 | ⌘K | Jump to anything |
 | ⌘F | Search tasks and notes (find in a note while editing it) |
 | ⌘J | Plan with AI |
-| ⌘1 – ⌘9 | Calendar, Inbox, Notes, Important, All, Completed, Insights, Waiting, From Slack & Gmail |
+| ⌘1 – ⌘9 | Calendar, Inbox, Notes, Important, All, Completed, Insights, Waiting, Messages |
 | ↑ / ↓, ⇧↑ / ⇧↓ | Move through tasks, extend the selection |
 | ⌘-click, ⇧-click, ⌘A | Select several tasks |
 | T / M / W / X | Selected tasks: today / tomorrow / next week / done |
@@ -204,7 +204,7 @@ Docket asks for `gmail.modify`: it reads your mail, stars what you star, and sen
 - Everything lives in `~/Library/Application Support/Docket/docket.json`, with photos and videos from notes in `attachments/` next to it.
 - Docket keeps a daily backup for 30 days in `Backups/`. If the data file is ever unreadable or missing, it restores the newest backup on its own.
 - **Settings → Data** exports everything (attachments included) and imports it on another Mac, or exports notes as Markdown.
-- API keys and tokens live in the macOS keychain, never in the data file.
+- API keys and tokens live in `secrets.json` in the same folder, readable only by your user account (permissions 600), never in the data file. Docket doesn't use the macOS keychain, so it never interrupts you for your password after an update.
 
 ## Build from source
 
@@ -238,7 +238,7 @@ Sources/Docket/
   AI/            Gemini client and prompts (structured JSON output)
   Integrations/  Slack, Gmail, Google sign-in (loopback + PKCE), suggestions
   Services/      notifications, alarms, focus timer, global hotkey, calendar, media library
-  Support/       quick-add parser, formatting, preferences, keychain, secrets
+  Support/       quick-add parser, formatting, preferences, secrets
   Views/         SwiftUI views; Theme.swift holds the design tokens; a TextKit Markdown renderer
 scripts/         build.sh (universal app + DMG), make-assets.swift (icon + alarm sound)
 Tests/           XCTest suite

@@ -36,7 +36,7 @@ struct GeminiClient {
     /// Fails at once, as if offline.
     static let offlineTransport: Transport = { _ in throw URLError(.notConnectedToInternet) }
 
-    /// XCTest is loaded: the same check the keychain uses to keep tests away from real secrets.
+    /// XCTest is loaded: the same check the secrets file uses to keep tests away from real secrets.
     static var isUnitTesting: Bool { NSClassFromString("XCTestCase") != nil }
 
     /// The model id as the URL wants it ("models/gemini-3.5-flash" → "gemini-3.5-flash").

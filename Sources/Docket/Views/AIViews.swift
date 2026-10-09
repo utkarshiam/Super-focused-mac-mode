@@ -1264,7 +1264,7 @@ private struct OrderDayPopover: View {
 
 // MARK: - Settings → AI
 
-/// Settings → AI: the "Use AI" switch, the Gemini key (kept in the keychain, never shown), the model,
+/// Settings → AI: the "Use AI" switch, the Gemini key (saved on this Mac, never shown), the model,
 /// a connection test, and what gets sent.
 struct AISettingsPage: View {
     @AppStorage(Prefs.Key.aiEnabled) private var aiEnabled = true
@@ -1305,7 +1305,7 @@ struct AISettingsPage: View {
                             .frame(width: 180, height: 30)
                             .background(RoundedRectangle(cornerRadius: Radius.xs, style: .continuous).fill(Color.fill))
                             .onSubmit(saveKey)
-                            .help("Your key is kept in the macOS keychain and never shown again")
+                            .help("Your key stays on this Mac, in a file only you can read, and is never shown again")
                         Button("Save", action: saveKey)
                             .buttonStyle(SecondaryPill(height: 30))
                             .disabled(keyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
@@ -1313,7 +1313,7 @@ struct AISettingsPage: View {
                         if source == .settings {
                             Button("Remove", action: removeKey)
                                 .buttonStyle(SecondaryPill(height: 30))
-                                .help("Delete your key from the keychain")
+                                .help("Delete your saved key")
                         }
                     }
                 }
@@ -1382,7 +1382,7 @@ struct AISettingsPage: View {
 
     private func keyStatus(_ source: KeySource) -> String {
         switch source {
-        case .settings: "Saved in your keychain"
+        case .settings: "Saved on this Mac"
         case .bundled: "Built into this copy of Docket"
         case .environment: "From GEMINI_API_KEY"
         case .none: "Not set yet"
@@ -1391,10 +1391,10 @@ struct AISettingsPage: View {
 
     private func keyFooter(_ source: KeySource) -> String {
         switch source {
-        case .settings: "Your own key, kept in the macOS keychain. Docket never shows it or writes it anywhere else."
+        case .settings: "Your own key, saved on this Mac in a file only you can read. Docket never shows it or writes it anywhere else."
         case .bundled: "Using the key built into this copy of Docket. Paste your own to use that instead."
-        case .environment: "Using the key in the GEMINI_API_KEY environment variable. Paste one here to keep it in the keychain instead."
-        case .none: "Paste a Gemini API key to use AI. It's kept in the macOS keychain and never shown again."
+        case .environment: "Using the key in the GEMINI_API_KEY environment variable. Paste one here to save it on this Mac instead."
+        case .none: "Paste a Gemini API key to use AI. It stays on this Mac and is never shown again."
         }
     }
 

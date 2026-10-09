@@ -78,20 +78,24 @@ private struct WidthLimit: Layout {
 struct DelegateRow: View {
     @EnvironmentObject var store: Store
     let taskID: UUID
+    /// Put the cursor in the name field when the row shows (it was just asked for with "+ Waiting on").
+    var focusOnAppear = false
     @State private var draft = ""
     /// Set once the stored name is in `draft`, so an empty field can never be saved over it by accident.
     @State private var loaded = false
     @FocusState private var editing: Bool
 
-    init(taskID: UUID) {
+    init(taskID: UUID, focusOnAppear: Bool = false) {
         self.taskID = taskID
+        self.focusOnAppear = focusOnAppear
     }
 
     var body: some View {
         let current = Delegation.normalized(store.task(taskID)?.waitingOn)
         let people = Delegation.recentPeople(in: store.tasks)
         HStack(spacing: Space.md) {
-            Image(systemName: "hourglass")
+            // Not the hourglass: that's Estimate, in the card above.
+            Image(systemName: "person")
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(Color.ink2)
                 .frame(width: 18)
@@ -155,6 +159,9 @@ struct DelegateRow: View {
         .onAppear {
             draft = current ?? ""
             loaded = true
+            if focusOnAppear, current == nil {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { editing = true }
+            }
         }
         .onChange(of: current) { value in
             // Changed elsewhere (the slip nudge, bulk edit, undo): show it, unless it's being typed over.

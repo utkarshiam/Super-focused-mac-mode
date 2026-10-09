@@ -219,6 +219,8 @@ final class ConversationModel: ObservableObject {
     @Published var showsEarlier = false
     /// The open message was brought into view (once, when the thread first shows).
     var revealed = false
+    /// Saves one message of the thread (its id) as a note: set by the detail.
+    var saveAsNote: ((String) -> Void)?
 
     /// How long the message has to stay open before its thread is fetched.
     static let settle: UInt64 = 200_000_000
@@ -294,6 +296,11 @@ final class ConversationModel: ObservableObject {
     /// Points the composer at this message (and brings it into view).
     func reply(to id: String) {
         target = id
+        composerRequests += 1
+    }
+
+    /// Brings out the composer (and into view) without changing which message it answers: the detail's Reply.
+    func requestComposer() {
         composerRequests += 1
     }
 
@@ -816,7 +823,8 @@ private struct SlackThreadView: View {
                                canReply: !isStandIn && messages.count > 1 && !sent, quickLook: quickLook,
                                filesBlocked: filesBlocked, updateSlack: updateSlack,
                                star: { InboxStarring.toggle(message: m.id, in: item.id) },
-                               reply: { conversation.reply(to: m.id) })
+                               reply: { conversation.reply(to: m.id) },
+                               saveNote: sent ? nil : { conversation.saveAsNote?(m.id) })
                     .id(ConversationSection.rowID(m.id))
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
@@ -844,6 +852,8 @@ private struct SlackThreadRow: View {
     let updateSlack: () -> Void
     let star: () -> Void
     let reply: () -> Void
+    /// Saves this message as a note (not one that just went out).
+    let saveNote: (() -> Void)?
     @State private var hovering = false
 
     var body: some View {
@@ -902,6 +912,7 @@ private struct SlackThreadRow: View {
                 Divider()
             }
             Button("Copy Text") { copy(message.text) }
+            if let saveNote { Button("Save Message as Note", action: saveNote) }
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(sender), \(Fmt.dateTime(message.date))")
@@ -965,7 +976,8 @@ private struct EmailConversationView: View {
                                   myAddress: myAddress, plainText: plainText, untrimmed: untrimmed(email.id),
                                   quickLook: quickLook, paneHeight: paneHeight,
                                   collapse: { toggle(email.id, open: false) }, star: star,
-                                  reply: { conversation.reply(to: email.id) })
+                                  reply: { conversation.reply(to: email.id) },
+                                  saveNote: sent ? nil : { conversation.saveAsNote?(email.id) })
                     } else {
                         EmailLine(email: email, isStarred: starred, now: app.clock, open: { toggle(email.id, open: true) }, star: star)
                     }
@@ -1062,6 +1074,8 @@ private struct EmailCard: View {
     let collapse: () -> Void
     let star: () -> Void
     let reply: () -> Void
+    /// Saves this email as a note (not one that just went out).
+    let saveNote: (() -> Void)?
     @StateObject private var facts = MailHTMLFacts()
 
     private var html: String? { email.content.html.flatMap { MailHTML.hasContent($0) ? $0 : nil } }
@@ -1088,6 +1102,7 @@ private struct EmailCard: View {
                 Divider()
             }
             Button("Copy Text") { copy(email.content.text) }
+            if let saveNote { Button("Save Email as Note", action: saveNote) }
         }
     }
 

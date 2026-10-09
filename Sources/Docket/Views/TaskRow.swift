@@ -119,7 +119,7 @@ struct TaskRow: View {
             CheckCircle(done: task.isCompleted, priority: task.priority, size: 16) {
                 app.toggle(task.id, in: store)
             }
-            // The title always keeps room to be read; the glyphs, then source, delegation and tags, get what's left.
+            // The title always keeps room to be read; the glyphs, then source and delegation, get what's left.
             CompactLineLayout {
                 titleText
                     .font(.system(size: 13.5, weight: .semibold))
@@ -129,10 +129,9 @@ struct TaskRow: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
                 compactGlyphs
-                // Source, delegation and tags only when the whole title fits beside them.
+                // Source and delegation only when the whole title fits beside them.
                 ViewThatFits(in: .horizontal) {
-                    compactExtras(tagCount: 2)
-                    compactExtras(tagCount: 0)
+                    compactExtras
                     Color.clear.frame(width: 0, height: 0)
                 }
             }
@@ -175,8 +174,7 @@ struct TaskRow: View {
         if let list = store.list(task.listID), !isListContext {
             glyphs.append(RowGlyph(id: "list", symbol: list.icon, help: list.name))
         }
-        if context == .calendar, let day, let due = task.dueDate, !task.isCompleted,
-           !Calendar.current.isDate(due, inSameDayAs: day) {
+        if let due = dueElsewhere {
             glyphs.append(RowGlyph(id: "due", symbol: "flag", help: "Due \(Fmt.absoluteDay(due, now: app.clock))"))
         }
         let progress = task.subtaskProgress
@@ -184,32 +182,19 @@ struct TaskRow: View {
             glyphs.append(RowGlyph(id: "steps", text: "\(progress.done)/\(progress.total)",
                                    help: "\(progress.done) of \(progress.total) steps done"))
         }
-        if let rule = task.recurrence {
-            glyphs.append(RowGlyph(id: "repeat", symbol: "repeat", help: rule.summary))
-        }
-        if !task.reminders.isEmpty, !task.isCompleted {
-            glyphs.append(RowGlyph(id: "reminder", symbol: task.hasAlarm ? "alarm" : "bell",
-                                   help: task.hasAlarm ? "Has an alarm" : "Has a reminder"))
-        }
-        if task.linkedNoteID != nil {
-            glyphs.append(RowGlyph(id: "note", symbol: "doc.text", help: "From a note"))
-        } else if !task.notes.isEmpty {
-            glyphs.append(RowGlyph(id: "note", symbol: "text.alignleft", help: "Has notes"))
+        if task.hasAlarm, !task.isCompleted {
+            glyphs.append(RowGlyph(id: "alarm", symbol: "alarm", help: "Has an alarm"))
         }
         return glyphs
     }
 
-    /// Where it came from, who it's waiting on, and the first tags: shown in compact rows only when they fit.
-    private func compactExtras(tagCount: Int) -> some View {
+    /// Where it came from and who it's waiting on: shown in compact rows only when they fit.
+    private var compactExtras: some View {
         HStack(spacing: 6) {
             if let source = task.source {
                 SourceBadge(source: source)
             }
             TaskRowBadges(task: task)
-            if tagCount > 0, !task.tags.isEmpty {
-                Text(task.tags.prefix(tagCount).map { "#\($0)" }.joined(separator: " "))
-                    .foregroundStyle(Color.ink3)
-            }
         }
         .font(.system(size: 11.5, weight: .medium))
         .foregroundStyle(Color.ink2)
@@ -247,19 +232,24 @@ struct TaskRow: View {
         return id.uuidString
     }
 
+    /// Only what helps act on the task: how urgent it is, where it lives, its deadline when that's another
+    /// day, steps left, where it came from, who it's waiting on, how often it slipped, and an alarm.
+    /// Tags, notes, repeats and quiet reminders live in the details panel.
     @ViewBuilder
     private var meta: some View {
         let list = store.list(task.listID)
         let progress = task.subtaskProgress
         let showList = list != nil && !isListContext
-        let hasMeta = showList || task.trackedSeconds >= 60 || !task.tags.isEmpty || progress.total > 0
-            || (context == .calendar && day != nil && task.dueDate.map { !Calendar.current.isDate($0, inSameDayAs: day!) } == true)
-            || task.recurrence != nil || !task.reminders.isEmpty || !task.notes.isEmpty || task.linkedNoteID != nil || task.priority.tone != nil
-            || task.source != nil || task.waitingOn != nil || task.postponeCount >= 3
+        let open = !task.isCompleted
+        let showPriority = task.priority.tone != nil && open
+        let showDue = dueElsewhere != nil
+        let showAlarm = task.hasAlarm && open
+        let hasMeta = showPriority || showList || showDue || progress.total > 0 || task.source != nil
+            || Delegation.normalized(task.waitingOn) != nil || task.postponeCount >= Slipping.threshold || showAlarm
 
         if hasMeta {
             HStack(spacing: 10) {
-                if let tone = task.priority.tone, !task.isCompleted {
+                if let tone = task.priority.tone, showPriority {
                     Badge(text: task.priority.label, tone: tone)
                         .fixedSize()
                 }
@@ -267,18 +257,14 @@ struct TaskRow: View {
                     metaItem(list.icon, list.name)
                         .layoutPriority(1)
                 }
-                if task.trackedSeconds >= 60 {
-                    metaItem("timer", "\(Fmt.duration(seconds: task.trackedSeconds)) spent")
-                        .layoutPriority(2)
-                }
-                if context == .calendar, let day, let due = task.dueDate, !task.isCompleted,
-                   !Calendar.current.isDate(due, inSameDayAs: day) {
+                if let due = dueElsewhere {
                     metaItem("flag", "Due \(Fmt.absoluteDay(due, now: app.clock))")
                         .layoutPriority(2)
                 }
                 if progress.total > 0 {
                     metaItem("checklist", "\(progress.done)/\(progress.total)")
                         .layoutPriority(2)
+                        .help("\(progress.done) of \(progress.total) steps done")
                 }
                 if let source = task.source {
                     SourceBadge(source: source)
@@ -286,26 +272,22 @@ struct TaskRow: View {
                 }
                 TaskRowBadges(task: task)
                     .layoutPriority(2)
-                if let first = task.tags.first {
-                    // Whole tags or none: squeezed tags would show as stray dots.
-                    ViewThatFits(in: .horizontal) {
-                        Text(task.tags.prefix(3).map { "#\($0)" }.joined(separator: "  "))
-                        Text("#\(first)")
-                        Color.clear.frame(width: 0, height: 0)
-                    }
-                }
-                if task.recurrence != nil { Image(systemName: "repeat") }
-                if !task.reminders.isEmpty, !task.isCompleted {
-                    Image(systemName: task.hasAlarm ? "alarm" : "bell")
-                }
-                if !task.notes.isEmpty || task.linkedNoteID != nil {
-                    Image(systemName: task.linkedNoteID != nil ? "doc.text" : "text.alignleft")
+                if showAlarm {
+                    Image(systemName: "alarm")
+                        .help("Has an alarm")
                 }
             }
             .font(.system(size: 12, weight: .medium))
             .foregroundStyle(Color.ink2)
             .lineLimit(1)
         }
+    }
+
+    /// Calendar only: the deadline, when the task is planned for a different day than it's due.
+    private var dueElsewhere: Date? {
+        guard context == .calendar, let day, let due = task.dueDate, !task.isCompleted,
+              !Calendar.current.isDate(due, inSameDayAs: day) else { return nil }
+        return due
     }
 
     private var isListContext: Bool {
@@ -347,7 +329,7 @@ private struct RowGlyphView: View {
 }
 
 /// The middle of a compact row, on one line: the title, its detail glyphs, then the extras (source, waiting
-/// on, tags). The title always keeps `minTitleWidth` (all of it, when shorter); the glyphs get what's left
+/// on). The title always keeps `minTitleWidth` (all of it, when shorter); the glyphs get what's left
 /// after that, and the extras whatever remains. Both are ViewThatFits, so each shows the fullest version
 /// that fits its room, and nothing ever pushes the date on the right out of the row.
 private struct CompactLineLayout: Layout {

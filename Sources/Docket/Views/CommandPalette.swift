@@ -129,7 +129,7 @@ struct CommandPalette: View {
             Item(id: "c-completed", icon: "checkmark.circle", title: "Go to Completed", subtitle: "⌘6") { app.selection = .completed },
             Item(id: "c-insights", icon: "chart.bar", title: "Go to Insights", subtitle: "⌘7") { app.selection = .insights },
             Item(id: "c-waiting", icon: "hourglass", title: "Go to Waiting", subtitle: "⌘8") { app.selection = .waiting },
-            Item(id: "c-suggestions", icon: "tray.and.arrow.down", title: "Go to From Slack & Gmail", subtitle: "⌘9") { app.selection = .suggestions },
+            Item(id: "c-suggestions", icon: "tray.and.arrow.down", title: "Go to Messages", subtitle: "⌘9") { app.selection = .suggestions },
             Item(id: "c-month", icon: "calendar.badge.clock", title: "Show the month", subtitle: "Calendar") {
                 app.selection = .calendar
                 app.calendarMode = .month

@@ -40,7 +40,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         app.showSettings = { [weak self] in self?.showSettings() }
         app.showQuickCapture = { [weak self] in self?.quickCapture.toggle() }
 
-        // Before any window reads a secret: screenshot mode never touches the login keychain or the network.
+        // Before any window reads a secret: screenshot mode never touches the secrets file or the network.
         if DebugSnapshot.isActive { Keychain.useInMemoryStore() } else { Integrations.shared.start(store: store, app: app) }
 
         // Docket doesn't use window tabs (this also keeps tab items out of the View menu).
