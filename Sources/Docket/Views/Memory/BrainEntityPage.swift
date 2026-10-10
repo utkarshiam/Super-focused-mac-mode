@@ -492,6 +492,19 @@ struct BrainEntityPage: View {
     }
 
     private func momentRow(_ m: Moment, item: MemoryItem, entity: UUID) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            momentButton(m, item: item)
+            if m.kind == .promise {
+                PromiseTaskButton(moment: m, item: item)
+                    .padding(.leading, 42)
+                    .padding(.top, -4)
+                    .padding(.bottom, 10)
+            }
+        }
+        .overlay(alignment: .bottom) { Rectangle().fill(Color.hair).frame(height: 1).padding(.leading, 42) }
+    }
+
+    private func momentButton(_ m: Moment, item: MemoryItem) -> some View {
         Button { openItem(item.id) } label: {
             HStack(alignment: .top, spacing: Space.md) {
                 Image(systemName: MemoryText.symbol(for: m.kind))
@@ -518,7 +531,6 @@ struct BrainEntityPage: View {
         }
         .buttonStyle(PressScale(scale: 0.985))
         .help("Open “\(item.displayTitle)”")
-        .overlay(alignment: .bottom) { Rectangle().fill(Color.hair).frame(height: 1).padding(.leading, 42) }
     }
 
     // MARK: Sub-topics, related

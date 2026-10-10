@@ -60,20 +60,23 @@ public struct MemoryAsk: Sendable {
     /// Said when nothing in memory matches, without calling Gemini.
     public static let nothingFound = "Nothing in your memory matches that yet."
 
-    /// Asks over the Mac library.
+    /// Asks over the Mac library. `about`: what to look for when it isn't the question itself (a task's title
+    /// and notes for "What do I need to know to do: …").
     @MainActor
     public func ask(_ question: String, history: [AskTurn] = [], in library: MemoryLibrary,
-                    filter: MemoryFilter = MemoryFilter()) async throws -> MemoryAnswer {
+                    filter: MemoryFilter = MemoryFilter(), about: String? = nil) async throws -> MemoryAnswer {
         try await ask(question, history: history, search: library.searchEngine(), profile: library.profile,
-                      lenses: library.lenses, filter: filter)
+                      lenses: library.lenses, filter: filter, about: about)
     }
 
     /// Asks over any searchable set of items (the phone's snapshot).
     public func ask(_ question: String, history: [AskTurn] = [], search: MemorySearch, profile: MemoryProfile,
-                    lenses: [Lens], filter: MemoryFilter = MemoryFilter()) async throws -> MemoryAnswer {
+                    lenses: [Lens], filter: MemoryFilter = MemoryFilter(), about: String? = nil) async throws -> MemoryAnswer {
         let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { throw MemoryAIError.badResponse("Ask a question first.") }
-        let sources = await retrieve(q, history: history, search: search, filter: filter)
+        let topic = about?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let sources = await retrieve(topic.isEmpty ? q : topic, history: history, search: search, filter: filter)
+            .filter { !TaskContext.isTaskItem($0) }
         guard !sources.isEmpty else {
             return MemoryAnswer(question: q, text: Self.nothingFound, citations: [], followUps: [], usedItemIDs: [],
                                 sources: [], answered: false)

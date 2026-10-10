@@ -62,10 +62,11 @@ struct TaskDetailView: View {
                 setSection(task, binding)
                 if showsChecklist(task) { checklistSection(task, binding) }
                 addSection(task, binding)
-                // What's already known about it: a quiet line, hidden when nothing is related.
-                FromMemoryStrip(text: task.title + "\n" + task.notes, excluding: [SourceRef.task(taskID)])
+                // What memory knows that helps with it: open when there's something, folded otherwise.
+                TaskBriefSection(task: task)
 
                 SourceLinkButton(taskID: taskID)
+                if let memoryID = task.memoryID { TaskMemoryLink(memoryID: memoryID) }
                 if let noteID = task.linkedNoteID, let note = store.note(noteID) {
                     Button { app.reveal(note: noteID) } label: {
                         Label("Open note: \(note.title)", systemImage: "doc.text")

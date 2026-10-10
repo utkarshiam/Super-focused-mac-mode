@@ -175,7 +175,8 @@ final class SpokenTaskCenter: ObservableObject {
         }
         let background = UIApplication.shared.beginBackgroundTask(withName: "Schedule spoken task")
         defer { if background != .invalid { UIApplication.shared.endBackgroundTask(background) } }
-        let parser = SpokenTaskParser(ai: ai, listNames: model.snapshot?.listNames ?? [], knownPeople: model.snapshot?.knownPeople ?? [])
+        let parser = SpokenTaskParser(ai: ai, listNames: model.snapshot?.listNames ?? [], knownPeople: model.snapshot?.knownPeople ?? [],
+                                      memoryContext: model.taskContextBlock(for: job.words))
         do {
             let tasks = try await parser.parse(job.words, now: job.spokenAt)
             if tasks.isEmpty {

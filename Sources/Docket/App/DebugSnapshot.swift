@@ -232,7 +232,7 @@ enum DebugSnapshot {
                 d.app.selection = .memory
                 d.app.selectedMemoryID = MemoryCenter.shared.library.items.first { $0.title == "Seed round: investor feedback" }?.id
             }),
-        ] + brainSteps(d) + dictationSteps(d)
+        ] + brainSteps(d) + dictationSteps(d) + taskMemorySteps(d)
 
         let t0 = ProcessInfo.processInfo.systemUptime
         func stamp() -> String {
@@ -339,14 +339,12 @@ enum DebugSnapshot {
             }),
             ("55-task-from-memory", {
                 d.app.showsMemoryProfile = false
-                UserDefaults.standard.set(false, forKey: "fromMemoryExpanded")
                 var t = TaskItem(title: "Send Jordan Lee the SOC 2 bridge letter")
                 t.notes = "The Acme renewal is blocked until their security team has it."
                 t.estimateMinutes = 20
                 let added = d.store.addTask(t)
                 d.app.reveal(task: added.id, in: d.store)
             }),
-            ("55b-task-from-memory-open", { UserDefaults.standard.set(true, forKey: "fromMemoryExpanded") }),
             ("55c-task-from-memory-bottom", { scrollDetail(in: d.mainWindow) }),
         ]
     }
@@ -541,6 +539,90 @@ enum DebugSnapshot {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
                     guard let dictation = TaskDictation.current, dictation.place == .menuBar else { return note("66f: no menu bar dictation") }
                     dictation.debugSchedule(Array(fresh(tasks).suffix(1)))
+                }
+            }),
+        ]
+    }
+
+    /// Memory → tasks, without Gemini: a task's Brief (related memories, the people and projects it names with
+    /// their open promises, and a canned "Brief me" answer with citations), a memory whose promises offer "Add
+    /// as task" (one already added), and the result of "Turn into tasks" on another memory (canned tasks).
+    static func taskMemorySteps(_ d: AppDelegate) -> [(String, () -> Void)] {
+        let center = MemoryCenter.shared
+        let library = center.library
+        func item(_ prefix: String) -> MemoryItem? { library.items.first { $0.title.hasPrefix(prefix) } }
+        func seedIfNeeded() {
+            if center.brain.entity(named: "Seed round", kind: .topic) == nil { center.brain.debugSeed(now: Date()) }
+        }
+        func hidePanels() { for panel in NSApp.windows where panel is FloatingPanel && panel.isVisible { (panel as? FloatingPanel)?.hide() } }
+        return [
+            ("70-task-brief", {
+                NSApp.appearance = nil
+                NSApp.windows.first { $0.title == "Docket Settings" }?.close()
+                NSApp.windows.first { $0.title == galleryTitle }?.close()
+                hidePanels()
+                d.app.showsMemoryProfile = false
+                MemoryView.debugOnboarding = false
+                seedIfNeeded()
+                var t = TaskItem(title: "Confirm the seed target with Priya Shah")
+                t.notes = "Harbor Capital wants the SAFE terms settled before the board meeting."
+                t.dueDate = day(2)
+                t.estimateMinutes = 30
+                t.priority = .high
+                let added = d.store.addTask(t)
+                let question = TaskBriefs.question(for: added)
+                let sources = ["Seed round: investor feedback", "Q3 board deck", "Market sizing"].compactMap(item)
+                let json: [String: Any] = [
+                    "answer": "Harbor Capital is leaning to a $2M SAFE [1], but the Q3 board deck still says $1.5M [2], so settle "
+                        + "the number before the board sees it. Priya Shah owes you a draft term sheet [1]; their pushback was CAC "
+                        + "payback and a market slide that felt too broad, and the bottom-up sizing answers the market point [3].",
+                    "answerable": true,
+                    "citations": [["source": 1], ["source": 2], ["source": 3]],
+                    "followUps": [],
+                ]
+                if let data = try? JSONSerialization.data(withJSONObject: json),
+                   let answer = try? MemoryAsk.parse(data, question: question, sources: sources) {
+                    TaskBriefs.shared.debugSet(answer, for: added.id)
+                } else {
+                    note("70: the canned brief didn't parse")
+                }
+                d.app.selection = .calendar
+                d.app.calendarMode = .agenda
+                d.app.reveal(task: added.id, in: d.store)
+            }),
+            ("70b-task-brief-bottom", { scrollDetail(in: d.mainWindow) }),
+            ("71-memory-add-as-task", {
+                seedIfNeeded()
+                d.app.selectedTaskID = nil
+                guard let seed = item("Seed round: investor feedback") else { return note("71: no seed item") }
+                // A promise of the user's own next to Priya's, and Priya's already made into a task.
+                if !seed.moments.contains(where: { $0.kind == .promise && $0.direction == .mine }) {
+                    library.update(seed.id) { i in
+                        i.moments.append(Moment(kind: .promise, text: "Send Harbor Capital a clearer CAC payback slide.",
+                                                due: day(5), direction: .mine))
+                    }
+                }
+                if let current = library.item(seed.id), let theirs = current.moments.first(where: { $0.direction == .theirs }) {
+                    MemoryTasks.add(theirs, in: current, store: d.store)
+                }
+                d.app.memoryAsk.clear()
+                d.app.memoryScope = .all
+                d.app.memoryMode = .library
+                d.app.selectedEntityID = nil
+                d.app.selection = .memory
+                d.app.selectedMemoryID = seed.id
+            }),
+            ("72-turn-into-tasks", {
+                seedIfNeeded()
+                guard let acme = item("Acme renewal") else { return note("72: no Acme item") }
+                d.app.selectedMemoryID = acme.id
+                let tasks = [
+                    DebriefTask(title: "Send Jordan Lee the SOC 2 bridge letter", dueDate: day(4), estimateMinutes: 30, priority: 3),
+                    DebriefTask(title: "Ask the auditor for the SOC 2 Type II report", dueDate: day(6), estimateMinutes: 15),
+                    DebriefTask(title: "Check Acme has signed the renewal", dueDate: day(20), waitingOn: "Jordan Lee"),
+                ]
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    NotificationCenter.default.post(name: MemoryItemDetail.debugTurnIntoTasks, object: acme.id, userInfo: ["tasks": tasks])
                 }
             }),
         ]

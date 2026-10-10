@@ -382,6 +382,7 @@ final class DocketFakeAI: MemoryAI, @unchecked Sendable {
     private var _generate = 0, _embed = 0
     private var _parts: [MemoryInlinePart] = []
     private var _prompt = ""
+    private var _system = ""
 
     init(answer: String = #"{"title":"T","summary":"S","keyTakeaways":[],"people":[],"projects":[],"topics":[],"tags":[],"moments":[],"extractedText":""}"#,
          error: MemoryAIError? = nil) {
@@ -393,12 +394,14 @@ final class DocketFakeAI: MemoryAI, @unchecked Sendable {
     var embedCount: Int { lock.lock(); defer { lock.unlock() }; return _embed }
     var lastParts: [MemoryInlinePart] { lock.lock(); defer { lock.unlock() }; return _parts }
     var lastPrompt: String { lock.lock(); defer { lock.unlock() }; return _prompt }
+    var lastSystem: String { lock.lock(); defer { lock.unlock() }; return _system }
 
     func generateJSON(system: String, prompt: String, schema: MemoryJSON, parts: [MemoryInlinePart]) async throws -> Data {
         lock.withLock {
             _generate += 1
             _parts = parts
             _prompt = prompt
+            _system = system
         }
         if let error { throw error }
         return Data(answer.utf8)

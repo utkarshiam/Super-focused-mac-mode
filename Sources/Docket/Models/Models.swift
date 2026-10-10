@@ -125,13 +125,17 @@ struct TaskItem: Codable, Identifiable, Hashable {
     var postponeCount = 0
     /// Where it came from (a Slack message, an email, AI). Links back to the original.
     var source: TaskSource?
+    /// The memory it was made from ("Add as task" on a promise, "Turn into tasks"), shown as "From memory: …".
+    var memoryID: UUID?
+    /// The promise in that memory it was made from, so the promise isn't offered as a task twice.
+    var momentID: UUID?
 
     init(title: String) { self.title = title }
 
     enum CodingKeys: String, CodingKey {
         case id, title, notes, listID, tags, priority, estimateMinutes, trackedSeconds, dueDate, dueHasTime
         case scheduledDate, reminders, recurrence, subtasks, completedAt, createdAt, updatedAt, linkedNoteID, noteLine, rank
-        case waitingOn, postponeCount, source
+        case waitingOn, postponeCount, source, memoryID, momentID
     }
 
     init(from decoder: Decoder) throws {
@@ -159,6 +163,8 @@ struct TaskItem: Codable, Identifiable, Hashable {
         waitingOn = c.value(.waitingOn, default: nil)
         postponeCount = c.value(.postponeCount, default: 0)
         source = c.value(.source, default: nil)
+        memoryID = c.value(.memoryID, default: nil)
+        momentID = c.value(.momentID, default: nil)
     }
 
     var isCompleted: Bool { completedAt != nil }

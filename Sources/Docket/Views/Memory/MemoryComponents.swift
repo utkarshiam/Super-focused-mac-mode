@@ -3,7 +3,7 @@ import MemoryKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-// Pieces the Memory screens share, and the "From memory" strip that tasks and threads show.
+// Pieces the Memory screens share, and the "From memory" strip message threads show (tasks have their Brief).
 
 // MARK: - Pictures
 
@@ -296,11 +296,11 @@ enum MemoryDrop {
 
 // MARK: - From memory (tasks and threads)
 
-/// A few memories related to what's open (a task, a message thread): one quiet line, collapsed until
-/// clicked, hidden when nothing is related. A click on one opens it in Memory.
+/// A few memories related to an open message thread: one quiet line, collapsed until clicked, hidden when
+/// nothing is related. A click on one opens it in Memory. (A task's is `TaskBriefSection`.)
 struct FromMemoryStrip: View {
     @EnvironmentObject var app: AppState
-    /// What to find related memories for (a task's title and notes, a thread's text).
+    /// What to find related memories for (a thread's text).
     let text: String
     /// Memories of the thing itself (its own sourceRefs), left out.
     var excluding: [String] = []
@@ -406,7 +406,9 @@ struct FromMemoryStrip: View {
         guard !Task.isCancelled else { return }
         let center = MemoryCenter.shared
         let skip = Set(excluding.compactMap { center.library.item(sourceRef: $0)?.id })
-        let found = await center.library.related(to: text, ai: center.processor.ai, excluding: skip, limit: 3)
+        // Tasks remembered by earlier versions aren't memories: never shown here.
+        let found = await center.library.related(to: text, ai: center.processor.ai, excluding: skip, limit: 4)
+            .filter { !TaskContext.isTaskItem($0.item) }.prefix(3).map { $0 }
         guard !Task.isCancelled else { return }
         withAnimation(Motion.base) { hits = found }
     }

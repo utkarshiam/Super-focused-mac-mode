@@ -56,7 +56,7 @@ extension MemoryBrain {
             var aliases: [String] = []
         }
         let topicSeeds: [TopicSeed] = [
-            TopicSeed(name: "Seed round", area: "Fundraising", items: ["Seed round: investor", "Market sizing", "Send Q3 board deck"],
+            TopicSeed(name: "Seed round", area: "Fundraising", items: ["Seed round: investor", "Market sizing", "Q3 board deck"],
                       detail: "The $2M SAFE: investor feedback, market sizing and the board deck.", created: 9, aliases: ["Seed raise"]),
             TopicSeed(name: "Renewals", area: "Customers", items: ["Acme renewal"],
                       detail: "Acme's $48k renewal and the SOC 2 questionnaire blocking it.", created: 9),
@@ -112,7 +112,7 @@ extension MemoryBrain {
         replaceState(s)
 
         // 4. Living pages (citations point at real items).
-        let seed = item("Seed round: investor"), market = item("Market sizing"), deck = item("Send Q3 board deck")
+        let seed = item("Seed round: investor"), market = item("Market sizing"), deck = item("Q3 board deck")
         let acme = item("Acme renewal"), oneOnOne = item("1:1 with Maya"), whiteboard = item("Whiteboard: onboarding")
         let digestIdea = item("Idea: a weekly digest"), pricingPage = item("What makes a pricing page convert")
         let annual = item("Pricing: annual discount"), incident = item("Billing API incident"), pipeline = item("Designing an event pipeline")

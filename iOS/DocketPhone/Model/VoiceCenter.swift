@@ -232,8 +232,11 @@ final class VoiceCenter: ObservableObject {
         let url = audioURL(id)
         let audio = await Task.detached(priority: .userInitiated) { try? Data(contentsOf: url) }.value
         do {
+            // What the Mac's memory knows about what was heard (names, dates, who to chase), when anything was.
+            let heard = job.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
             let debriefer = VoiceDebriefer(ai: ai, profile: snapshot?.profile ?? MemoryProfile(), lenses: snapshot?.lenses ?? [],
-                                           listNames: snapshot?.listNames ?? [], knownPeople: snapshot?.knownPeople ?? [])
+                                           listNames: snapshot?.listNames ?? [], knownPeople: snapshot?.knownPeople ?? [],
+                                           memoryContext: heard.isEmpty ? nil : model.taskContextBlock(for: heard))
             let debrief = try await debriefer.debrief(audio: audio.map { MemoryInlinePart(mimeType: "audio/aac", data: $0) },
                                                       liveTranscript: job.transcript, recordedAt: job.recordedAt, madeBy: "iPhone")
             update(id) {

@@ -195,15 +195,19 @@ public struct VoiceDebriefer: Sendable {
     /// People already in memory, so names are spelled the way the user has them.
     public var knownPeople: [String]
     public var timeZone: TimeZone
+    /// `TaskContext.promptBlock()` for what was said (when there's a transcript to build it from): names, dates
+    /// and notes memory can fill in. Nil leaves the prompt as it was.
+    public var memoryContext: String?
 
     public init(ai: MemoryAI, profile: MemoryProfile = MemoryProfile(), lenses: [Lens] = [], listNames: [String] = [],
-                knownPeople: [String] = [], timeZone: TimeZone = .current) {
+                knownPeople: [String] = [], timeZone: TimeZone = .current, memoryContext: String? = nil) {
         self.ai = ai
         self.profile = profile
         self.lenses = lenses
         self.listNames = listNames
         self.knownPeople = knownPeople
         self.timeZone = timeZone
+        self.memoryContext = memoryContext
     }
 
     /// `audio` is the recording (nil when only text is available); `liveTranscript` is what on-device speech
@@ -213,7 +217,7 @@ public struct VoiceDebriefer: Sendable {
         let hint = liveTranscript?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard audio != nil || !hint.isEmpty else { throw MemoryAIError.badResponse("There's nothing in this recording.") }
         let data = try await ai.generateJSON(
-            system: Self.system(lenses: lenses, profile: profile, timeZone: timeZone),
+            system: TaskContext.adding(memoryContext, to: Self.system(lenses: lenses, profile: profile, timeZone: timeZone)),
             prompt: Self.prompt(recordedAt: recordedAt, timeZone: timeZone, hasAudio: audio != nil, liveTranscript: hint,
                                 listNames: listNames, knownPeople: knownPeople),
             schema: Self.schema, parts: audio.map { [$0] } ?? [])

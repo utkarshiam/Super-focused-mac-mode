@@ -121,9 +121,10 @@ enum HotKeyPreset: String, CaseIterable, Identifiable {
 // MARK: - Memory
 
 extension Prefs.Key {
-    /// "Remember my work automatically" in Settings → Memory: the switch over the three below.
+    /// "Remember my work automatically" in Settings → Memory: the switch over the two below.
     static let memoryAutoCapture = "memoryAutoCapture"
     static let memoryCaptureNotes = "memoryCaptureNotes"
+    /// The old "Completed tasks" switch. Tasks no longer go into memory; the key is left alone and never read.
     static let memoryCaptureTasks = "memoryCaptureTasks"
     static let memoryCaptureMessages = "memoryCaptureMessages"
     /// "Sync with iPhone" (off until turned on) and the shared folder's path ("" = the iCloud Drive default).
@@ -131,8 +132,10 @@ extension Prefs.Key {
     static let phoneFolder = "memoryPhoneFolder"
     /// When the phone folder was last read or written (seconds since 1970).
     static let phoneLastSync = "memoryPhoneLastSync"
-    /// Set once the existing notes and recently finished tasks were added to memory (first launch with Memory).
+    /// Set once the existing notes were added to memory (first launch with Memory).
     static let memoryBackfilled = "memoryBackfilled"
+    /// Set once the tasks earlier versions remembered (`task:` items) were taken out of memory.
+    static let memoryTasksForgotten = "memoryTasksForgotten"
     /// Quick capture's last mode (Task, Note or Memory).
     static let captureMode = "quickCaptureMode"
 }
@@ -142,7 +145,6 @@ extension Prefs {
 
     /// What Docket remembers by itself. Each is on unless the user turned it (or the master switch) off.
     static var memoryCapturesNotes: Bool { on(Key.memoryAutoCapture) && on(Key.memoryCaptureNotes) }
-    static var memoryCapturesTasks: Bool { on(Key.memoryAutoCapture) && on(Key.memoryCaptureTasks) }
     static var memoryCapturesMessages: Bool { on(Key.memoryAutoCapture) && on(Key.memoryCaptureMessages) }
     static var phoneSync: Bool { UserDefaults.standard.bool(forKey: Key.phoneSync) }
 }

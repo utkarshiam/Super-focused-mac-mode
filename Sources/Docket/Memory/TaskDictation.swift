@@ -71,6 +71,9 @@ final class TaskDictation: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var result: Result?
+    /// Set while the tasks come from a memory ("Turn into tasks") rather than from what was said: they link
+    /// back to it.
+    @Published private(set) var memoryItemID: UUID?
     /// Recent input levels, 0…1, oldest first (the small meter by the field).
     @Published private(set) var levels: [Float] = Array(repeating: 0, count: TaskDictation.levelCount)
 
@@ -127,6 +130,7 @@ final class TaskDictation: ObservableObject {
         typedBefore = field.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
         words = ""
         result = nil
+        memoryItemID = nil
         phase = .starting
         // Screenshots: listening without the microphone (`debugHear` brings the words).
         if DebugSnapshot.isActive {
@@ -256,7 +260,8 @@ final class TaskDictation: ObservableObject {
         }
         phase = .working
         let parser = SpokenTaskParser(ai: ai, listNames: store.lists.map(\.name),
-                                      knownPeople: intake.library.people().prefix(60).map(\.name))
+                                      knownPeople: intake.library.people().prefix(60).map(\.name),
+                                      memoryContext: intake.memoryContext(spoken))
         let at = now()
         // Holds on to the model until it's done, so tasks asked for are added even if the field went away.
         work = Task {
@@ -277,6 +282,45 @@ final class TaskDictation: ObservableObject {
         }
     }
 
+    // MARK: From a memory
+
+    /// "Turn into tasks" on a memory: Gemini reads it (with what memory knows around it) for the user's own
+    /// promises and next steps and what to chase, and the tasks are added at once, linked back to the memory,
+    /// with the same result card (one ⌘Z, or Undo all). Needs a key.
+    func turnIntoTasks(_ item: MemoryItem) {
+        guard !isBusy else { return }
+        guard let ai = intake.ai(), let store = intake.store else {
+            phase = .failed(DictationText.memoryNeedsKey, privacy: nil)
+            return
+        }
+        field = nil
+        context = AddContext()
+        result = nil
+        memoryItemID = item.id
+        phase = .working
+        let about = [item.displayTitle, item.summary, String(item.fullText.prefix(1_500))].filter { !$0.isEmpty }.joined(separator: "\n")
+        let parser = SpokenTaskParser(ai: ai, listNames: store.lists.map(\.name),
+                                      knownPeople: intake.library.people().prefix(60).map(\.name),
+                                      memoryContext: intake.memoryContext(about))
+        let at = now()
+        work = Task {
+            do {
+                let tasks = try await parser.tasks(in: item, now: at)
+                guard !Task.isCancelled, phase == .working else { return }
+                guard !tasks.isEmpty else {
+                    phase = .failed(DictationText.memoryNoTask, privacy: nil)
+                    return
+                }
+                add(tasks, at: at)
+            } catch {
+                guard !Task.isCancelled, phase == .working else { return }
+                let e = error as? MemoryAIError ?? .network(error.localizedDescription)
+                phase = .failed(DictationText.memoryFailed(e), privacy: nil)
+            }
+            work = nil
+        }
+    }
+
     /// Returns once Gemini has answered (tests).
     func waitUntilScheduled() async {
         await work?.value
@@ -291,9 +335,22 @@ final class TaskDictation: ObservableObject {
             seen.insert(t.id).inserted && store.task(t.id) == nil && !intake.ledger.isDeleted(t.id)
                 && !t.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
-        let tasks = fresh.map { Self.task(from: $0, context: context, store: store, now: date) }
+        let memory = memoryItemID
+        let source = memory.flatMap(intake.library.item)
+        var taken = Set(store.tasks.compactMap(\.momentID))
+        let tasks = fresh.map { t in
+            var task = Self.task(from: t, context: context, store: store, now: date)
+            task.memoryID = memory
+            // A task that is one of the memory's promises takes it over (it isn't offered as a task again).
+            if let source, let promise = MemoryTasks.promise(matching: task.title, in: source, taken: taken) {
+                task.momentID = promise.id
+                taken.insert(promise.id)
+            }
+            return task
+        }
+        let undo = memory != nil ? "Add Tasks from Memory" : tasks.count == 1 ? "Add Dictated Task" : "Add Dictated Tasks"
         withAnimation(Motion.gentle) {
-            _ = store.addTasks(tasks, undo: tasks.count == 1 ? "Add Dictated Task" : "Add Dictated Tasks")
+            _ = store.addTasks(tasks, undo: undo)
         }
         let ids = tasks.map(\.id)
         intake.ledger.noteAdded(ids, at: date)
@@ -368,6 +425,15 @@ final class TaskDictation: ObservableObject {
         phase = .working
         add(tasks, at: now())
     }
+
+    /// "Turn into tasks" on a memory, with tasks made here instead of by Gemini.
+    func debugTurnIntoTasks(_ item: MemoryItem, tasks: [DebriefTask]) {
+        field = nil
+        context = AddContext()
+        memoryItemID = item.id
+        phase = .working
+        add(tasks, at: now())
+    }
 }
 
 // MARK: - Words
@@ -379,6 +445,12 @@ enum DictationText {
     static let noKeyHint = "Add a Gemini key in Settings → AI and Docket schedules what you say. For now Return adds it as typed."
     static let listening = "↩ done · esc cancel · stops when you pause"
     static let sayHint = "Say it: “Call Rohan Friday at 3 for half an hour, remind me 15 minutes before”"
+    static let memoryNoTask = "Gemini didn't find anything to do in this memory."
+    static let memoryNeedsKey = "Add a Gemini key in Settings → AI and Docket finds the tasks in a memory."
+
+    static func memoryFailed(_ error: MemoryAIError) -> String {
+        "Gemini couldn't read the tasks in it (\(error.errorDescription ?? "unknown error")). Try again in a moment."
+    }
 
     static func failed(_ error: MemoryAIError) -> String {
         "Gemini couldn't schedule it (\(error.errorDescription ?? "unknown error")). Your words are in the field: press Return to add them as typed."

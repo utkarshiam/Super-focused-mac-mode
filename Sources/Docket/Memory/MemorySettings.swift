@@ -12,7 +12,6 @@ struct MemorySettingsPage: View {
     @ObservedObject private var brain = MemoryCenter.shared.brain
     @AppStorage(Prefs.Key.memoryAutoCapture) private var autoCapture = true
     @AppStorage(Prefs.Key.memoryCaptureNotes) private var captureNotes = true
-    @AppStorage(Prefs.Key.memoryCaptureTasks) private var captureTasks = true
     @AppStorage(Prefs.Key.memoryCaptureMessages) private var captureMessages = true
     @State private var importLine: String?
     @State private var storage: Int64?
@@ -47,7 +46,6 @@ struct MemorySettingsPage: View {
                 ToggleRow(title: "Remember my work automatically", subtitle: "Without you saving anything", isOn: $autoCapture)
                 Group {
                     ToggleRow(title: "Notes", subtitle: "Once you stop editing", isOn: $captureNotes)
-                    ToggleRow(title: "Completed tasks", isOn: $captureTasks)
                     ToggleRow(title: "Message threads", subtitle: "Summaries, replies you send, and messages you make into tasks or notes",
                               isOn: $captureMessages, divider: false)
                 }

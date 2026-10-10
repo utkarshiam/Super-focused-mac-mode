@@ -472,6 +472,14 @@ final class AppModel: ObservableObject {
     // MARK: AI
 
     /// Gemini with the user's key, or nil without one (search still works, Ask explains).
+    /// What the Mac's memory (this snapshot) knows that helps with some spoken words (`TaskContext`): names,
+    /// dates, notes and who to chase, for Gemini to fill in. Nil without a snapshot or when it knows nothing.
+    func taskContextBlock(for text: String) -> String? {
+        guard let snapshot, let search else { return nil }
+        let block = TaskContext.build(text: text, search: search, snapshot: snapshot).promptBlock()
+        return block.isEmpty ? nil : block
+    }
+
     func makeAI() -> MemoryAI? {
         if isDemo { return DemoAI() }
         guard let apiKey else { return nil }

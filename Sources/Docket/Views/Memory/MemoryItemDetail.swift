@@ -20,6 +20,8 @@ struct MemoryItemDetail: View {
     @State private var note = ""
     @State private var noteSave: Task<Void, Never>?
     @StateObject private var quickLook = QuickLookController()
+    /// "Turn into tasks": Gemini reads the memory and the tasks are added with the dictation result card.
+    @StateObject private var tasksFromMemory = TaskDictation()
     @FocusState private var titleFocused: Bool
 
     var body: some View {
@@ -67,6 +69,7 @@ struct MemoryItemDetail: View {
                 voiceTasks(item)
                 pictures(item)
                 moments(item)
+                turnIntoTasks(item)
                 topics(item)
                 names(item)
                 source(item)
@@ -189,6 +192,36 @@ struct MemoryItemDetail: View {
         }
     }
 
+    /// "Turn into tasks" (with a key), and what it added, in the dictation result card.
+    @ViewBuilder
+    private func turnIntoTasks(_ item: MemoryItem) -> some View {
+        let mine = tasksFromMemory.memoryItemID == itemID && tasksFromMemory.phase != .idle
+        VStack(alignment: .leading, spacing: Space.sm) {
+            if !mine {
+                HStack(spacing: Space.sm) {
+                    Button { tasksFromMemory.turnIntoTasks(item) } label: { Label("Turn into tasks", systemImage: "checklist") }
+                        .buttonStyle(SecondaryPill(height: 30))
+                        .disabled(!center.hasAI || tasksFromMemory.isBusy)
+                        .help(center.hasAI ? "Add the tasks in this memory: your promises, next steps and what to chase"
+                                           : "Needs a Gemini key in Settings → AI")
+                    if !center.hasAI {
+                        Text("Needs a Gemini key").textStyle(.caption).foregroundStyle(Color.ink3)
+                    }
+                }
+            }
+            if mine { DictationStatus(dictation: tasksFromMemory, stacked: true) }
+        }
+        .onAppear { tasksFromMemory.isShown = true }
+        .onDisappear { tasksFromMemory.isShown = false }
+        // Screenshots: "Turn into tasks" with tasks made there instead of by Gemini.
+        .onReceive(NotificationCenter.default.publisher(for: Self.debugTurnIntoTasks)) { note in
+            guard DebugSnapshot.isActive, note.object as? UUID == itemID, let tasks = note.userInfo?["tasks"] as? [DebriefTask] else { return }
+            tasksFromMemory.debugTurnIntoTasks(item, tasks: tasks)
+        }
+    }
+
+    static let debugTurnIntoTasks = Notification.Name("DocketDebugTurnIntoTasks")
+
     private func momentRow(_ m: Moment, kind: MomentKind) -> some View {
         HStack(alignment: .top, spacing: Space.md) {
             if kind == .promise {
@@ -213,6 +246,10 @@ struct MemoryItemDetail: View {
                     Text(line)
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(isLate(m) ? Color.dangerText : Color.ink2)
+                }
+                if kind == .promise, let item = library.item(itemID) {
+                    PromiseTaskButton(moment: m, item: item)
+                        .padding(.top, 4)
                 }
             }
             Spacer(minLength: 0)

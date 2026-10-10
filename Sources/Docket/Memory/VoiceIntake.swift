@@ -140,6 +140,9 @@ final class VoiceIntake {
     let ledger: VoiceLedger
     /// The AI to debrief with (nil without a key).
     var ai: () -> MemoryAI?
+    /// What memory knows that helps with what was said (`MemoryCenter.taskContextBlock`), for debriefs and
+    /// dictated tasks; nil when it knows nothing (or in tests, unless they set it).
+    var memoryContext: (String) -> String? = { _ in nil }
     /// Called after a phone voice note was applied (the app notifies).
     var onApplied: ((VoiceOutcome) -> Void)?
     /// Called when a debrief finished in the background and its envelope can be ingested now.
@@ -323,7 +326,7 @@ final class VoiceIntake {
                             notice: VoiceText.noKeyNotice)
         }
         guard running[env.id] == nil else { return false }
-        let debriefer = makeDebriefer(ai)
+        let debriefer = makeDebriefer(ai, transcript: env.transcript)
         let audio = Self.audioPart(attachmentURL)
         let transcript = env.transcript
         let recordedAt = env.createdAt
@@ -373,7 +376,7 @@ final class VoiceIntake {
         var notice: String? = VoiceText.noKeyNotice
         if let ai = ai() {
             do {
-                debrief = try await makeDebriefer(ai).debrief(audio: Self.audioPart(file), liveTranscript: liveTranscript,
+                debrief = try await makeDebriefer(ai, transcript: liveTranscript).debrief(audio: Self.audioPart(file), liveTranscript: liveTranscript,
                                                              recordedAt: recordedAt, madeBy: "Mac")
                 processed = true
                 notice = nil
@@ -386,9 +389,12 @@ final class VoiceIntake {
                          processed: processed, notice: notice)
     }
 
-    private func makeDebriefer(_ ai: MemoryAI) -> VoiceDebriefer {
-        VoiceDebriefer(ai: ai, profile: library.profile, lenses: library.lenses,
-                       listNames: store?.lists.map(\.name) ?? [], knownPeople: library.people().prefix(60).map(\.name))
+    /// The debriefer, with memory's context for what was heard (when anything was).
+    func makeDebriefer(_ ai: MemoryAI, transcript: String?) -> VoiceDebriefer {
+        let heard = transcript?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return VoiceDebriefer(ai: ai, profile: library.profile, lenses: library.lenses,
+                              listNames: store?.lists.map(\.name) ?? [], knownPeople: library.people().prefix(60).map(\.name),
+                              memoryContext: heard.isEmpty ? nil : memoryContext(heard))
     }
 
     /// The recording as a part Gemini can hear (nil when missing or too big to send).

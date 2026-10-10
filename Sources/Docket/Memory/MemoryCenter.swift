@@ -48,6 +48,7 @@ final class MemoryCenter: ObservableObject {
         brain = MemoryBrain(library: library)
         voice = VoiceIntake(library: library, store: nil)
         voice.ai = { [weak self] in self?.processor.ai }
+        voice.memoryContext = { [weak self] in self?.taskContextBlock(for: $0) }
     }
 
     /// True when a Gemini key is set, so items get summarised and Ask works.
@@ -74,6 +75,11 @@ final class MemoryCenter: ObservableObject {
         let integrations = integrations ?? .shared
         // Screenshot mode stays as seeded: nothing is captured or synced behind its back.
         if !DebugSnapshot.isActive {
+            // Once: tasks earlier versions remembered come out (memory is what you know, tasks what you do).
+            if !UserDefaults.standard.bool(forKey: Prefs.Key.memoryTasksForgotten) {
+                brain.forgetTaskMemories()
+                UserDefaults.standard.set(true, forKey: Prefs.Key.memoryTasksForgotten)
+            }
             let capture = MemoryAutoCapture(library: library, store: store)
             autoCapture = capture
             // The first time Memory runs, what's already in Docket goes in too, not only new work.
@@ -277,6 +283,36 @@ final class MemoryCenter: ObservableObject {
               let url = URL(string: text), let scheme = url.scheme?.lowercased(),
               scheme == "http" || scheme == "https", url.host != nil else { return nil }
         return url
+    }
+
+    // MARK: Memory for tasks
+
+    /// What memory knows that helps with a task's text (profile facts, related memories, the people,
+    /// organisations and projects it names and their open promises), by names and words: no AI call, so every
+    /// AI task feature can afford it. Tasks never feed it.
+    func taskContext(for text: String, people: [String] = []) -> TaskContext {
+        let brain = brain
+        return TaskContext.build(text: text, people: people, search: library.searchEngine(), profile: library.profile,
+                                 entities: brain.entities, itemIDs: { Array(brain.itemIDs(for: $0)) })
+    }
+
+    /// The same, with related memories ranked by meaning when there's a key (the task's Brief).
+    func taskContext(for text: String, people: [String] = [], ai: MemoryAI?) async -> TaskContext {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var vector: [Float]?
+        if let ai, !trimmed.isEmpty, library.vectors.isCompatible(model: ai.embeddingModel, dimensions: ai.embeddingDimensions) {
+            vector = try? await ai.embed([trimmed], task: .document).first
+        }
+        let brain = brain
+        return TaskContext.build(text: trimmed, people: people, search: library.searchEngine(), profile: library.profile,
+                                 entities: brain.entities, itemIDs: { Array(brain.itemIDs(for: $0)) },
+                                 vector: vector, model: ai?.embeddingModel)
+    }
+
+    /// The block AI task prompts carry (`TaskContext.promptBlock`), nil when memory has nothing on it.
+    func taskContextBlock(for text: String, people: [String] = []) -> String? {
+        let block = taskContext(for: text, people: people).promptBlock()
+        return block.isEmpty ? nil : block
     }
 
     // MARK: Messages

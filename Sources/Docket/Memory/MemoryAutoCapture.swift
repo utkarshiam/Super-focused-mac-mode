@@ -2,20 +2,20 @@ import Combine
 import Foundation
 import MemoryKit
 
-/// Remembers the user's work without being asked, each kind behind a switch in Settings → Memory:
-/// - **Notes**: once editing pauses (5 s), a note that says something goes into memory, and again whenever its
-///   words change. Empty, very short and untouched template notes stay out. Deleting the note forgets it.
-/// - **Completed tasks**: ticking a task off adds a light memory (indexed, no AI extraction) dated when it was
-///   done. Reopening the task forgets it.
-/// It watches the Store and never changes it. What existed before launch counts as already seen: only edits
-/// made while Docket runs are remembered, apart from the one-time `backfill` when Memory first starts.
+/// Remembers the user's notes without being asked (behind its switch in Settings → Memory): once editing
+/// pauses (5 s), a note that says something goes into memory, and again whenever its words change. Empty, very
+/// short and untouched template notes stay out. Deleting the note forgets it.
+///
+/// Tasks never go in: memory is what the user knows, tasks are what they do (memory feeds tasks through
+/// `TaskContext`, not the other way round). It watches the Store and never changes it. What existed before
+/// launch counts as already seen: only edits made while Docket runs are remembered, apart from the one-time
+/// `backfill` when Memory first starts.
 @MainActor
 final class MemoryAutoCapture {
     struct Switches: Equatable {
         var notes = true
-        var tasks = true
 
-        static var current: Switches { Switches(notes: Prefs.memoryCapturesNotes, tasks: Prefs.memoryCapturesTasks) }
+        static var current: Switches { Switches(notes: Prefs.memoryCapturesNotes) }
     }
 
     enum NoteAction: Equatable { case remember, forget, none }
@@ -23,8 +23,6 @@ final class MemoryAutoCapture {
     nonisolated static let noteDelay: TimeInterval = 5
     /// Notes with fewer letters and digits than this aren't worth remembering.
     static let minimumNoteCharacters = 30
-    /// A task that shows up done longer ago than this (an import, an undo) isn't work just finished.
-    static let recentCompletion: TimeInterval = 10 * 60
 
     let library: MemoryLibrary
     private weak var store: Store?
@@ -33,8 +31,6 @@ final class MemoryAutoCapture {
 
     /// Each note's body as last seen, to tell an edit from a note that's just there.
     private var noteBaseline: [UUID: String] = [:]
-    /// Whether each task was done, as last seen.
-    private var completed: [UUID: Bool] = [:]
     /// Notes remembered another way (a message saved as a note is remembered as the message).
     private var skippedNotes: Set<UUID> = []
     private var cancellables = Set<AnyCancellable>()
@@ -43,14 +39,9 @@ final class MemoryAutoCapture {
         self.library = library
         self.store = store
         noteBaseline = Dictionary(store.notes.map { ($0.id, $0.body) }, uniquingKeysWith: { a, _ in a })
-        completed = Dictionary(store.tasks.map { ($0.id, $0.isCompleted) }, uniquingKeysWith: { a, _ in a })
         store.$notes.dropFirst()
             .debounce(for: .seconds(noteDelay), scheduler: DispatchQueue.main)
             .sink { [weak self] notes in self?.notesSettled(notes) }
-            .store(in: &cancellables)
-        // As the change happens (the publisher sends the new value), so a quick undo still finds the item.
-        store.$tasks.dropFirst()
-            .sink { [weak self] tasks in self?.tasksChanged(tasks) }
             .store(in: &cancellables)
     }
 
@@ -59,31 +50,17 @@ final class MemoryAutoCapture {
         skippedNotes.insert(id)
     }
 
-    /// How far back the first backfill reaches for finished tasks.
-    static let backfillDays = 90
-
-    /// Once, when Memory first starts: remembers the notes already written and the tasks finished in the last
-    /// 90 days, following the same rules (and switches) as new work. Returns how many it added.
+    /// Once, when Memory first starts: remembers the notes already written, following the same rules (and
+    /// switch) as new ones. Returns how many it added.
     @discardableResult
     func backfill() -> Int {
-        guard let store else { return 0 }
-        let switches = switches()
-        let since = now().addingTimeInterval(-Double(Self.backfillDays) * 86_400)
+        guard let store, switches().notes else { return 0 }
         var added = 0
         library.batch {
-            if switches.notes {
-                for note in store.notes where !skippedNotes.contains(note.id) && library.item(sourceRef: SourceRef.note(note.id)) == nil {
-                    guard Self.noteAction(note, previous: nil, remembered: false) == .remember else { continue }
-                    library.add(Self.item(for: note))
-                    added += 1
-                }
-            }
-            if switches.tasks {
-                for t in store.tasks where t.isCompleted && library.item(sourceRef: SourceRef.task(t.id)) == nil {
-                    guard let done = t.completedAt, done >= since else { continue }
-                    library.add(Self.item(for: t, listName: store.list(t.listID)?.name))
-                    added += 1
-                }
+            for note in store.notes where !skippedNotes.contains(note.id) && library.item(sourceRef: SourceRef.note(note.id)) == nil {
+                guard Self.noteAction(note, previous: nil, remembered: false) == .remember else { continue }
+                library.add(Self.item(for: note))
+                added += 1
             }
         }
         return added
@@ -136,40 +113,6 @@ final class MemoryAutoCapture {
     static func item(for note: Note) -> MemoryItem {
         MemoryItem(kind: .note, origin: .auto, sourceRef: SourceRef.note(note.id), title: note.title, body: note.body,
                    capturedFrom: "Notes", createdAt: note.createdAt)
-    }
-
-    // MARK: Tasks
-
-    /// Remembers tasks just ticked off; forgets ones reopened.
-    func tasksChanged(_ tasks: [TaskItem]) {
-        let on = switches().tasks
-        let stamp = now()
-        library.batch {
-            for t in tasks {
-                let was = completed[t.id]
-                if t.isCompleted, was != true {
-                    guard on, let done = t.completedAt, stamp.timeIntervalSince(done) < Self.recentCompletion else { continue }
-                    library.add(Self.item(for: t, listName: store?.list(t.listID)?.name))
-                } else if !t.isCompleted, was == true {
-                    forget(SourceRef.task(t.id))
-                }
-            }
-        }
-        completed = Dictionary(tasks.map { ($0.id, $0.isCompleted) }, uniquingKeysWith: { a, _ in a })
-    }
-
-    /// A finished task as a light memory: its title, notes and steps; its list as the project; who it waited on.
-    static func item(for t: TaskItem, listName: String?) -> MemoryItem {
-        var parts: [String] = []
-        let notes = t.notes.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !notes.isEmpty { parts.append(notes) }
-        if !t.subtasks.isEmpty { parts.append(t.subtasks.map { "- [\($0.done ? "x" : " ")] \($0.title)" }.joined(separator: "\n")) }
-        let who = t.waitingOn?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return MemoryItem(kind: .task, origin: .auto, sourceRef: SourceRef.task(t.id), title: t.title,
-                          body: parts.joined(separator: "\n\n"), url: t.source?.url?.absoluteString,
-                          capturedFrom: listName.map { "Tasks · \($0)" } ?? "Tasks",
-                          people: who.isEmpty ? [] : [who], projects: listName.map { [$0] } ?? [], tags: t.tags,
-                          createdAt: t.completedAt ?? Date(), lightweight: true)
     }
 
     private func forget(_ ref: String) {

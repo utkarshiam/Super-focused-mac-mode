@@ -10,13 +10,13 @@ import MemoryKit
 /// The library's filter: one of the kinds along the top, or something picked from Browse (a person,
 /// a project, a kind of moment).
 enum MemoryScope: Hashable {
-    case all, notes, links, media, files, messages, tasks
+    case all, notes, links, media, files, messages
     case person(String)
     case project(String)
     case moments(MomentKind)
 
-    /// The row of filters along the top, in order.
-    static let kinds: [MemoryScope] = [.all, .notes, .links, .media, .files, .messages, .tasks]
+    /// The row of filters along the top, in order. No Tasks: tasks aren't memories.
+    static let kinds: [MemoryScope] = [.all, .notes, .links, .media, .files, .messages]
     /// The kinds of moment Browse offers.
     static let momentKinds: [MomentKind] = [.decision, .promise, .idea, .insight]
 
@@ -37,7 +37,6 @@ enum MemoryScope: Hashable {
         case .media: MemoryFilter(kinds: [.image, .video, .audio])
         case .files: MemoryFilter(kinds: [.pdf, .file])
         case .messages: MemoryFilter(kinds: [.message])
-        case .tasks: MemoryFilter(kinds: [.task])
         case .person(let name): MemoryFilter(person: name)
         case .project(let name): MemoryFilter(project: name)
         case .moments(let kind): MemoryFilter(momentKind: kind)
@@ -53,7 +52,6 @@ enum MemoryScope: Hashable {
         case .media: "Media"
         case .files: "Files"
         case .messages: "Messages"
-        case .tasks: "Tasks"
         case .person(let name), .project(let name): name
         case .moments(let kind): vocabulary.label(for: kind)
         }

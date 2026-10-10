@@ -31,10 +31,10 @@ final class MemoryViewsTests: XCTestCase {
         XCTAssertEqual(MemoryScope.media.filter.kinds, [.image, .video, .audio])
         XCTAssertEqual(MemoryScope.files.filter.kinds, [.pdf, .file])
         XCTAssertEqual(MemoryScope.messages.filter.kinds, [.message])
-        XCTAssertEqual(MemoryScope.tasks.filter.kinds, [.task])
-        // Every kind is reachable from one of the chips.
+        // Every kind is reachable from one of the chips, except tasks: they aren't memories.
         let covered = MemoryScope.kinds.reduce(into: Set<MemoryKind>()) { $0.formUnion($1.filter.kinds) }
-        XCTAssertEqual(covered, Set(MemoryKind.allCases))
+        XCTAssertEqual(covered, Set(MemoryKind.allCases).subtracting([.task]))
+        XCTAssertFalse(MemoryScope.kinds.map { $0.label(.neutral) }.contains("Tasks"))
     }
 
     func testBrowseFiltersMapToPeopleProjectsAndMoments() {

@@ -772,6 +772,56 @@ final class AIServiceTests: XCTestCase {
         }
     }
 
+    // MARK: Memory for tasks
+
+    func testTaskFeaturesCarryMemoryApartFromTheRulesAndUnchangedWithout() async throws {
+        let store = makeStore()
+        var asked: [String] = []
+        let block = "People, organisations and projects in it:\n- Priya Shah (person): Investor at Harbor Capital."
+        let withMemory = AIService(transport: fake.transport, apiKey: { "k" }, model: { "m" }, enabled: { true },
+                                   memory: { asked.append($0); return $0.contains("Priya") ? block : nil })
+        let without = AIService(transport: fake.transport, apiKey: { "k" }, model: { "m" }, enabled: { true }, memory: { _ in nil })
+
+        // Planning: the brain dump is what memory is asked about.
+        fake.answer(#"{"tasks": []}"#)
+        fake.answer(#"{"tasks": []}"#)
+        _ = try await without.planTasks(from: "Call Priya about the term sheet", store: store, now: now)
+        _ = try await withMemory.planTasks(from: "Call Priya about the term sheet", store: store, now: now)
+        let plain = try systemText(of: fake.requests[0]), rich = try systemText(of: fake.requests[1])
+        XCTAssertEqual(asked, ["Call Priya about the term sheet"])
+        XCTAssertFalse(plain.contains("Context from the user's memory"), "no memory: the prompt is as it was")
+        XCTAssertTrue(rich.hasPrefix(plain), "the rules first, untouched")
+        XCTAssertTrue(rich.contains("Context from the user's memory (use only to fill names, lists, dates, notes and waiting-on; never create tasks from it)"))
+        XCTAssertTrue(rich.hasSuffix(block))
+        XCTAssertEqual(try userText(of: fake.requests[1]), "Call Priya about the term sheet", "what was written stays the input")
+
+        // Breaking down: the task's title, notes and who it waits on.
+        var task = TaskItem(title: "Prepare the term sheet review")
+        task.notes = "Numbers from Priya"
+        task.waitingOn = "Sam Lee"
+        fake.answer(#"{"subtasks": [], "estimateMinutes": null}"#)
+        _ = try await withMemory.breakDown(task, store: store, now: now)
+        XCTAssertEqual(asked.last, "Prepare the term sheet review\nNumbers from Priya\nWaiting on Sam Lee")
+        XCTAssertTrue(try systemText(of: XCTUnwrap(fake.requests.last)).hasSuffix(block))
+
+        // Triage: who wrote and what about.
+        let source = TaskSource(kind: .gmail, externalID: "gmail:t1", url: nil, label: "Priya Shah · Term sheet")
+        fake.answer(#"{"tasks": []}"#)
+        _ = try await withMemory.triage([IncomingMessage(source: source, from: "Priya Shah <priya@example.com>", subject: "Term sheet",
+                                                         text: "Draft attached, can you review by Friday?", date: now)], store: store, now: now)
+        XCTAssertTrue(asked.last?.contains("Priya Shah <priya@example.com> · Term sheet · Draft attached") == true)
+        XCTAssertTrue(try systemText(of: XCTUnwrap(fake.requests.last)).hasSuffix(block))
+    }
+
+    func testMemoryInPromptsIsCapped() {
+        let context = AIPrompts.Context(now: now, calendar: greg, workdayStart: 540, workdayEnd: 1080, lists: [], tags: [],
+                                        memory: String(repeating: "Acme renewal. ", count: 1_000))
+        let plain = AIPrompts.planSystem(AIPrompts.Context(now: now, calendar: greg, workdayStart: 540, workdayEnd: 1080, lists: [], tags: []))
+        let rich = AIPrompts.planSystem(context)
+        XCTAssertLessThanOrEqual(rich.count - plain.count, 2_800, "about 2,500 characters of memory at most")
+        XCTAssertTrue(rich.hasPrefix(plain))
+    }
+
     private func json(_ data: Data) throws -> [String: Any] {
         try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }

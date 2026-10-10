@@ -20,9 +20,9 @@ final class MemoryCaptureTests: XCTestCase {
         try? FileManager.default.removeItem(at: dir)
     }
 
-    private func makeCapture(notes: Bool = true, tasks: Bool = true) -> MemoryAutoCapture {
+    private func makeCapture(notes: Bool = true) -> MemoryAutoCapture {
         let capture = MemoryAutoCapture(library: library, store: store, noteDelay: 0.05)
-        capture.switches = { MemoryAutoCapture.Switches(notes: notes, tasks: tasks) }
+        capture.switches = { MemoryAutoCapture.Switches(notes: notes) }
         return capture
     }
 
@@ -114,69 +114,53 @@ final class MemoryCaptureTests: XCTestCase {
         XCTAssertNil(library.item(sourceRef: SourceRef.note(fromMessage.id)), "remembered as the message instead")
     }
 
-    // MARK: Tasks
+    // MARK: Tasks stay out
 
-    func testBackfillAddsExistingNotesAndRecentlyFinishedTasksOnce() {
+    func testBackfillAddsExistingNotesOnceAndNeverTasks() {
         let note = store.addNote(body: longNote)
         let short = store.addNote(body: "Call Sam")
         var recent = TaskItem(title: "Ship the pricing page")
         recent.completedAt = Date().addingTimeInterval(-3 * 86_400)
-        var old = TaskItem(title: "Renew the domain")
-        old.completedAt = Date().addingTimeInterval(-200 * 86_400)
-        let open = store.addTask(TaskItem(title: "Draft the board memo"))
-        let recentID = store.addTask(recent).id, oldID = store.addTask(old).id
+        let done = store.addTask(recent)
+        store.addTask(TaskItem(title: "Draft the board memo"))
 
         let capture = makeCapture()
-        XCTAssertEqual(capture.backfill(), 2)
+        XCTAssertEqual(capture.backfill(), 1)
         XCTAssertNotNil(library.item(sourceRef: SourceRef.note(note.id)))
         XCTAssertNil(library.item(sourceRef: SourceRef.note(short.id)), "too short, same rule as new notes")
-        XCTAssertNotNil(library.item(sourceRef: SourceRef.task(recentID)))
-        XCTAssertNil(library.item(sourceRef: SourceRef.task(oldID)), "finished more than 90 days ago")
-        XCTAssertNil(library.item(sourceRef: SourceRef.task(open.id)), "not finished")
+        XCTAssertNil(library.item(sourceRef: SourceRef.task(done.id)), "tasks are what you do, not what you know")
+        XCTAssertFalse(library.items.contains { $0.kind == .task })
         XCTAssertEqual(capture.backfill(), 0, "running again adds nothing twice")
-        XCTAssertEqual(makeCapture(notes: false, tasks: false).backfill(), 0)
+        XCTAssertEqual(makeCapture(notes: false).backfill(), 0)
     }
 
-    func testCompletedTaskIsRememberedAndForgottenWhenReopened() throws {
+    func testFinishingOrReopeningTasksNeverTouchesMemory() {
         let capture = makeCapture()
-        let list = store.addList(name: "Fundraising", color: ListColor.allCases[0])
         var t = TaskItem(title: "Send the deck to Harbor Capital")
         t.notes = "Use the September numbers"
-        t.listID = list.id
-        t.tags = ["investors"]
         t.waitingOn = "Priya"
         let task = store.addTask(t)
-        XCTAssertNil(library.item(sourceRef: SourceRef.task(task.id)))
-
         store.setCompleted(task.id, true)
-        let item = try XCTUnwrap(library.item(sourceRef: SourceRef.task(task.id)))
-        XCTAssertEqual(item.kind, .task)
-        XCTAssertEqual(item.origin, .auto)
-        XCTAssertTrue(item.lightweight, "embedded only, no extraction")
-        XCTAssertEqual(item.title, "Send the deck to Harbor Capital")
-        XCTAssertEqual(item.body, "Use the September numbers")
-        XCTAssertEqual(item.projects, ["Fundraising"])
-        XCTAssertEqual(item.tags, ["investors"])
-        XCTAssertEqual(item.people, ["Priya"])
-        XCTAssertEqual(item.capturedFrom, "Tasks · Fundraising")
-        XCTAssertEqual(item.createdAt, store.task(task.id)?.completedAt, "dated when it was done")
-
-        store.setCompleted(task.id, false)
+        XCTAssertEqual(library.count, 0)
         XCTAssertNil(library.item(sourceRef: SourceRef.task(task.id)))
+        store.setCompleted(task.id, false)
+        XCTAssertEqual(library.count, 0)
         _ = capture
     }
 
-    func testOldCompletionsAndSwitchedOffTasksAreNotRemembered() {
-        let capture = makeCapture()
-        var imported = TaskItem(title: "Done long ago")
-        imported.completedAt = Date().addingTimeInterval(-2 * 86_400)
-        store.addTask(imported)
-        XCTAssertEqual(library.count, 0, "an import or undo isn't work just finished")
+    func testOneTimeCleanUpForgetsTaskMemoriesAndWhatOnlyTheyKept() throws {
+        let note = library.add(MemoryItem(kind: .note, title: "Board prep", body: longNote, people: ["Priya Shah"], processing: .processed))
+        let old = library.add(MemoryItem(kind: .task, origin: .auto, sourceRef: SourceRef.task(UUID()), title: "Renew the domain",
+                                         people: ["Sam Lee"], processing: .processed, lightweight: true))
+        let brain = MemoryBrain(library: library, saveDelay: 60, autoUpdate: false)
+        XCTAssertNotNil(brain.entity(named: "Sam Lee", kind: .person))
 
-        capture.switches = { MemoryAutoCapture.Switches(notes: true, tasks: false) }
-        let task = store.addTask(TaskItem(title: "Quiet one"))
-        store.setCompleted(task.id, true)
-        XCTAssertEqual(library.count, 0)
+        XCTAssertEqual(brain.forgetTaskMemories(), 1)
+        XCTAssertNil(library.item(old.id))
+        XCTAssertNotNil(library.item(note.id))
+        XCTAssertNil(brain.entity(named: "Sam Lee", kind: .person), "only the task mentioned Sam Lee")
+        XCTAssertNotNil(brain.entity(named: "Priya Shah", kind: .person))
+        XCTAssertEqual(brain.forgetTaskMemories(), 0, "nothing left to forget")
     }
 
     // MARK: Phone tasks

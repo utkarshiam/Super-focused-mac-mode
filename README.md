@@ -140,19 +140,26 @@ Connect Slack and Gmail in **Settings → Connections** and the messages that ne
   Files, Record Voice Note); switch Quick Capture to **Memory**; click **Remember** on a message; or
   capture from the iPhone.
 - **Remember automatically** (Settings → Memory, each behind its own switch): notes once you stop
-  editing, completed tasks, and message threads (summaries, replies you send, messages you turn into tasks
-  or notes). The first time, it also takes in your existing notes and the tasks finished in the last 90 days.
+  editing, and message threads (summaries, replies you send, messages you turn into tasks or notes). The
+  first time, it also takes in your existing notes. Tasks never go into memory: memory is what you know,
+  tasks are what you do.
 - **Every memory is read for you** *(AI)*: a title, a 1–2 sentence summary, key takeaways, people,
   projects, topics, and *moments*: decisions, promises (who owes what, by when), ideas and insights. Links
   are fetched and read; images, PDFs and recordings are described or transcribed.
-- **Library** with filters (All, Notes, Links, Media, Files, Messages, Tasks) and **Browse** by people,
+- **Library** with filters (All, Notes, Links, Media, Files, Messages) and **Browse** by people,
   projects, decisions, promises, ideas and insights, all in your lens's words. **Worth revisiting** and
   **On this day** bring back older memories.
 - **Ask with sources.** Type a question in the one field at the top (or press ⌘K and pick
   "Ask memory: …"). *(AI)* Gemini answers only from your memories, with **[n]** citation chips that open
   the source, a Sources list with real dates, and follow-up questions. If your memory doesn't contain the
   answer, it says so. Without a key, the field searches by text.
-- **From memory:** a task or message thread shows the few memories related to it.
+- **Memory works for your tasks.** A task's **Brief** shows related memories, the people, organisations
+  and projects it names (each opens its page) with their open promises, and **Brief me** *(AI)*: a short
+  answer from your memory with citations. Planning, Break down, Find tasks in a note, message triage, voice
+  notes and dictation *(AI)* all get what memory knows (names, dates, who you're waiting on) to fill in the
+  tasks they write. In Memory, a promise has **Add as task** (yours: due on its date; someone else's: a
+  follow-up waiting on them), and any memory has **Turn into tasks** *(AI)*; such tasks link back with
+  "From memory: …". A message thread shows the few memories related to it.
 - **Profile: "What Docket knows about me."** Facts Docket worked out from your memory *(AI)*, plus your own.
   Edit, pin (pinned facts stay exactly as written) or forget any of them; **Refresh from my memory**. Docket
   reads them before it summarises or answers.

@@ -2,7 +2,8 @@ import Foundation
 
 // MARK: - Kind
 
-/// What a memory is. Unknown raw values (from a newer app) decode as `.note`.
+/// What a memory is. Unknown raw values (from a newer app) decode as `.note`. `.task` is only read back from
+/// libraries of earlier versions: tasks aren't captured as memories any more.
 public enum MemoryKind: String, Codable, CaseIterable, Identifiable, Sendable {
     case note, text, link, image, video, audio, pdf, file, task, message, engram
 
@@ -68,7 +69,7 @@ public enum MemoryKind: String, Codable, CaseIterable, Identifiable, Sendable {
 public enum MemoryOrigin: String, Codable, CaseIterable, Sendable {
     /// The user saved it (capture panel, drag and drop, "Remember").
     case manual
-    /// Docket captured it on its own (a note, a completed task, a thread summary, a sent reply).
+    /// Docket captured it on its own (a note, a thread summary, a sent reply).
     case auto
     /// Came in through the phone bridge's Inbox folder.
     case phone
@@ -354,7 +355,7 @@ public struct MemoryItem: Identifiable, Hashable, Codable, Sendable {
     public var processedAt: Date?
     /// Failed AI attempts so far (reset on success).
     public var attempts: Int
-    /// Embed only, no extraction call: auto-captured tasks and ENGRAM imports (which already have a summary).
+    /// Embed only, no extraction call: ENGRAM imports (which already have a summary).
     public var lightweight: Bool
 
     public init(id: UUID = UUID(), kind: MemoryKind = .note, origin: MemoryOrigin = .manual, sourceRef: String? = nil,

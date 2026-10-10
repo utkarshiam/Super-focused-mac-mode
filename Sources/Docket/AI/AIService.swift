@@ -205,16 +205,22 @@ final class AIService: ObservableObject {
     private let apiKey: () -> String?
     private let model: () -> String
     private let enabled: @MainActor () -> Bool
+    /// What memory knows that helps with some text (`MemoryCenter.taskContextBlock`): names, dates, notes and
+    /// who it waits on for the tasks written from it. Nil when memory has nothing on it.
+    private let memory: @MainActor (String) -> String?
 
-    /// Tests pass a fake transport and their own key, so nothing touches the network or the secrets file.
+    /// Tests pass a fake transport and their own key, so nothing touches the network or the secrets file (and
+    /// memory stays out unless they bring their own).
     init(transport: @escaping GeminiClient.Transport = GeminiClient.defaultTransport,
          apiKey: @escaping () -> String? = { Secrets.geminiAPIKey },
          model: @escaping () -> String = { Secrets.geminiModel },
-         enabled: @escaping @MainActor () -> Bool = { Prefs.aiEnabled && !DebugSnapshot.isActive }) {
+         enabled: @escaping @MainActor () -> Bool = { Prefs.aiEnabled && !DebugSnapshot.isActive },
+         memory: @escaping @MainActor (String) -> String? = { GeminiClient.isUnitTesting ? nil : MemoryCenter.shared.taskContextBlock(for: $0) }) {
         self.transport = transport
         self.apiKey = apiKey
         self.model = model
         self.enabled = enabled
+        self.memory = memory
     }
 
     /// AI is switched on and there's a key to use (screenshot mode never calls out).
@@ -240,7 +246,8 @@ final class AIService: ObservableObject {
         let client = try client()
         let input = AIPrompts.planInput(text)
         guard !input.isEmpty else { return [] }
-        let context = AIPrompts.Context(store: store, now: now)
+        var context = AIPrompts.Context(store: store, now: now)
+        context.memory = memory(input)
         let answer = try await client.generate(system: AIPrompts.planSystem(context), prompt: input, schema: AIPrompts.tasksSchema)
         return try AIAnswers.drafts(answer, calendar: context.calendar)
     }
@@ -248,7 +255,9 @@ final class AIService: ObservableObject {
     /// Steps for a task (none when it's already one step), and a total estimate when the model can tell.
     func breakDown(_ task: TaskItem, store: Store, now: Date = Date()) async throws -> (subtasks: [String], estimateMinutes: Int?) {
         let client = try client()
-        let context = AIPrompts.Context(store: store, now: now)
+        var context = AIPrompts.Context(store: store, now: now)
+        let people = task.waitingOn.map { [$0] } ?? []
+        context.memory = memory(task.title + "\n" + task.notes + (people.isEmpty ? "" : "\nWaiting on " + people[0]))
         let input = AIPrompts.breakDownInput(task, listName: store.list(task.listID)?.name, calendar: context.calendar)
         let answer = try await client.generate(system: AIPrompts.breakDownSystem(context), prompt: input, schema: AIPrompts.breakDownSchema)
         return try AIAnswers.breakDown(answer, existing: task.subtasks.map(\.title))
@@ -259,7 +268,8 @@ final class AIService: ObservableObject {
         let client = try client()
         let input = AIPrompts.noteInput(note)
         guard !input.isEmpty else { return [] }
-        let context = AIPrompts.Context(store: store, now: now)
+        var context = AIPrompts.Context(store: store, now: now)
+        context.memory = memory(input)
         let answer = try await client.generate(system: AIPrompts.noteSystem(context, note: note), prompt: input, schema: AIPrompts.tasksSchema)
         return try AIAnswers.drafts(answer, calendar: context.calendar)
     }
@@ -289,11 +299,13 @@ final class AIService: ObservableObject {
         var seen = Set<String>()
         let unique = messages.filter { seen.insert($0.source.externalID).inserted }
         guard !unique.isEmpty else { return [:] }
-        let context = AIPrompts.Context(store: store, now: now)
-        let system = AIPrompts.triageSystem(context)
+        var context = AIPrompts.Context(store: store, now: now)
         var result: [String: TaskDraft] = [:]
         for start in stride(from: 0, to: unique.count, by: Self.triageBatchSize) {
             let batch = Array(unique[start..<min(start + Self.triageBatchSize, unique.count)])
+            // Who wrote and what about: the senders and subjects say the most for the fewest words.
+            context.memory = memory(AIPrompts.triageMemoryText(batch))
+            let system = AIPrompts.triageSystem(context)
             let answer = try await client.generate(system: system, prompt: AIPrompts.triageInput(batch, calendar: context.calendar),
                                                    schema: AIPrompts.triageSchema)
             for pick in try AIAnswers.triage(answer, count: batch.count, calendar: context.calendar) {

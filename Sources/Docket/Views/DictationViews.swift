@@ -142,7 +142,8 @@ struct DictationStatus: View {
         case .working:
             line {
                 ThinkingDots(size: 5)
-                Text("Scheduling it…").textStyle(.subheadStrong).foregroundStyle(Color.ink2)
+                Text(dictation.memoryItemID == nil ? "Scheduling it…" : "Finding the tasks in it…")
+                    .textStyle(.subheadStrong).foregroundStyle(Color.ink2)
             }
         case .result:
             if let result = dictation.result {

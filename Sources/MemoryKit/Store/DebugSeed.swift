@@ -61,9 +61,12 @@ extension MemoryLibrary {
                                   Moment(kind: .promise, text: "Write the double-charge postmortem.", due: dayFromNow(2), direction: .mine)],
                         createdAt: daysAgo(3, hour: 14)).withRef(SourceRef.slack(channel: "C0BILLING", ts: "1700000000.000100")), [.billing])
 
-        seed(MemoryItem(kind: .task, origin: .auto, title: "Send Q3 board deck to Alex Kim",
-                        summary: "", body: "Completed task · Board\nDeck v3: seed target $1.5M, 18 months of runway.", people: ["Alex Kim"], projects: ["Board"],
-                        createdAt: daysAgo(4, hour: 17), lightweight: true), [.fundraising, .team])
+        seed(MemoryItem(kind: .note, title: "Q3 board deck sent to Alex Kim",
+                        summary: "Deck v3 went to Alex Kim for the board: it still shows a $1.5M seed target and 18 months of runway.",
+                        body: "Sent deck v3 to Alex Kim ahead of the board meeting.\nSeed target $1.5M, 18 months of runway.",
+                        keyTakeaways: ["Seed target in the deck: $1.5M", "18 months of runway"],
+                        people: ["Alex Kim"], projects: ["Board"], topics: ["fundraising"],
+                        createdAt: daysAgo(4, hour: 17)), [.fundraising, .team])
 
         seed(MemoryItem(kind: .message, title: "Acme renewal: security questionnaire",
                         summary: "Jordan Lee at Acme needs a SOC 2 report before signing the renewal; procurement deadline is end of month.",
