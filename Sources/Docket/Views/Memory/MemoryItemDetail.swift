@@ -3,14 +3,15 @@ import MemoryKit
 import SwiftUI
 
 /// The open memory, on the right of Memory: its title (editable), what AI made of it (summary, takeaways,
-/// moments in the lens's words), who and what it's about, where it came from, its files, the user's own
-/// note, and related memories. A voice note also gets a player, the tasks it made and its transcript.
+/// moments in the lens's words), its topics (with "Move to topic…"), who and what it's about (each opens its
+/// page), where it came from, its files, the user's own note, and related memories. A voice note also gets a player, the tasks it made and its transcript.
 struct MemoryItemDetail: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var app: AppState
     @ObservedObject private var center = MemoryCenter.shared
     @ObservedObject private var library = MemoryCenter.shared.library
     @ObservedObject private var processor = MemoryCenter.shared.processor
+    @ObservedObject private var brain = MemoryCenter.shared.brain
     @ObservedObject private var integrations = Integrations.shared
     @ObservedObject private var ledger = MemoryCenter.shared.voice.ledger
     let itemID: UUID
@@ -66,6 +67,7 @@ struct MemoryItemDetail: View {
                 voiceTasks(item)
                 pictures(item)
                 moments(item)
+                topics(item)
                 names(item)
                 source(item)
                 transcript(item)
@@ -82,10 +84,25 @@ struct MemoryItemDetail: View {
 
     private func topBar(_ item: MemoryItem) -> some View {
         HStack(spacing: Space.sm) {
-            Label(MemoryText.origin(item), systemImage: item.kind.symbolName)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(Color.ink2)
-                .lineLimit(1)
+            if let back = app.memoryBackEntityID.flatMap(brain.entity) {
+                Button { app.selectedEntityID = back.id } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.left").font(.system(size: 10, weight: .bold))
+                        Text(back.name).lineLimit(1)
+                    }
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.ink2)
+                    .padding(.horizontal, 10)
+                    .frame(height: 26)
+                }
+                .buttonStyle(MenuChromeStyle(shape: Capsule(), fill: .fill, hoverFill: .fillStrong))
+                .help("Back to \(back.name)")
+            } else {
+                Label(MemoryText.origin(item), systemImage: item.kind.symbolName)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.ink2)
+                    .lineLimit(1)
+            }
             Spacer(minLength: Space.sm)
             Button { withAnimation(Motion.snappy) { library.setPinned(itemID, !item.pinned) } } label: {
                 Image(systemName: item.pinned ? "pin.fill" : "pin")
@@ -212,26 +229,99 @@ struct MemoryItemDetail: View {
         return Calendar.current.startOfDay(for: due) < Calendar.current.startOfDay(for: app.clock)
     }
 
-    /// People and projects; a click shows everything about them.
+    /// People, organisations and projects; a click opens their page (or, before the brain knows them, shows
+    /// every memory that mentions them).
     @ViewBuilder
     private func names(_ item: MemoryItem) -> some View {
-        if !item.people.isEmpty || !item.projects.isEmpty {
+        let names: [(String, EntityKind)] = item.people.map { ($0, .person) } + item.organisations.map { ($0, .organisation) }
+            + item.projects.map { ($0, .project) }
+        if !names.isEmpty {
             FlowLayout(spacing: Space.sm, lineSpacing: Space.sm) {
-                ForEach(item.people, id: \.self) { name in
-                    SuggestionChip(title: name, icon: "person") { show(.person(name)) }
-                        .help("Everything about \(name)")
-                }
-                ForEach(item.projects, id: \.self) { name in
-                    SuggestionChip(title: name, icon: "folder") { show(.project(name)) }
-                        .help("Everything about \(name)")
+                ForEach(names, id: \.0) { name, kind in
+                    let entity = brain.entity(named: name, kind: kind)
+                    SuggestionChip(title: entity?.name ?? name, icon: kind.symbolName) { open(name, kind: kind) }
+                        .help("Everything about \(entity?.name ?? name)")
                 }
             }
         }
     }
 
-    private func show(_ scope: MemoryScope) {
+    private func open(_ name: String, kind: EntityKind) {
+        if let e = brain.entity(named: name, kind: kind) {
+            app.selectedEntityID = e.id
+            return
+        }
         app.memoryAsk.clear()
-        withAnimation(Motion.snappy) { app.memoryScope = scope }
+        app.memoryMode = .library
+        withAnimation(Motion.snappy) { app.memoryScope = kind == .person ? .person(name) : .project(name) }
+    }
+
+    /// The topics it's filed under (the main one first; each opens), and "Move to topic…".
+    @ViewBuilder
+    private func topics(_ item: MemoryItem) -> some View {
+        let topics = brain.entities(for: itemID).filter { $0.kind == .topic }
+        if !topics.isEmpty || brain.organizedAt != nil {
+            HStack(alignment: .firstTextBaseline, spacing: Space.sm) {
+                FlowLayout(spacing: Space.sm, lineSpacing: Space.sm) {
+                    if topics.isEmpty {
+                        Text("Not sorted yet")
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(Color.ink3)
+                            .frame(height: 28)
+                    }
+                    ForEach(Array(topics.enumerated()), id: \.element.id) { i, t in
+                        SuggestionChip(title: brain.path(to: t.id).dropFirst().map(\.name).joined(separator: " › "),
+                                       icon: i == 0 ? "number" : nil) { app.selectedEntityID = t.id }
+                            .help(i == 0 ? "Its main topic" : "Also in \(t.name)")
+                    }
+                }
+                moveMenu(current: topics)
+            }
+        }
+    }
+
+    private func moveMenu(current: [BrainEntity]) -> some View {
+        Menu {
+            ForEach(brain.areas()) { area in
+                let list = brain.topics(in: area.id)
+                if !list.isEmpty {
+                    Section(area.name) {
+                        ForEach(list) { t in
+                            topicButton(t, current: current)
+                            ForEach(brain.children(of: t.id)) { sub in topicButton(sub, current: current, indent: true) }
+                        }
+                    }
+                }
+            }
+            let loose = brain.topics(in: nil)
+            if !loose.isEmpty {
+                Section("Other topics") { ForEach(loose) { t in topicButton(t, current: current) } }
+            }
+            if let main = current.first {
+                Divider()
+                Button("Take Out of \(main.name)") { brain.removeItem(itemID, fromTopic: main.id) }
+            }
+        } label: {
+            Image(systemName: "arrow.right.circle")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Color.ink2)
+                .frame(width: 28, height: 28)
+        }
+        .menuChrome(Circle(), fill: .clear, hoverFill: .pressedTint)
+        .help("Move to topic…")
+    }
+
+    private func topicButton(_ t: BrainEntity, current: [BrainEntity], indent: Bool = false) -> some View {
+        Button {
+            brain.setPrimaryTopic(t.id, for: itemID)
+            app.showToast("Filed under \(t.name)")
+        } label: {
+            if current.first?.id == t.id {
+                Label((indent ? "   " : "") + t.name, systemImage: "checkmark")
+            } else {
+                Text((indent ? "   " : "") + t.name)
+            }
+        }
     }
 
     // MARK: Where it came from, files

@@ -17,6 +17,24 @@ enum PhoneFmt {
     /// "Mon 5 Oct", or "5 Oct 2025" in another year.
     static func day(_ date: Date, now: Date = Date()) -> String { MemoryDates.label(date, now: now) }
 
+    /// "5 Oct" (no weekday), or "5 Oct 2025" in another year: for tight spots like a slider's ends.
+    static func shortDay(_ date: Date, now: Date = Date()) -> String {
+        let sameYear = Calendar.current.component(.year, from: date) == Calendar.current.component(.year, from: now)
+        return (sameYear ? shortFormatter : shortYearFormatter).string(from: date)
+    }
+
+    private static let shortFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate("d MMM")
+        return f
+    }()
+
+    private static let shortYearFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate("d MMM yyyy")
+        return f
+    }()
+
     /// "Mon 5 Oct · 10:00".
     static func dayTime(_ date: Date, now: Date = Date()) -> String { "\(day(date, now: now)) · \(time(date))" }
 

@@ -8,7 +8,7 @@ import MemoryKit
 /// - **In**: every minute, when Docket comes to the front and when the folder's Inbox changes, captures the
 ///   phone dropped there become memories; a task envelope becomes a task, "done" / "undone" / "delete" ones
 ///   complete, reopen or delete it, and a voice note becomes its tasks and a memory (`VoiceIntake`).
-/// - **Out**: ten seconds after memory or the tasks change, the library is published for the phone
+/// - **Out**: ten seconds after memory, the brain or the tasks change, the library and brain are published for the phone
 ///   (`PhoneBridge.publish`) with the tasks it shows (open ones overdue, today and the next 7 days, recent ones
 ///   from voice notes, and today's finished ones) and the list names.
 /// Never runs in tests or screenshot mode (`isAllowed`), so iCloud Drive is never touched there.
@@ -21,6 +21,8 @@ final class PhoneSync: ObservableObject {
 
     let library: MemoryLibrary
     let voice: VoiceIntake
+    /// Published with the library (topics, pages and the map, capped).
+    let brain: MemoryBrain?
     private weak var store: Store?
     private var timer: Timer?
     private var publishWork: DispatchWorkItem?
@@ -49,8 +51,9 @@ final class PhoneSync: ObservableObject {
         return path.isEmpty ? defaultRoot : URL(fileURLWithPath: path, isDirectory: true)
     }
 
-    init(library: MemoryLibrary, store: Store, voice: VoiceIntake) {
+    init(library: MemoryLibrary, store: Store, voice: VoiceIntake, brain: MemoryBrain? = nil) {
         self.library = library
+        self.brain = brain
         self.store = store
         self.voice = voice
         let stamp = UserDefaults.standard.double(forKey: Prefs.Key.phoneLastSync)
@@ -90,6 +93,9 @@ final class PhoneSync: ObservableObject {
         watch(PhoneBridge(root: root).inboxURL)
 
         library.changes
+            .sink { [weak self] in self?.schedulePublish() }
+            .store(in: &cancellables)
+        brain?.changes
             .sink { [weak self] in self?.schedulePublish() }
             .store(in: &cancellables)
         store?.$tasks.dropFirst()
@@ -213,10 +219,11 @@ final class PhoneSync: ObservableObject {
         let fromVoice = voice.ledger.taskIDs(since: now.addingTimeInterval(-Self.voiceTaskDays * 86_400))
         let tasks = Self.snapshotTasks(store, now: now, including: fromVoice)
         let lists = store.lists.map(\.name)
+        let brain = brain
         Task { @MainActor in
             defer { publishing = false }
             do {
-                try await PhoneBridge(root: Self.root).publish(library, tasks: tasks, listNames: lists, now: now)
+                try await PhoneBridge(root: Self.root).publish(library, tasks: tasks, listNames: lists, now: now, brain: brain)
                 problem = nil
                 noteSynced(now)
             } catch {

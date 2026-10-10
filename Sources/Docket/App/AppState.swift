@@ -136,8 +136,26 @@ final class AppState: ObservableObject {
 
     // MARK: Memory
 
-    /// The memory open on the right of the Memory view.
-    @Published var selectedMemoryID: UUID?
+    /// The memory open on the right of the Memory view. Opening one closes a brain page.
+    @Published var selectedMemoryID: UUID? {
+        didSet {
+            if selectedMemoryID != nil && selectedEntityID != nil { selectedEntityID = nil }
+            if memoryBackEntityID != nil { memoryBackEntityID = nil }
+        }
+    }
+    /// The brain page (a topic, area, person, organisation or project) open on the right. Opening one closes
+    /// the open memory.
+    @Published var selectedEntityID: UUID? {
+        didSet { if selectedEntityID != nil && selectedMemoryID != nil { selectedMemoryID = nil } }
+    }
+    /// The page a memory was opened from (a citation, the timeline), for the detail's way back.
+    @Published var memoryBackEntityID: UUID?
+    /// Library, Topics or Map (remembered).
+    @Published var memoryMode: MemoryMode = .saved {
+        didSet { if memoryMode != oldValue { MemoryMode.save(memoryMode) } }
+    }
+    /// The map's focus, date, kinds and viewport. Kept here so they're still there after a detour.
+    let brainMap = BrainMapModel()
     /// What the Memory library shows: a kind, or a person, project or kind of moment.
     @Published var memoryScope: MemoryScope = .all
     /// A question to ask once the Memory view is up (⌘K "Ask memory: …"). The view asks it and clears it.
@@ -152,6 +170,19 @@ final class AppState: ObservableObject {
         selection = .memory
         selectedMemoryID = id
         showMainWindow()
+    }
+
+    /// Opens Memory on a brain page (a topic, a person…), in whichever view Memory was showing.
+    func reveal(entity id: UUID) {
+        selection = .memory
+        selectedEntityID = id
+        showMainWindow()
+    }
+
+    /// Opens a memory from a brain page; its detail offers the way back to the page.
+    func openMemory(_ id: UUID, from entity: UUID?) {
+        selectedMemoryID = id
+        memoryBackEntityID = entity
     }
 
     /// Opens Memory and asks `question` there.

@@ -252,11 +252,12 @@ public struct PhoneBridge: Sendable {
     /// Builds the snapshot from the library and writes it with vectors and thumbnails (the file work
     /// runs off the main actor). `tasks` are the open tasks the phone should show (overdue, today,
     /// next 7 days, and recent ones from voice notes); `listNames` the user's task lists, so a debrief made
-    /// on the phone can file tasks. Debounce calls (e.g. on `library.changes`).
+    /// on the phone can file tasks; `brain` adds the organised brain (`BrainSnapshot`). Debounce calls (e.g. on
+    /// `library.changes` and `brain.changes`).
     @MainActor
     public func publish(_ library: MemoryLibrary, tasks: [TaskSnapshot], listNames: [String] = [], now: Date = Date(),
-                        itemLimit: Int? = nil) async throws {
-        let snapshot = Self.makeSnapshot(library, tasks: tasks, listNames: listNames, now: now, itemLimit: itemLimit)
+                        itemLimit: Int? = nil, brain: MemoryBrain? = nil) async throws {
+        let snapshot = Self.makeSnapshot(library, tasks: tasks, listNames: listNames, now: now, itemLimit: itemLimit, brain: brain)
         let vectors = library.vectors
         // Thumbnails for items whose first image attachment is on disk.
         var images: [(UUID, URL)] = []
@@ -270,10 +271,11 @@ public struct PhoneBridge: Sendable {
         }.value
     }
 
-    /// The snapshot for the phone: items newest first with text capped, profile, lenses, tasks, list names.
+    /// The snapshot for the phone: items newest first with text capped, profile, lenses, tasks, list names, and
+    /// the brain when given.
     @MainActor
     public static func makeSnapshot(_ library: MemoryLibrary, tasks: [TaskSnapshot], listNames: [String] = [], now: Date = Date(),
-                                    itemLimit: Int? = nil) -> LibrarySnapshot {
+                                    itemLimit: Int? = nil, brain: MemoryBrain? = nil) -> LibrarySnapshot {
         let source = itemLimit.map { Array(library.items.prefix($0)) } ?? library.items
         let items = source.map { item -> MemoryItem in
             var copy = item
@@ -283,7 +285,8 @@ public struct PhoneBridge: Sendable {
         }
         let vectors = library.vectors
         return LibrarySnapshot(generatedAt: now, items: items, profile: library.profile, lenses: library.lenses, tasks: tasks,
-                               embeddingModel: vectors.model, embeddingDimensions: vectors.dimensions, listNames: listNames)
+                               embeddingModel: vectors.model, embeddingDimensions: vectors.dimensions, listNames: listNames,
+                               brain: brain?.snapshot(itemIDs: Set(items.map(\.id))))
     }
 
     /// Writes snapshot.json, and vectors.bin when its content changed.

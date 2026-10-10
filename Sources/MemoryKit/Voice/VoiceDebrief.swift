@@ -91,10 +91,19 @@ public struct DebriefTask: Identifiable, Hashable, Codable, Sendable {
     /// One of the user's existing lists when it clearly fits, else nil (Inbox).
     public var listName: String?
     public var people: [String]
+    /// The day the user plans to work on it ("Do on"), separate from the deadline. Never changes `dueDate`.
+    public var scheduledDate: Date?
+    /// A reminder this many minutes before the due time (0 = at it); nil = the app's default reminder.
+    public var reminderMinutes: Int?
+    /// The reminder is a loud alarm ("wake me", "alarm").
+    public var isAlarm: Bool
+    public var repeatRule: TaskRepeat?
+    public var tags: [String]
 
     public init(id: UUID = UUID(), title: String, notes: String = "", dueDate: Date? = nil, dueHasTime: Bool = false,
                 estimateMinutes: Int? = nil, priority: Int = 0, waitingOn: String? = nil, listName: String? = nil,
-                people: [String] = []) {
+                people: [String] = [], scheduledDate: Date? = nil, reminderMinutes: Int? = nil, isAlarm: Bool = false,
+                repeatRule: TaskRepeat? = nil, tags: [String] = []) {
         self.id = id
         self.title = title
         self.notes = notes
@@ -105,10 +114,16 @@ public struct DebriefTask: Identifiable, Hashable, Codable, Sendable {
         self.waitingOn = waitingOn
         self.listName = listName
         self.people = people
+        self.scheduledDate = scheduledDate
+        self.reminderMinutes = reminderMinutes
+        self.isAlarm = isAlarm
+        self.repeatRule = repeatRule
+        self.tags = tags
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, title, notes, dueDate, dueHasTime, estimateMinutes, priority, waitingOn, listName, people
+        case scheduledDate, reminderMinutes, isAlarm, repeatRule, tags
     }
 
     public init(from decoder: Decoder) throws {
@@ -123,6 +138,47 @@ public struct DebriefTask: Identifiable, Hashable, Codable, Sendable {
         waitingOn = c.value(.waitingOn, default: nil)
         listName = c.value(.listName, default: nil)
         people = c.value(.people, default: [])
+        scheduledDate = c.value(.scheduledDate, default: nil)
+        reminderMinutes = c.value(.reminderMinutes, default: nil)
+        isAlarm = c.value(.isAlarm, default: false)
+        repeatRule = c.value(.repeatRule, default: nil)
+        tags = c.value(.tags, default: [])
+    }
+}
+
+/// How a task repeats, in the Mac's `Recurrence` terms: every `interval` days/weeks/months/years, weekly ones on
+/// `weekdays` (1 = Sunday … 7 = Saturday; empty = the due date's weekday).
+public struct TaskRepeat: Hashable, Codable, Sendable {
+    public enum Frequency: String, Codable, Sendable, CaseIterable { case daily, weekly, monthly, yearly }
+
+    public var frequency: Frequency
+    public var interval: Int
+    public var weekdays: [Int]
+
+    public init(frequency: Frequency, interval: Int = 1, weekdays: [Int] = []) {
+        self.frequency = frequency
+        self.interval = max(1, interval)
+        self.weekdays = Array(Set(weekdays.filter { (1...7).contains($0) })).sorted()
+    }
+
+    private enum CodingKeys: String, CodingKey { case frequency, interval, weekdays }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(frequency: c.value(.frequency, default: .weekly), interval: c.value(.interval, default: 1),
+                  weekdays: c.value(.weekdays, default: []))
+    }
+
+    /// "every week on Mon", "every 2 weeks", "every weekday", "every month".
+    public var label: String {
+        let unit = ["daily": "day", "weekly": "week", "monthly": "month", "yearly": "year"][frequency.rawValue]!
+        if frequency == .weekly, weekdays == [2, 3, 4, 5, 6], interval == 1 { return "every weekday" }
+        var text = interval == 1 ? "every \(unit)" : "every \(interval) \(unit)s"
+        if frequency == .weekly, !weekdays.isEmpty {
+            let names = Calendar(identifier: .gregorian).shortWeekdaySymbols
+            text += " on " + weekdays.map { names[$0 - 1] }.joined(separator: ", ")
+        }
+        return text
     }
 }
 

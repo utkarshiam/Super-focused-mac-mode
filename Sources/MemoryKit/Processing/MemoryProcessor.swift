@@ -29,6 +29,10 @@ public final class MemoryProcessor: ObservableObject {
     public var embedBatchSize = 50
     /// The clock (tests pin it).
     public var now: () -> Date = { Date() }
+    /// Names already in memory, added to every extraction prompt so new items reuse existing topics, tags and
+    /// spellings. Optional; set it to `{ [weak brain] in brain?.extractionVocabulary() }` (or call
+    /// `MemoryBrain.attach(to:)`). Read on the main actor once per item.
+    public var vocabulary: (@MainActor () -> ExtractionVocabulary?)?
 
     /// Items queued or being worked on. 0 when idle.
     @Published public private(set) var processingCount = 0
@@ -281,7 +285,8 @@ public final class MemoryProcessor: ObservableObject {
     private func process(_ id: UUID, ai: MemoryAI) async throws {
         guard let item = library.item(id) else { return }
         let gathered = try await gather(item)
-        let system = MemoryPrompts.extractionSystem(lenses: library.lenses, profile: library.profile, now: now())
+        let system = MemoryPrompts.extractionSystem(lenses: library.lenses, profile: library.profile, now: now(),
+                                                    vocabulary: vocabulary?())
         let prompt = MemoryPrompts.extractionPrompt(for: item, content: gathered.text, attachmentNote: gathered.note)
         let data = try await ai.generateJSON(system: system, prompt: prompt, schema: MemoryPrompts.extractionSchema, parts: gathered.parts)
         guard let extraction = try? MemoryCoding.decoder.decode(MemoryPrompts.Extraction.self, from: data) else {
@@ -365,6 +370,7 @@ public final class MemoryProcessor: ObservableObject {
         item.keyTakeaways = Array(clean(x.keyTakeaways).prefix(5))
         item.people = TextFold.uniqueNames(item.people + x.people)
         item.projects = TextFold.uniqueNames(item.projects + x.projects, limit: 10)
+        item.organisations = TextFold.uniqueNames(item.organisations + x.organisations, limit: 10)
         item.topics = TextFold.uniqueNames(x.topics, limit: 5)
         item.tags = TextFold.uniqueNames((item.tags + x.tags).map { $0.lowercased().replacingOccurrences(of: " ", with: "-") }, limit: 10)
         item.moments = x.moments(keeping: item.moments)

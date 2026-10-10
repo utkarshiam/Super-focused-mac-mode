@@ -34,10 +34,34 @@ Set these environment variables in the scheme (they're there, switched off) or w
 | Variable | Effect |
 | --- | --- |
 | `DOCKET_PHONE_DEMO=1` | Seeds a throwaway Docket folder in the temp directory with sample memories, tasks and recent captures. Your real folder, Keychain and the network are never touched. |
-| `DOCKET_PHONE_TAB=capture\|record\|debrief\|memory\|ask\|today\|settings` | The tab to start on (`settings` opens the Settings sheet). `record` shows a recording in progress with a live transcript; `debrief` shows a finished result card (Hindi/English, 3 tasks). |
+| `DOCKET_PHONE_TAB=capture\|record\|debrief\|memory\|topics\|map\|ask\|today\|settings` | The tab to start on (`settings` opens the Settings sheet). `record` shows a recording in progress with a live transcript; `debrief` shows a finished result card (Hindi/English, 3 tasks). |
 | `DOCKET_PHONE_ITEM=first\|<index>\|<words>` | Opens that memory (the first one, by index, or by words in its title). |
+| `DOCKET_PHONE_ENTITY=<name>` | Opens that topic's, person's or project's page ("Seed round", "Maya Chen"). |
+| `DOCKET_PHONE_SEARCH=<words>` | Starts Memory → Library with that search. |
+| `DOCKET_PHONE_MAP_FOCUS=<name>`, `…_MAP_SELECT=<name>`, `…_MAP_DAYS=<n>`, `…_MAP_ZOOM=<x>` | The map opens focused on a node, with a node's card open, with the time slider n days back, or zoomed in. |
+| `DOCKET_PHONE_MAP_NODES=<n>`, `DOCKET_PHONE_MAP_TIMING=1` | Stress test: pads the map with made-up nodes up to n; logs each map draw's time. |
 
 In demo mode the Ask tab starts with a ready-made answer, and further questions get canned replies.
+The demo library comes with an organised brain (`MemoryBrain.debugSeed`): areas, topics, pages, a
+disagreement, connections, this week's digest and the map.
+
+## Topics, pages and the map
+
+Memory has three views, picked at the top and remembered: **Library · Topics · Map**. All of it is
+read from what the Mac publishes (`snapshot.brain`); the phone never changes the brain. Renaming,
+merging and moving happen on the Mac, and the phone says so in one quiet line.
+
+- **Topics:** this week's digest ("What you learned 5–11 Oct") and up to three connections you
+  haven't made, then areas with their topics (count, last seen as a real date) and the unsorted
+  count. A switch shows people, organisations and projects instead (in the lens's words).
+- **Pages:** breadcrumb, kind, counts, first and last seen; What you know with tappable [n]
+  citations; key facts; notes that disagree (with their sources and dates); open questions;
+  sub-topics; related things; the timeline. Topic, people and project chips on a memory open them.
+- **Map:** the Mac's layout drawn in one Canvas, coloured by area with the Mac's palette. Pinch and
+  drag; labels appear as you zoom and never overlap; tap a node for Open page or Focus (Show all to
+  go back); chips hide kinds; the slider steps through the days things first appeared.
+- **Search** in Library also matches topic, people and project names ("Topics & people", above
+  the memories).
 
 ## Voice debriefs
 
@@ -132,8 +156,10 @@ DocketPhone/
   App/        also App Intents (Siri, Action Button, Shortcuts) and the docket:// URL
   Model/      AppModel (folder, snapshot, search, captures, tasks), capture queue,
               folder bookmark + iCloud file access, Ask session, voice recorder, live
-              transcript, dictation + read aloud, VoiceCenter (debrief, hold, retry), demo seed
-  Views/      Capture, recording screen + result card, task composer, Memory, item detail, Ask,
+              transcript, dictation + read aloud, VoiceCenter (debrief, hold, retry), demo seed,
+              BrainSupport (routes, reading the brain snapshot, area colours)
+  Views/      Capture, recording screen + result card, task composer, Memory (Library, Topics,
+              Map), entity pages, item detail, Ask,
               Today, Settings
 DocketPhone-Info.plist   background audio and the docket:// scheme (merged with generated keys)
   Support/    Theme (mirrors the Mac's ink-and-paper tokens), date formatting, Keychain

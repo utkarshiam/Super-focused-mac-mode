@@ -70,18 +70,44 @@ struct MemoryView: View {
 
     var body: some View {
         NavigationStack(path: $model.memoryPath) {
-            content
+            mode
                 .paperBackground()
                 .navigationTitle("Memory")
-                .toolbar { ToolbarItem(placement: .topBarTrailing) { SettingsButton() } }
-                .navigationDestination(for: UUID.self) { id in
-                    ItemDetailView(itemID: id)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .principal) { modePicker }
+                    ToolbarItem(placement: .topBarTrailing) { SettingsButton() }
                 }
+                .memoryDestinations()
         }
-        .onAppear { runSearch() }
+        .environment(\.memoryPush) { route in model.memoryPath.append(route) }
+        .onAppear {
+            if let q = model.demoSearch, browser.query.isEmpty { browser.query = q }
+            runSearch()
+        }
         .onChange(of: browser.query) { _, _ in runSearch() }
         .onChange(of: browser.chipID) { _, _ in runSearch() }
         .onChange(of: model.snapshot?.generatedAt) { _, _ in runSearch() }
+    }
+
+    private var modePicker: some View {
+        Picker("View", selection: Binding(get: { model.memoryMode }, set: { mode in
+            Haptics.select()
+            model.memoryMode = mode
+        })) {
+            ForEach(MemoryMode.allCases) { Text($0.title).tag($0) }
+        }
+        .pickerStyle(.segmented)
+        .frame(width: 236)
+    }
+
+    @ViewBuilder
+    private var mode: some View {
+        switch model.memoryMode {
+        case .library: content
+        case .topics: TopicsView()
+        case .map: BrainMapView()
+        }
     }
 
     private func runSearch() {
@@ -98,6 +124,7 @@ struct MemoryView: View {
             }
             .refreshable { await model.refresh(force: true) }
         } else {
+            let entities = model.entityMatches(browser.query)
             List {
                 Section {
                     chipRow
@@ -113,8 +140,22 @@ struct MemoryView: View {
                             .listRowSeparator(.hidden)
                     }
                 }
+                if !entities.isEmpty {
+                    Section {
+                        ForEach(entities) { entity in
+                            NavigationLink(value: MemoryRoute.entity(entity.id)) {
+                                EntityRowContent(entity: entity, showsKind: true, chevron: false)
+                            }
+                            .listRowBackground(Color.paper)
+                            .listRowSeparatorTint(Color.hair)
+                            .listRowInsets(EdgeInsets(top: 10, leading: Space.gutter, bottom: 10, trailing: Space.lg))
+                        }
+                    } header: {
+                        sectionHeader("Topics & people")
+                    }
+                }
                 Section {
-                    if browser.results.isEmpty && browser.hasSearched {
+                    if browser.results.isEmpty && browser.hasSearched && entities.isEmpty {
                         Text(browser.query.isEmpty ? "Nothing here yet." : "Nothing in your memory matches “\(browser.query)”.")
                             .font(.system(size: 15))
                             .foregroundStyle(Color.ink2)
@@ -122,7 +163,7 @@ struct MemoryView: View {
                             .listRowSeparator(.hidden)
                     }
                     ForEach(browser.results) { item in
-                        NavigationLink(value: item.id) {
+                        NavigationLink(value: MemoryRoute.item(item.id)) {
                             MemoryRow(item: item)
                         }
                         .listRowBackground(Color.paper)
@@ -130,6 +171,8 @@ struct MemoryView: View {
                         .listRowInsets(EdgeInsets(top: 12, leading: Space.gutter, bottom: 12, trailing: Space.lg))
                         .alignmentGuide(.listRowSeparatorLeading) { _ in 56 }
                     }
+                } header: {
+                    if !entities.isEmpty && !browser.results.isEmpty { sectionHeader("Memories") }
                 }
             }
             .listStyle(.plain)
@@ -137,6 +180,15 @@ struct MemoryView: View {
             .searchable(text: $browser.query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search your memory")
             .refreshable { await model.refresh(force: true) }
         }
+    }
+
+    private func sectionHeader(_ title: String) -> some View {
+        Eyebrow(title)
+            .padding(.horizontal, Space.gutter)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.paper)
+            .listRowInsets(EdgeInsets())
     }
 
     private var chipRow: some View {

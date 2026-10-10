@@ -131,30 +131,65 @@ struct ItemDetailView: View {
         }
     }
 
+    /// Topics, people, organisations and projects; each opens its page when the Mac's brain knows it.
     @ViewBuilder
     private func names(_ item: MemoryItem) -> some View {
         let vocabulary = model.vocabulary
-        if !item.people.isEmpty || !item.projects.isEmpty {
+        let topics = itemTopics(item)
+        let groups: [(String, [NameChip])] = [
+            ("Topics", topics.map { NameChip(name: $0.name, kind: .topic, entity: $0) }),
+            (vocabulary.people, chips(item.people, .person)),
+            ("Organisations", chips(item.organisations, .organisation)),
+            (vocabulary.projects, chips(item.projects, .project)),
+        ].filter { !$0.1.isEmpty }
+        if !groups.isEmpty {
             VStack(alignment: .leading, spacing: Space.lg) {
-                if !item.people.isEmpty { nameGroup(vocabulary.people, item.people, symbol: "person") }
-                if !item.projects.isEmpty { nameGroup(vocabulary.projects, item.projects, symbol: "folder") }
+                ForEach(groups, id: \.0) { group in
+                    VStack(alignment: .leading, spacing: Space.sm) {
+                        Eyebrow(group.0)
+                        FlowLayout(spacing: Space.sm) {
+                            ForEach(group.1) { chip in
+                                if let entity = chip.entity {
+                                    EntityChip(entity: entity)
+                                } else {
+                                    Label(chip.name, systemImage: chip.kind.symbolName)
+                                        .font(.system(size: 14, weight: .medium))
+                                        .foregroundStyle(Color.ink2)
+                                        .padding(.horizontal, 12)
+                                        .frame(height: 32)
+                                        .overlay(Capsule().strokeBorder(Color.hairStrong, lineWidth: 1))
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
-    private func nameGroup(_ title: String, _ names: [String], symbol: String) -> some View {
-        VStack(alignment: .leading, spacing: Space.sm) {
-            Eyebrow(title)
-            FlowLayout(spacing: Space.sm) {
-                ForEach(names, id: \.self) { name in
-                    Label(name, systemImage: symbol)
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(Color.ink)
-                        .padding(.horizontal, 12)
-                        .frame(height: 32)
-                        .background(Capsule().fill(Color.fill))
-                }
-            }
+    private struct NameChip: Identifiable {
+        var name: String
+        var kind: EntityKind
+        var entity: BrainEntity?
+        var id: String { (entity?.id.uuidString ?? "") + kind.rawValue + name }
+    }
+
+    /// The item's topics from the brain, its primary topic first.
+    private func itemTopics(_ item: MemoryItem) -> [BrainEntity] {
+        guard let brain = model.brain else { return [] }
+        let primary = brain.primaryTopic(of: item.id)
+        let others = brain.entities(forItem: item.id).filter { $0.kind == .topic && $0.id != primary?.id }
+        return (primary.map { [$0] } ?? []) + others
+    }
+
+    /// Names on the item, resolved to entities where the brain has them (one chip per entity).
+    private func chips(_ names: [String], _ kind: EntityKind) -> [NameChip] {
+        var seen: Set<String> = []
+        return names.compactMap { name in
+            let entity = model.brainEntity(named: name, kind: kind)
+            let key = entity?.id.uuidString ?? BrainText.fold(name)
+            guard seen.insert(key).inserted else { return nil }
+            return NameChip(name: entity?.name ?? name, kind: entity?.kind ?? kind, entity: entity)
         }
     }
 
@@ -209,7 +244,7 @@ struct ItemDetailView: View {
                 VStack(spacing: 0) {
                     ForEach(Array(hits.enumerated()), id: \.element.id) { index, hit in
                         if index > 0 { Hairline() }
-                        NavigationLink(value: hit.item.id) {
+                        NavigationLink(value: MemoryRoute.item(hit.item.id)) {
                             HStack(spacing: Space.md) {
                                 ItemThumb(item: hit.item, size: 32)
                                 VStack(alignment: .leading, spacing: 2) {

@@ -26,7 +26,11 @@ final class AppModel: ObservableObject {
 
     @Published var tab: Tab = .capture
     @Published var showSettings = false
-    @Published var memoryPath: [UUID] = []
+    @Published var memoryPath: [MemoryRoute] = []
+    /// Library, Topics or Map (remembered).
+    @Published var memoryMode: MemoryMode = .library {
+        didSet { if !isDemo { UserDefaults.standard.set(memoryMode.rawValue, forKey: "memory.mode") } }
+    }
     @Published var toast: String?
     /// A button on the toast ("Undo").
     @Published private(set) var toastAction: ToastAction?
@@ -85,6 +89,13 @@ final class AppModel: ObservableObject {
             deleted = local.loadDeleted()
         }
         voice = VoiceCenter(local: local, isDemo: isDemo)
+        if !isDemo, let saved = UserDefaults.standard.string(forKey: "memory.mode").flatMap(MemoryMode.init(rawValue:)) {
+            memoryMode = saved
+        }
+        if let mode = environment["DOCKET_PHONE_TAB"].flatMap({ MemoryMode(rawValue: $0.lowercased()) }), mode != .library {
+            tab = .memory
+            memoryMode = mode
+        }
         if let tab = environment["DOCKET_PHONE_TAB"].flatMap({ Tab(rawValue: $0.lowercased()) }) { self.tab = tab }
         if environment["DOCKET_PHONE_TAB"]?.lowercased() == "settings" { showSettings = true }
         if ["record", "debrief"].contains(environment["DOCKET_PHONE_TAB"]?.lowercased()) { tab = .capture }
@@ -421,6 +432,19 @@ final class AppModel: ObservableObject {
 
     // MARK: Demo
 
+    /// `DOCKET_PHONE_MAP_FOCUS=<name>`: the map opens focused on that entity (demo only).
+    var demoMapFocus: String? { isDemo ? environment["DOCKET_PHONE_MAP_FOCUS"] : nil }
+    /// `DOCKET_PHONE_MAP_DAYS=<n>`: the map's time slider starts n days back (demo only).
+    var demoMapDaysBack: Int? { isDemo ? environment["DOCKET_PHONE_MAP_DAYS"].flatMap(Int.init) : nil }
+    /// `DOCKET_PHONE_SEARCH=<words>`: Memory's Library starts with that search (demo only).
+    var demoSearch: String? { isDemo ? environment["DOCKET_PHONE_SEARCH"] : nil }
+    /// `DOCKET_PHONE_MAP_ZOOM=<factor>`: the map opens zoomed in (demo only).
+    var demoMapZoom: Double? { isDemo ? environment["DOCKET_PHONE_MAP_ZOOM"].flatMap(Double.init) : nil }
+    /// `DOCKET_PHONE_MAP_TIMING=1`: logs each map draw's time (demo only).
+    var demoMapTiming: Bool { isDemo && environment["DOCKET_PHONE_MAP_TIMING"] == "1" }
+    /// `DOCKET_PHONE_MAP_SELECT=<name>`: that node's card is open (demo only).
+    var demoMapSelect: String? { isDemo ? environment["DOCKET_PHONE_MAP_SELECT"] : nil }
+
     private func applyDemoLaunchOptions() async {
         switch environment["DOCKET_PHONE_TAB"]?.lowercased() {
         case "record":
@@ -440,8 +464,12 @@ final class AppModel: ObservableObject {
                 ?? items.first { $0.displayTitle.lowercased().contains(lowered) }
             if let item {
                 tab = .memory
-                memoryPath = [item.id]
+                memoryPath = [.item(item.id)]
             }
+        }
+        if let name = environment["DOCKET_PHONE_ENTITY"], let entity = demoEntity(name) {
+            tab = .memory
+            memoryPath = [.entity(entity.id)]
         }
         if tab == .ask, let search, let snapshot, let answer = await DemoSeed.answer(search: search, snapshot: snapshot) {
             ask.inject(answer)

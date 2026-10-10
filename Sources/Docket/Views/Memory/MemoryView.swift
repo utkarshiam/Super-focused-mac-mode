@@ -2,9 +2,10 @@ import AppKit
 import MemoryKit
 import SwiftUI
 
-/// Memory: one Ask field on top (typing filters, Return searches and, with a key, answers from what's
-/// saved), the library under it, and the open memory on the right. Anything dropped on it is remembered.
-/// Until the user has said what they do, the lens card stands in for all of it.
+/// Memory: three views picked in the header (remembered). Library: one Ask field on top (typing filters,
+/// Return searches and, with a key, answers from what's saved) and the library under it. Topics: the brain's
+/// areas, topics, people and projects. Map: the mental map. On the right, the open memory or brain page.
+/// Anything dropped on it is remembered. Until the user has said what they do, the lens card stands in.
 struct MemoryView: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var app: AppState
@@ -12,6 +13,7 @@ struct MemoryView: View {
     @EnvironmentObject var calendar: CalendarService
     @ObservedObject private var center = MemoryCenter.shared
     @ObservedObject private var library = MemoryCenter.shared.library
+    @ObservedObject private var brain = MemoryCenter.shared.brain
     @State private var dropTargeted = false
     @State private var composing: MemoryComposeSheet.Mode?
 
@@ -30,10 +32,17 @@ struct MemoryView: View {
                     .frame(width: 390)
                     .id(id)
                     .transition(.asymmetric(insertion: .opacity.combined(with: .offset(x: 16)), removal: .opacity))
+            } else if !onboarding, let id = app.selectedEntityID, brain.entity(id) != nil {
+                Rectangle().fill(Color.hair).frame(width: 1).ignoresSafeArea()
+                BrainEntityPage(entityID: id)
+                    .frame(width: 390)
+                    .id(id)
+                    .transition(.asymmetric(insertion: .opacity.combined(with: .offset(x: 16)), removal: .opacity))
             }
         }
         .background(Color.paper)
         .animation(Motion.sheet, value: app.selectedMemoryID)
+        .animation(Motion.sheet, value: app.selectedEntityID)
         .onDrop(of: MemoryDrop.types, isTargeted: $dropTargeted) { providers in
             MemoryDrop.read(providers) { files, links, texts in remember(files: files, links: links, texts: texts) }
             return true
@@ -116,6 +125,7 @@ private struct MemoryMainColumn: View {
     @ObservedObject private var center = MemoryCenter.shared
     @ObservedObject private var library = MemoryCenter.shared.library
     @ObservedObject private var processor = MemoryCenter.shared.processor
+    @ObservedObject private var brain = MemoryCenter.shared.brain
     let onboarding: Bool
     let compose: (MemoryComposeSheet.Mode) -> Void
     let addFiles: () -> Void
@@ -132,6 +142,10 @@ private struct MemoryMainColumn: View {
                         .padding(.bottom, Space.x4)
                         .frame(maxWidth: .infinity)
                 }
+            } else if app.memoryMode == .topics {
+                BrainTopicsView()
+            } else if app.memoryMode == .map {
+                BrainMapView(model: app.brainMap)
             } else {
                 MemoryAskBar(ask: app.memoryAsk, submit: submit)
                     .padding(.horizontal, Space.gutter)
@@ -157,6 +171,11 @@ private struct MemoryMainColumn: View {
 
     private var subtitle: String {
         var parts = [MemoryText.count(library.count)]
+        if app.memoryMode != .library {
+            let topics = brain.allTopics().count
+            if topics > 0 { parts.append(topics == 1 ? "1 topic" : "\(topics) topics") }
+            if brain.isWorking { parts.append("organising") }
+        }
         if processor.processingCount > 0 { parts.append("summarising \(processor.processingCount)") }
         return parts.joined(separator: " · ")
     }
@@ -165,11 +184,15 @@ private struct MemoryMainColumn: View {
         app.memoryAsk.ask(text, library: library, ai: processor.ai, scope: app.memoryScope.filter)
     }
 
-    /// Who Docket thinks you are, and + to add something. Nothing until the lens card is done.
+    /// Library · Topics · Map, who Docket thinks you are, and + to add something. Nothing until the lens
+    /// card is done.
     @ViewBuilder
     private var headerButtons: some View {
         if !onboarding {
             HStack(spacing: Space.sm) {
+                SegmentedControl(selection: Binding(get: { app.memoryMode }, set: { app.memoryMode = $0 }),
+                                 options: MemoryMode.allCases.map { ($0, $0.label) })
+                    .padding(.trailing, Space.xs)
                 Button { app.showsMemoryProfile = true } label: { Image(systemName: "person.crop.circle") }
                     .buttonStyle(IconButtonStyle(filled: true))
                     .help("What Docket knows about you")
@@ -438,19 +461,27 @@ private struct MemoryAnswerCard: View {
         var out = AttributedString()
         for segment in CitationText.segments(text, valid: sources > 0 ? 1...sources : nil) {
             switch segment {
-            case .text(let s):
-                out += AttributedString(s)
-            case .citation(let n):
-                out += AttributedString("\u{2009}")
-                var chip = AttributedString("\u{2009}\(n)\u{2009}")
-                chip.font = .system(size: 10.5, weight: .bold).monospacedDigit()
-                chip.foregroundColor = .ink
-                chip.backgroundColor = .fillStrong
-                chip.baselineOffset = 2
-                chip.link = URL(string: "docket-cite:\(n)")
-                out += chip
+            case .text(let s): out += AttributedString(s)
+            case .citation(let n): out += MemoryAnswerLinks.chip(n)
             }
         }
+        return out
+    }
+
+    static func citation(_ url: URL) -> Int? { MemoryAnswerLinks.citation(url) }
+}
+
+/// A citation [n] as a small tappable chip in running text (answers and brain pages), and back.
+enum MemoryAnswerLinks {
+    static func chip(_ n: Int) -> AttributedString {
+        var out = AttributedString("\u{2009}")
+        var chip = AttributedString("\u{2009}\(n)\u{2009}")
+        chip.font = .system(size: 10.5, weight: .bold).monospacedDigit()
+        chip.foregroundColor = .ink
+        chip.backgroundColor = .fillStrong
+        chip.baselineOffset = 2
+        chip.link = URL(string: "docket-cite:\(n)")
+        out += chip
         return out
     }
 
@@ -620,10 +651,13 @@ private struct MemoryLibrarySection: View {
     }
 }
 
-/// All · Notes · Links · Media · Files · Messages · Tasks, then Browse (people, projects, decisions…).
+/// All · Notes · Links · Media · Files · Messages · Tasks, then Browse (pages for people, organisations,
+/// projects and topics; decisions, promises… as filters).
 private struct MemoryFilterRow: View {
+    @EnvironmentObject var app: AppState
     @Binding var scope: MemoryScope
     @ObservedObject private var library = MemoryCenter.shared.library
+    @ObservedObject private var brain = MemoryCenter.shared.brain
 
     var body: some View {
         let vocabulary = library.vocabulary
@@ -639,21 +673,16 @@ private struct MemoryFilterRow: View {
         }
     }
 
+    /// People, organisations, projects and topics open their pages; kinds of moment filter the list.
     private func browseMenu(_ vocabulary: LensVocabulary) -> some View {
         Menu {
-            let people = library.people()
-            if !people.isEmpty {
-                Menu(vocabulary.people) {
-                    ForEach(people.prefix(40)) { p in
-                        Button("\(p.name)  ·  \(p.count)") { scope = .person(p.name) }
-                    }
-                }
-            }
-            let projects = library.projects()
-            if !projects.isEmpty {
-                Menu(vocabulary.projects) {
-                    ForEach(projects.prefix(40)) { p in
-                        Button("\(p.name)  ·  \(p.count)") { scope = .project(p.name) }
+            ForEach([EntityKind.person, .organisation, .project, .topic], id: \.self) { kind in
+                let list = brain.entities(kind).filter { $0.itemCount > 0 }
+                if !list.isEmpty {
+                    Menu(kind.pluralLabel(vocabulary)) {
+                        ForEach(list.prefix(40)) { e in
+                            Button("\(e.name)  ·  \(e.itemCount)") { app.selectedEntityID = e.id }
+                        }
                     }
                 }
             }

@@ -232,7 +232,7 @@ enum DebugSnapshot {
                 d.app.selection = .memory
                 d.app.selectedMemoryID = MemoryCenter.shared.library.items.first { $0.title == "Seed round: investor feedback" }?.id
             }),
-        ]
+        ] + brainSteps(d)
 
         let t0 = ProcessInfo.processInfo.systemUptime
         func stamp() -> String {
@@ -348,6 +348,83 @@ enum DebugSnapshot {
             }),
             ("55b-task-from-memory-open", { UserDefaults.standard.set(true, forKey: "fromMemoryExpanded") }),
             ("55c-task-from-memory-bottom", { scrollDetail(in: d.mainWindow) }),
+        ]
+    }
+
+    /// Docket Brain on the sample library (`MemoryBrain.debugSeed`: areas, topics, merged spellings, pages with
+    /// citations, a disagreement, connections, this week's digest): Topics (collapsed, then opened, then people),
+    /// the Pricing page, the page with notes that disagree, Priya Shah with her other spellings, the map, the
+    /// map around Pricing, the map earlier on, and map plus page in the other appearance.
+    static func brainSteps(_ d: AppDelegate) -> [(String, () -> Void)] {
+        let center = MemoryCenter.shared
+        let brain = center.brain
+        let defaults = UserDefaults.standard
+        func entity(_ name: String, _ kind: EntityKind) -> UUID? { brain.entity(named: name, kind: kind)?.id }
+        return [
+            ("60-brain-topics", {
+                NSApp.appearance = nil
+                NSApp.windows.first { $0.title == "Docket Settings" }?.close()
+                NSApp.windows.first { $0.title == galleryTitle }?.close()
+                for panel in NSApp.windows where panel is FloatingPanel && panel.isVisible { panel.orderOut(nil) }
+                d.app.showsMemoryProfile = false
+                MemoryView.debugOnboarding = false
+                brain.debugSeed(now: Date())
+                defaults.removeObject(forKey: BrainBanner.seenKey)
+                defaults.set(BrainListKind.topics.rawValue, forKey: "brainListKind")
+                defaults.set(false, forKey: "brainDigestOpen")
+                defaults.set(false, forKey: "brainConnectionsOpen")
+                d.app.memoryAsk.clear()
+                d.app.memoryScope = .all
+                d.app.selectedMemoryID = nil
+                d.app.selectedEntityID = nil
+                d.app.selectedTaskID = nil
+                d.app.memoryMode = .topics
+                d.app.selection = .memory
+            }),
+            ("60b-brain-topics-open", {
+                defaults.set(true, forKey: "brainDigestOpen")
+                defaults.set(true, forKey: "brainConnectionsOpen")
+            }),
+            ("60c-brain-people", {
+                defaults.set(false, forKey: "brainDigestOpen")
+                defaults.set(false, forKey: "brainConnectionsOpen")
+                defaults.set(BrainListKind.people.rawValue, forKey: "brainListKind")
+            }),
+            ("61-brain-topic-page", {
+                defaults.set(BrainListKind.topics.rawValue, forKey: "brainListKind")
+                d.app.selectedEntityID = entity("Pricing", .topic)
+            }),
+            ("61b-brain-disagreement", { d.app.selectedEntityID = entity("Seed round", .topic) }),
+            // A memory opened from a page: the way back, its topics and "Move to topic…".
+            ("61c-brain-item-topics", {
+                guard let pricing = entity("Pricing", .topic),
+                      let item = center.library.items.first(where: { $0.title.hasPrefix("Pricing: annual discount") }) else { return }
+                d.app.openMemory(item.id, from: pricing)
+            }),
+            ("62-brain-person-page", { d.app.selectedEntityID = entity("Priya Shah", .person) }),
+            ("63-brain-map", {
+                d.app.selectedEntityID = nil
+                d.app.brainMap.asOf = nil
+                d.app.brainMap.focusID = nil
+                d.app.memoryMode = .map
+            }),
+            ("63b-brain-map-focus", {
+                if let pricing = entity("Pricing", .topic) { d.app.brainMap.focus(pricing, brain: brain) }
+            }),
+            ("63c-brain-map-earlier", {
+                d.app.brainMap.showAll(brain: brain)
+                if let first = d.app.brainMap.firstDate(center.library) {
+                    d.app.brainMap.asOf = MapTime.date(at: 0.985, first: first, now: Date())
+                }
+            }),
+            ("64-brain-light", {
+                // The other appearance from the system's (step 17 may have flipped it already).
+                NSApp.appearance = nil
+                let dark = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                NSApp.appearance = NSAppearance(named: dark ? .aqua : .darkAqua)
+                d.app.brainMap.asOf = nil
+                d.app.selectedEntityID = entity("Pricing", .topic)
+            }),
         ]
     }
 

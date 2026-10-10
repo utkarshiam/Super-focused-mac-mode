@@ -28,7 +28,8 @@ extension MemoryLibrary {
                         summary: "Notes from the partner meeting with Harbor Capital. Strong interest in the retention numbers; they want a clearer path to $1M ARR.",
                         body: "Met Priya Shah and Tom Becker at Harbor Capital.\n\nThey liked the 92% logo retention and the self-serve motion. Main pushback: CAC payback is unclear and the market slide feels too broad.\n\nAgreed to go with a SAFE rather than a priced round to keep the timeline short. Priya will send a draft term sheet.",
                         keyTakeaways: ["92% logo retention resonated", "Pushback on CAC payback and market size", "Going with a SAFE, target $2M"],
-                        people: ["Priya Shah", "Tom Becker"], projects: ["Seed round"], topics: ["fundraising"], tags: ["investors"],
+                        people: ["Priya Shah", "Tom Becker"], projects: ["Seed round"], organisations: ["Harbor Capital"],
+                        topics: ["fundraising"], tags: ["investors"],
                         moments: [Moment(kind: .decision, text: "Raise the seed on a SAFE instead of a priced round to keep the timeline short."),
                                   Moment(kind: .promise, text: "Priya Shah sends a draft term sheet.", who: "Priya Shah", due: dayFromNow(3), direction: .theirs),
                                   Moment(kind: .insight, text: "Investors respond to retention more than to top-of-funnel growth.")],
@@ -61,14 +62,15 @@ extension MemoryLibrary {
                         createdAt: daysAgo(3, hour: 14)).withRef(SourceRef.slack(channel: "C0BILLING", ts: "1700000000.000100")), [.billing])
 
         seed(MemoryItem(kind: .task, origin: .auto, title: "Send Q3 board deck to Alex Kim",
-                        summary: "", body: "Completed task · Board", people: ["Alex Kim"], projects: ["Board"],
+                        summary: "", body: "Completed task · Board\nDeck v3: seed target $1.5M, 18 months of runway.", people: ["Alex Kim"], projects: ["Board"],
                         createdAt: daysAgo(4, hour: 17), lightweight: true), [.fundraising, .team])
 
         seed(MemoryItem(kind: .message, title: "Acme renewal: security questionnaire",
                         summary: "Jordan Lee at Acme needs a SOC 2 report before signing the renewal; procurement deadline is end of month.",
                         body: "Hi, before we can sign the renewal our security team needs your SOC 2 Type II report or a bridge letter. Procurement closes the quarter at the end of the month. — Jordan Lee, Acme",
                         keyTakeaways: ["Blocker: SOC 2 report or bridge letter", "Procurement deadline: end of month", "Renewal at $48k ARR"],
-                        capturedFrom: "Gmail", people: ["Jordan Lee"], projects: ["Acme renewal"], topics: ["sales", "security"], tags: ["renewal"],
+                        capturedFrom: "Gmail", people: ["Jordan Lee"], projects: ["Acme renewal"], organisations: ["Acme Inc."],
+                        topics: ["sales", "security"], tags: ["renewal"],
                         moments: [Moment(kind: .insight, text: "Acme won't sign without a SOC 2 report or a bridge letter.", who: "Jordan Lee"),
                                   Moment(kind: .promise, text: "Send Jordan Lee the SOC 2 bridge letter.", due: dayFromNow(4), direction: .mine)],
                         createdAt: daysAgo(5, hour: 11)).withRef(SourceRef.gmail(threadID: "18c2f0a9d1e3b7aa")), [.sales])
@@ -77,7 +79,7 @@ extension MemoryLibrary {
                         summary: "Maya wants to own the events pipeline end to end and asked for more time with customers.",
                         body: "- Events pipeline is stable; Maya wants to own it end to end\n- Wants to join two customer calls a month\n- Feedback: her design reviews are thorough, could share drafts earlier\n- I'll set up the customer calls with Jordan",
                         keyTakeaways: ["Maya to own the events pipeline", "Two customer calls a month", "Share drafts earlier"],
-                        people: ["Maya Chen", "Jordan Lee"], projects: ["Events pipeline"], topics: ["1:1", "growth"],
+                        people: ["Maya Chen", "Jordan Lee"], projects: ["Events pipeline"], organisations: ["Acme"], topics: ["1:1", "growth"],
                         moments: [Moment(kind: .decision, text: "Maya Chen owns the events pipeline end to end from now on."),
                                   Moment(kind: .promise, text: "Set up two customer calls a month for Maya Chen.", due: dayFromNow(6), direction: .mine)],
                         createdAt: daysAgo(6, hour: 15)), [.team, .product])

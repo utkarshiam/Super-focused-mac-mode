@@ -2,7 +2,8 @@ import AppKit
 import MemoryKit
 import SwiftUI
 
-/// ⌘K: jump to any task, note, memory or view, ask your memory, or create a task from what you typed.
+/// ⌘K: jump to any task, note, memory, brain page (topic, person, organisation, project) or view, ask your
+/// memory, or create a task from what you typed.
 struct CommandPalette: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var app: AppState
@@ -170,6 +171,16 @@ struct CommandPalette: View {
         let question = PaletteMemory.looksLikeQuestion(q)
         if question { items.append(ask) }
         items += commands.filter { $0.title.localizedCaseInsensitiveContains(q) }
+        // Brain pages: topics, people, organisations and projects ("go to pricing" works too).
+        let brain = MemoryCenter.shared.brain
+        let vocabulary = MemoryCenter.shared.library.vocabulary
+        let pages = brain.entities.filter { $0.itemCount > 0 || $0.kind == .area }
+        items += EntityPicker.filter(pages, query: EntityPicker.paletteQuery(q), limit: 5).map { e in
+            Item(id: "e-\(e.id)", icon: e.kind.symbolName, title: "Go to \(e.name)",
+                 subtitle: "\(e.kind.label(vocabulary)) · \(BrainText.memories(e.itemCount))") {
+                app.reveal(entity: e.id)
+            }
+        }
         items += store.searchTasks(q, limit: 15).map { t in
             let when = t.dueDate.map { Fmt.due($0, hasTime: t.dueHasTime) }
             return Item(id: "t-\(t.id)", icon: t.isCompleted ? "checkmark.circle.fill" : "circle", title: t.title,

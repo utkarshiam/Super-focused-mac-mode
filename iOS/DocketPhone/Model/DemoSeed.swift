@@ -5,8 +5,9 @@ import MemoryKit
 /// `MemoryLibrary.debugSeed` and published the way the Mac does, a few tasks, a few recent captures
 /// and a canned Ask answer. Nothing touches the user's real folder, Keychain or the network.
 ///
-/// Launch options: `DOCKET_PHONE_TAB=capture|record|debrief|memory|ask|today|settings`,
-/// `DOCKET_PHONE_ITEM=first|<index>|<words in a title>` opens that item.
+/// Launch options: `DOCKET_PHONE_TAB=capture|record|debrief|memory|topics|map|ask|today|settings`,
+/// `DOCKET_PHONE_ITEM=first|<index>|<words in a title>` opens that item, `DOCKET_PHONE_ENTITY=<name>` opens
+/// that topic's or person's page.
 enum DemoSeed {
     static var baseURL: URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("DocketPhoneDemo", isDirectory: true)
@@ -25,11 +26,47 @@ enum DemoSeed {
         let library = MemoryLibrary(directory: baseURL.appendingPathComponent("MacLibrary", isDirectory: true), saveDelay: 0)
         library.debugSeed(now: now, lenses: [.founder, .manager])
         library.flush()
+        // The organised brain (areas, topics, pages, connections, digest, map), offline.
+        let brain = MemoryBrain(library: library, saveDelay: 0, autoUpdate: false)
+        brain.debugSeed(now: now)
+        brain.flush()
         // Published a little while ago, like a Mac that synced this afternoon.
         let published = now.addingTimeInterval(-14 * 60)
-        try? await PhoneBridge(root: root).publish(library, tasks: tasks(now: now), now: published)
+        try? await PhoneBridge(root: root).publish(library, tasks: tasks(now: now), now: published, brain: brain)
+        if let n = ProcessInfo.processInfo.environment["DOCKET_PHONE_MAP_NODES"].flatMap(Int.init) { padMap(root: root, to: n) }
         try? fm.createDirectory(at: PhoneBridge(root: root).inboxURL, withIntermediateDirectories: true)
         return Seeded(root: root, records: records(now: now))
+    }
+
+    /// `DOCKET_PHONE_MAP_NODES=<n>` (stress test): pads the published map with made-up people around its
+    /// topics until it has n nodes.
+    static func padMap(root: URL, to target: Int) {
+        let url = PhoneBridge(root: root).snapshotURL
+        guard let data = try? Data(contentsOf: url),
+              var snapshot = try? MemoryCoding.decoder.decode(LibrarySnapshot.self, from: data),
+              var brain = snapshot.brain else { return }
+        let topics = brain.map.nodes.filter { $0.kind == .topic }
+        guard !topics.isEmpty else { return }
+        var seed: UInt64 = 42
+        func random() -> Double {
+            seed = seed &* 6364136223846793005 &+ 1442695040888963407
+            return Double(seed >> 11) / Double(1 << 53)
+        }
+        var added: [UUID] = []
+        while brain.map.nodes.count < target {
+            let topic = topics[Int(random() * Double(topics.count))]
+            let angle = random() * 2 * .pi, distance = 0.4 + random() * 1.6
+            let id = UUID()
+            brain.map.nodes.append(MapNode(id: id, kind: [.person, .organisation, .project][Int(random() * 3)], name: "Contact \(added.count + 1)",
+                                           size: 1 + Int(random() * 4), areaID: topic.areaID,
+                                           position: MapPoint(x: topic.position.x + cos(angle) * distance, y: topic.position.y + sin(angle) * distance),
+                                           firstSeen: topic.firstSeen, lastSeen: topic.lastSeen))
+            brain.map.edges.append(MapEdge(a: id, b: topic.id, weight: 0.2 + random() * 0.4, kind: .shared))
+            if let other = added.randomElement() { brain.map.edges.append(MapEdge(a: id, b: other, weight: random() * 0.3, kind: .shared)) }
+            added.append(id)
+        }
+        snapshot.brain = brain
+        if let out = try? MemoryCoding.encoder.encode(snapshot) { try? out.write(to: url, options: .atomic) }
     }
 
     static func tasks(now: Date) -> [TaskSnapshot] {

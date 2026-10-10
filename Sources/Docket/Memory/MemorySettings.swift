@@ -3,12 +3,13 @@ import MemoryKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Settings → Memory: lenses and what AI is doing, what Docket remembers by itself, the iPhone folder,
-/// importing from ENGRAM and rebuilding the search index.
+/// Settings → Memory: lenses and what AI is doing, how the brain is organised (with "Organise now"), what
+/// Docket remembers by itself, the iPhone folder, importing from ENGRAM and rebuilding the search index.
 struct MemorySettingsPage: View {
     @ObservedObject private var center = MemoryCenter.shared
     @ObservedObject private var library = MemoryCenter.shared.library
     @ObservedObject private var processor = MemoryCenter.shared.processor
+    @ObservedObject private var brain = MemoryCenter.shared.brain
     @AppStorage(Prefs.Key.memoryAutoCapture) private var autoCapture = true
     @AppStorage(Prefs.Key.memoryCaptureNotes) private var captureNotes = true
     @AppStorage(Prefs.Key.memoryCaptureTasks) private var captureTasks = true
@@ -25,6 +26,12 @@ struct MemorySettingsPage: View {
                         Button("Try again") { processor.retryFailed() }
                             .buttonStyle(SecondaryPill(height: 30))
                     }
+                }
+                SettingsRow(title: "Topics", subtitle: center.brainLine) {
+                    Button("Organise now") { center.organizeNow() }
+                        .buttonStyle(SecondaryPill(height: 30))
+                        .disabled(brain.isWorking || library.count < brain.minimumItemsToOrganize)
+                        .help("Sort memories into topics and areas again (what you fixed by hand stays)")
                 }
                 SettingsRow(title: "Storage", subtitle: storageLine, divider: false) {
                     Button("Show in Finder") {

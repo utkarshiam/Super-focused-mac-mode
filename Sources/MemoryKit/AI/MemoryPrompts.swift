@@ -23,8 +23,12 @@ public enum MemoryPrompts {
     // MARK: Extraction
 
     /// The system instruction for turning one item into summary, people, projects and moments.
-    public static func extractionSystem(lenses: [Lens], profile: MemoryProfile, now: Date) -> String {
-        """
+    /// `vocabulary` (from `MemoryBrain.extractionVocabulary()`) lists the names already in memory so new
+    /// items reuse them ("Pricing", not "pricing strategy" one day and "Pricing" the next).
+    public static func extractionSystem(lenses: [Lens], profile: MemoryProfile, now: Date,
+                                        vocabulary: ExtractionVocabulary? = nil) -> String {
+        let known = vocabulary.map { $0.promptSection } ?? ""
+        return """
         You file things into the user's personal memory. From one saved item, extract what they would want \
         to find again. Work only from the item; never add facts, names or numbers it doesn't contain.
 
@@ -36,8 +40,9 @@ public enum MemoryPrompts {
         - summary: 1–2 plain sentences on what it is and why it matters.
         - keyTakeaways: up to 5 short, concrete points (numbers, names, conclusions). Empty for trivial items.
         - people: full names as written; never the user themself. projects: named initiatives, products, \
-        deals, campaigns or works. topics: 1–5 broad subjects. tags: 0–5 lowercase single words or \
-        hyphenated phrases.
+        deals, campaigns or works. organisations: companies, investors, customers, vendors, schools or \
+        institutions named, by their usual short name ("Acme", not "Acme Inc."). topics: 1–5 broad subjects \
+        in Title Case ("Pricing", "Hiring"). tags: 0–5 lowercase single words or hyphenated phrases.
         - moments, only when clearly present: "decision" (something decided), "promise" (someone committed to \
         do something), "idea" (a proposal or possibility), "insight" (a learning, finding or reference worth \
         keeping). Each moment's text is one self-contained sentence. For promises set who (the person who \
@@ -47,7 +52,7 @@ public enum MemoryPrompts {
         - extractedText: for an attached image, PDF, audio or video, the transcript (speech, verbatim) or \
         a faithful description including any visible text; "" when the item is already text.
         - Always write absolute dates ("Mon 12 Oct 2026"), never "today", "tomorrow" or "next week".
-
+        \(known)
         \(context(profile: profile, lenses: lenses))
         """
     }
@@ -75,6 +80,7 @@ public enum MemoryPrompts {
         "keyTakeaways": MemoryJSON.Schema.array(MemoryJSON.Schema.string(), maxItems: 5),
         "people": MemoryJSON.Schema.array(MemoryJSON.Schema.string(), maxItems: 20),
         "projects": MemoryJSON.Schema.array(MemoryJSON.Schema.string(), maxItems: 10),
+        "organisations": MemoryJSON.Schema.array(MemoryJSON.Schema.string(), maxItems: 10),
         "topics": MemoryJSON.Schema.array(MemoryJSON.Schema.string(), maxItems: 5),
         "tags": MemoryJSON.Schema.array(MemoryJSON.Schema.string(), maxItems: 5),
         "moments": MemoryJSON.Schema.array(MemoryJSON.Schema.object([
@@ -112,12 +118,13 @@ public enum MemoryPrompts {
         public var keyTakeaways: [String]
         public var people: [String]
         public var projects: [String]
+        public var organisations: [String]
         public var topics: [String]
         public var tags: [String]
         public var moments: [RawMoment]
         public var extractedText: String
 
-        private enum CodingKeys: String, CodingKey { case title, summary, keyTakeaways, people, projects, topics, tags, moments, extractedText }
+        private enum CodingKeys: String, CodingKey { case title, summary, keyTakeaways, people, projects, organisations, topics, tags, moments, extractedText }
         public init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             title = c.value(.title, default: "")
@@ -125,6 +132,7 @@ public enum MemoryPrompts {
             keyTakeaways = c.value(.keyTakeaways, default: [])
             people = c.value(.people, default: [])
             projects = c.value(.projects, default: [])
+            organisations = c.value(.organisations, default: [])
             topics = c.value(.topics, default: [])
             tags = c.value(.tags, default: [])
             moments = c.value(.moments, default: [])
@@ -206,6 +214,7 @@ public enum MemoryPrompts {
         var head = "[\(number)] \"\(item.displayTitle)\" — \(item.kind.label.lowercased()), \(MemoryDates.prompt(item.createdAt))"
         if !item.people.isEmpty { head += " · people: \(item.people.prefix(8).joined(separator: ", "))" }
         if !item.projects.isEmpty { head += " · projects: \(item.projects.prefix(5).joined(separator: ", "))" }
+        if !item.organisations.isEmpty { head += " · organisations: \(item.organisations.prefix(5).joined(separator: ", "))" }
         if let from = item.capturedFrom, !from.isEmpty { head += " · from: \(from)" }
         var lines = [head]
         if !item.summary.isEmpty { lines.append("Summary: \(item.summary)") }
@@ -284,4 +293,55 @@ public enum MemoryPrompts {
             "category": MemoryJSON.Schema.string(enum: ProfileFact.Category.allCases.map(\.rawValue)),
         ]), maxItems: 20),
     ])
+}
+
+// MARK: - Vocabulary for extraction
+
+/// The names already in the user's memory, given to extraction so new items reuse them: topic names from
+/// the brain's taxonomy, the most used tags, and canonical spellings of people, projects and organisations.
+/// Build it with `MemoryBrain.extractionVocabulary()`; give `MemoryProcessor.vocabulary` a closure returning it.
+public struct ExtractionVocabulary: Hashable, Sendable {
+    public var topics: [String]
+    public var tags: [String]
+    public var people: [String]
+    public var projects: [String]
+    public var organisations: [String]
+
+    public init(topics: [String] = [], tags: [String] = [], people: [String] = [], projects: [String] = [], organisations: [String] = []) {
+        self.topics = topics
+        self.tags = tags
+        self.people = people
+        self.projects = projects
+        self.organisations = organisations
+    }
+
+    public var isEmpty: Bool { topics.isEmpty && tags.isEmpty && people.isEmpty && projects.isEmpty && organisations.isEmpty }
+
+    /// Caps for the prompt (most important first; the caller orders them).
+    static let limits = (topics: 40, tags: 30, people: 40, projects: 30, organisations: 25)
+
+    /// The rules block added to the extraction prompt ("" when empty).
+    var promptSection: String {
+        guard !isEmpty else { return "" }
+        func line(_ label: String, _ names: [String], _ limit: Int) -> String? {
+            let list = TextFold.uniqueNames(names, limit: limit)
+            return list.isEmpty ? nil : "- \(label): " + list.joined(separator: "; ")
+        }
+        let lines = [
+            line("Topics", topics, Self.limits.topics),
+            line("Tags", tags, Self.limits.tags),
+            line("People", people, Self.limits.people),
+            line("Projects", projects, Self.limits.projects),
+            line("Organisations", organisations, Self.limits.organisations),
+        ].compactMap { $0 }
+        return """
+
+        Names already in the user's memory. Reuse the exact spelling when the item is about the same thing \
+        ("Rohan" in the text is "Rohan Mehta" if that is clearly who it means); use a topic from this list \
+        whenever one fits and add a new topic only for a genuinely new subject; prefer these tags over \
+        synonyms. Never add a name the item doesn't mention.
+        \(lines.joined(separator: "\n"))
+
+        """
+    }
 }

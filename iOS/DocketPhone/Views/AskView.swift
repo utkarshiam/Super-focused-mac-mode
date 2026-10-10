@@ -355,16 +355,18 @@ private struct NoKeyCard: View {
 struct ItemSheet: View {
     let itemID: UUID
     @Environment(\.dismiss) private var dismiss
+    @State private var path: [MemoryRoute] = []
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             ItemDetailView(itemID: itemID)
-                .navigationDestination(for: UUID.self) { ItemDetailView(itemID: $0) }
+                .memoryDestinations()
                 .toolbar {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("Done") { dismiss() }.fontWeight(.semibold).foregroundStyle(Color.ink)
                     }
                 }
         }
+        .environment(\.memoryPush) { path.append($0) }
     }
 }

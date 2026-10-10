@@ -335,6 +335,8 @@ public struct MemoryItem: Identifiable, Hashable, Codable, Sendable {
 
     public var people: [String]
     public var projects: [String]
+    /// Companies, funds, institutions and teams named in it ("Harbor Capital", "Mehta Traders").
+    public var organisations: [String]
     public var topics: [String]
     /// The user's own tags plus AI's (lowercase, no "#").
     public var tags: [String]
@@ -358,7 +360,7 @@ public struct MemoryItem: Identifiable, Hashable, Codable, Sendable {
     public init(id: UUID = UUID(), kind: MemoryKind = .note, origin: MemoryOrigin = .manual, sourceRef: String? = nil,
                 title: String = "", summary: String = "", body: String = "", extractedText: String = "", keyTakeaways: [String] = [],
                 url: String? = nil, imageURL: String? = nil, capturedFrom: String? = nil,
-                people: [String] = [], projects: [String] = [], topics: [String] = [], tags: [String] = [],
+                people: [String] = [], projects: [String] = [], organisations: [String] = [], topics: [String] = [], tags: [String] = [],
                 moments: [Moment] = [], attachments: [MemoryAttachment] = [], pinned: Bool = false,
                 createdAt: Date = Date(), updatedAt: Date? = nil, lastViewedAt: Date? = nil,
                 processing: ProcessingState = .pending, processedAt: Date? = nil, attempts: Int = 0,
@@ -377,6 +379,7 @@ public struct MemoryItem: Identifiable, Hashable, Codable, Sendable {
         self.capturedFrom = capturedFrom
         self.people = people
         self.projects = projects
+        self.organisations = organisations
         self.topics = topics
         self.tags = tags
         self.moments = moments
@@ -393,7 +396,7 @@ public struct MemoryItem: Identifiable, Hashable, Codable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case id, kind, origin, sourceRef, title, summary, body, extractedText, keyTakeaways, url, imageURL, capturedFrom
-        case people, projects, topics, tags, moments, attachments, pinned, createdAt, updatedAt, lastViewedAt
+        case people, projects, organisations, topics, tags, moments, attachments, pinned, createdAt, updatedAt, lastViewedAt
         case processing, processedAt, attempts, lightweight
     }
 
@@ -413,6 +416,7 @@ public struct MemoryItem: Identifiable, Hashable, Codable, Sendable {
         capturedFrom = c.value(.capturedFrom, default: nil)
         people = c.value(.people, default: [])
         projects = c.value(.projects, default: [])
+        organisations = c.value(.organisations, default: [])
         topics = c.value(.topics, default: [])
         tags = c.value(.tags, default: [])
         moments = c.value(.moments, default: [])
@@ -461,6 +465,7 @@ extension MemoryItem {
         if !keyTakeaways.isEmpty { lines.append(keyTakeaways.map { "- \($0)" }.joined(separator: "\n")) }
         if !people.isEmpty { lines.append("People: " + people.joined(separator: ", ")) }
         if !projects.isEmpty { lines.append("Projects: " + projects.joined(separator: ", ")) }
+        if !organisations.isEmpty { lines.append("Organisations: " + organisations.joined(separator: ", ")) }
         if !topics.isEmpty { lines.append("Topics: " + topics.joined(separator: ", ")) }
         if summary.isEmpty && keyTakeaways.isEmpty {
             // Not extracted (lightweight, or extraction failed): the start of the text carries the meaning.

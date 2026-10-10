@@ -18,6 +18,8 @@ import Foundation
 ///   "due": "2026-10-12T00:00:00Z",   // task, optional
 ///   "dueHasTime": false,             // task
 ///   "taskID": "UUID",                // taskDone/taskUndone/taskDelete: which task (TaskSnapshot.id)
+///   "task": { DebriefTask },          // task: every field when the phone parsed it (dictated scheduling);
+///                                    // its id is the envelope id. Older envelopes have only title/due.
 ///   "transcript": "…",               // voice: what on-device speech recognition heard (rough)
 ///   "debrief": { VoiceDebrief },      // voice: already processed on the phone; the Mac creates its
 ///                                    // tasks (with the same ids) and the memory without asking Gemini again
@@ -58,10 +60,13 @@ public struct CaptureEnvelope: Identifiable, Hashable, Codable, Sendable {
     public var transcript: String?
     /// Voice: the phone's finished debrief. Nil when the phone couldn't process it (no key, offline).
     public var debrief: VoiceDebrief?
+    /// Task: the fully parsed task (date, time, length, reminder, repeat…) when the phone understood it.
+    public var task: DebriefTask?
 
     public init(id: UUID = UUID(), kind: Kind, createdAt: Date = Date(), title: String? = nil, text: String? = nil,
                 url: String? = nil, attachmentName: String? = nil, due: Date? = nil, dueHasTime: Bool = false,
-                taskID: UUID? = nil, device: String? = nil, transcript: String? = nil, debrief: VoiceDebrief? = nil) {
+                taskID: UUID? = nil, device: String? = nil, transcript: String? = nil, debrief: VoiceDebrief? = nil,
+                task: DebriefTask? = nil) {
         self.version = Self.currentVersion
         self.id = id
         self.kind = kind
@@ -76,10 +81,11 @@ public struct CaptureEnvelope: Identifiable, Hashable, Codable, Sendable {
         self.device = device
         self.transcript = transcript
         self.debrief = debrief
+        self.task = task
     }
 
     private enum CodingKeys: String, CodingKey {
-        case version, id, kind, createdAt, title, text, url, attachmentName, due, dueHasTime, taskID, device, transcript, debrief
+        case version, id, kind, createdAt, title, text, url, attachmentName, due, dueHasTime, taskID, device, transcript, debrief, task
     }
 
     public init(from decoder: Decoder) throws {
@@ -98,6 +104,7 @@ public struct CaptureEnvelope: Identifiable, Hashable, Codable, Sendable {
         device = c.value(.device, default: nil)
         transcript = c.value(.transcript, default: nil)
         debrief = c.value(.debrief, default: nil)
+        task = c.value(.task, default: nil)
     }
 
     /// "<id>.capture.json"
@@ -169,7 +176,8 @@ public struct TaskSnapshot: Identifiable, Hashable, Codable, Sendable {
 ///   "lenses": ["founder", …],
 ///   "tasks": [TaskSnapshot…],        // open tasks: overdue, today, the next 7 days, recent voice-note ones
 ///   "embeddingModel": "gemini-embedding-2", "embeddingDimensions": 768,
-///   "listNames": ["Sales", "Hiring"]  // the user's task lists, for debriefs made on the phone
+///   "listNames": ["Sales", "Hiring"], // the user's task lists, for debriefs made on the phone
+///   "brain": BrainSnapshot             // topics, entities, pages, map (optional; older Macs leave it out)
 /// }
 /// ```
 public struct LibrarySnapshot: Hashable, Codable, Sendable {
@@ -186,10 +194,12 @@ public struct LibrarySnapshot: Hashable, Codable, Sendable {
     public var embeddingDimensions: Int
     /// The user's task list names, so a debrief on the phone can file tasks into them.
     public var listNames: [String]
+    /// The organised brain (areas, topics, people, pages, the map). Nil from a Mac without it.
+    public var brain: BrainSnapshot?
 
     public init(generatedAt: Date = Date(), items: [MemoryItem] = [], profile: MemoryProfile = MemoryProfile(),
                 lenses: [Lens] = [], tasks: [TaskSnapshot] = [], embeddingModel: String = "", embeddingDimensions: Int = 0,
-                listNames: [String] = []) {
+                listNames: [String] = [], brain: BrainSnapshot? = nil) {
         self.version = Self.currentVersion
         self.generatedAt = generatedAt
         self.items = items
@@ -199,10 +209,11 @@ public struct LibrarySnapshot: Hashable, Codable, Sendable {
         self.embeddingModel = embeddingModel
         self.embeddingDimensions = embeddingDimensions
         self.listNames = listNames
+        self.brain = brain
     }
 
     private enum CodingKeys: String, CodingKey {
-        case version, generatedAt, items, profile, lenses, tasks, embeddingModel, embeddingDimensions, listNames
+        case version, generatedAt, items, profile, lenses, tasks, embeddingModel, embeddingDimensions, listNames, brain
     }
 
     public init(from decoder: Decoder) throws {
@@ -216,6 +227,7 @@ public struct LibrarySnapshot: Hashable, Codable, Sendable {
         embeddingModel = c.value(.embeddingModel, default: "")
         embeddingDimensions = c.value(.embeddingDimensions, default: 0)
         listNames = c.value(.listNames, default: [])
+        brain = c.value(.brain, default: nil)
     }
 
     /// Everyone named in the library, most mentioned first: spelling hints for a debrief.

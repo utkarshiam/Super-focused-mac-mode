@@ -103,7 +103,7 @@ public struct MemorySearch: Sendable {
         public init(_ item: MemoryItem) {
             self.item = item
             title = Self.bytes(item.displayTitle)
-            names = Self.bytes((item.people + item.projects).joined(separator: " | "))
+            names = Self.bytes((item.people + item.projects + item.organisations).joined(separator: " | "))
             labels = Self.bytes((item.tags + item.topics).joined(separator: " | ") + " | " + (item.capturedFrom ?? ""))
             summary = Self.bytes(([item.summary] + item.keyTakeaways + item.moments.map(\.text)).joined(separator: " | "))
             var text = item.fullText
