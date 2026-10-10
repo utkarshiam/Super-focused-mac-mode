@@ -44,6 +44,10 @@ final class AppModel: ObservableObject {
     @Published private(set) var completed: [UUID: Date] = [:]
     /// Tasks deleted on this phone, hidden until a snapshot confirms them (task id → when).
     @Published private(set) var deleted: [UUID: Date] = [:]
+    /// Tasks sent from this phone (composer, dictation, Siri) the Mac's list doesn't show yet.
+    @Published private(set) var sentTasks: [SentTask] = []
+    /// The task composer, when open (Capture shows it).
+    @Published var composing: ComposerRequest?
     @Published private(set) var syncProblem: String?
     @Published private(set) var hasKey = false
 
@@ -51,6 +55,7 @@ final class AppModel: ObservableObject {
     let local: LocalStore
     let ask = AskSession()
     let voice: VoiceCenter
+    let spoken: SpokenTaskCenter
 
     /// The running app's model, for App Intents that run inside the app.
     static weak var current: AppModel?
@@ -69,6 +74,7 @@ final class AppModel: ObservableObject {
     private let environment: [String: String]
     private var pendingDeletes: [UUID: Task<Void, Never>] = [:]
     private var voiceChanges: AnyCancellable?
+    private var spokenChanges: AnyCancellable?
 
     init(environment: [String: String] = ProcessInfo.processInfo.environment) {
         self.environment = environment
@@ -87,8 +93,10 @@ final class AppModel: ObservableObject {
             records = local.loadRecords()
             completed = local.loadCompleted()
             deleted = local.loadDeleted()
+            sentTasks = local.loadSentTasks()
         }
         voice = VoiceCenter(local: local, isDemo: isDemo)
+        spoken = SpokenTaskCenter(local: local, isDemo: isDemo)
         if !isDemo, let saved = UserDefaults.standard.string(forKey: "memory.mode").flatMap(MemoryMode.init(rawValue:)) {
             memoryMode = saved
         }
@@ -98,11 +106,13 @@ final class AppModel: ObservableObject {
         }
         if let tab = environment["DOCKET_PHONE_TAB"].flatMap({ Tab(rawValue: $0.lowercased()) }) { self.tab = tab }
         if environment["DOCKET_PHONE_TAB"]?.lowercased() == "settings" { showSettings = true }
-        if ["record", "debrief"].contains(environment["DOCKET_PHONE_TAB"]?.lowercased()) { tab = .capture }
+        if ["record", "debrief", "dictate", "dictated", "composer"].contains(environment["DOCKET_PHONE_TAB"]?.lowercased()) { tab = .capture }
         voice.model = self
+        spoken.attach(self)
         Self.current = self
         // Debrief tasks show in Today, so the voice queue's changes are the model's too.
         voiceChanges = voice.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }
+        spokenChanges = spoken.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }
     }
 
     /// Called once when the window appears.
@@ -160,6 +170,8 @@ final class AppModel: ObservableObject {
         await reloadLibrary(force: force)
         await updateReceived()
         voice.sweep()
+        spoken.sweep()
+        sweepSentTasks()
     }
 
     private func reloadLibrary(force: Bool) async {
@@ -276,16 +288,91 @@ final class AppModel: ObservableObject {
 
     // MARK: Tasks
 
-    /// The Mac's open tasks plus debrief tasks it doesn't list yet (merged by id), minus ones deleted here.
+    /// The Mac's open tasks plus tasks sent from here it doesn't list yet (debriefs, the composer, dictation,
+    /// Siri; merged by id), minus ones deleted here.
     var openTasks: [TaskSnapshot] {
         let fromMac = snapshot?.tasks.filter { !$0.done } ?? []
-        let known = Set((snapshot?.tasks ?? []).map(\.id))
-        return (fromMac + voice.pendingTasks(excluding: known)).filter { deleted[$0.id] == nil }
+        var known = Set((snapshot?.tasks ?? []).map(\.id))
+        let fromVoice = voice.pendingTasks(excluding: known)
+        known.formUnion(fromVoice.map(\.id))
+        let sent = sentTasks.filter { !known.contains($0.id) }.map(\.task.asSnapshot)
+        return (fromMac + fromVoice + sent).filter { deleted[$0.id] == nil }
     }
 
-    /// A debrief task the Mac hasn't listed yet.
-    func isPendingFromVoice(_ id: UUID) -> Bool {
-        !(snapshot?.tasks.contains { $0.id == id } ?? false) && voice.debriefTask(id) != nil
+    /// A task sent from this phone (a debrief, the composer, dictation, Siri) the Mac hasn't listed yet.
+    func isJustAdded(_ id: UUID) -> Bool {
+        !(snapshot?.tasks.contains { $0.id == id } ?? false) && (voice.debriefTask(id) != nil || sentTask(id) != nil)
+    }
+
+    func sentTask(_ id: UUID) -> DebriefTask? { sentTasks.first { $0.id == id }?.task }
+
+    /// Sends a new task with every field (a `.task` envelope whose id is the task's); it shows in Today at once.
+    @discardableResult
+    func addTask(_ task: DebriefTask, quiet: Bool = false) -> Bool {
+        var task = task
+        task.title = task.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !task.title.isEmpty else { return false }
+        guard capture(.task(task), title: task.title, detail: PhoneFmt.taskDetail(task), quiet: quiet) else { return false }
+        sentTasks.removeAll { $0.id == task.id }
+        sentTasks.insert(SentTask(task: task, sentAt: Date()), at: 0)
+        saveSentTasks()
+        return true
+    }
+
+    /// Takes back a task sent from here: straight out of Pending when it hasn't gone anywhere yet, else a
+    /// taskDelete for the Mac.
+    func takeBackTask(_ id: UUID) {
+        let title = sentTask(id)?.title
+        withAnimation(Motion.snappy) { sentTasks.removeAll { $0.id == id } }
+        saveSentTasks()
+        if !flushing, local.unstage(id) {
+            forgetRecord(id)
+        } else {
+            sendTaskDelete(id, title: title)
+        }
+    }
+
+    /// An edited task sent from here: the old one is taken back and the edit added. Keeps the id when the old
+    /// one never left the phone; otherwise the edit gets a new one. Returns the task as sent.
+    @discardableResult
+    func replaceTask(_ task: DebriefTask) -> DebriefTask {
+        var sent = task
+        let unsent = !flushing && local.unstage(task.id)
+        if unsent {
+            forgetRecord(task.id)
+        } else {
+            sendTaskDelete(task.id, title: sentTask(task.id)?.title ?? task.title)
+            sent.id = UUID()
+        }
+        sentTasks.removeAll { $0.id == task.id }
+        addTask(sent, quiet: true)
+        return sent
+    }
+
+    private func forgetRecord(_ id: UUID) {
+        records.removeAll { $0.id == id }
+        saveRecords()
+    }
+
+    private func saveSentTasks() {
+        guard !isDemo else { return }
+        local.saveSentTasks(sentTasks)
+    }
+
+    /// Forgets sent tasks the Mac lists now, or took in and published since, or that are three days old.
+    private func sweepSentTasks(now: Date = Date()) {
+        guard !sentTasks.isEmpty else { return }
+        let before = sentTasks
+        let known = Set((snapshot?.tasks ?? []).map(\.id))
+        let received = Set(records.filter { $0.state == .received }.map(\.id))
+        let generated = snapshot?.generatedAt ?? .distantPast
+        for i in sentTasks.indices where sentTasks[i].receivedAt == nil && received.contains(sentTasks[i].id) {
+            sentTasks[i].receivedAt = now
+        }
+        sentTasks.removeAll { sent in
+            known.contains(sent.id) || (sent.receivedAt.map { generated > $0 } ?? false) || now.timeIntervalSince(sent.sentAt) > 3 * 24 * 3600
+        }
+        if sentTasks != before { saveSentTasks() }
     }
 
     func isCompletedHere(_ id: UUID) -> Bool { completed[id] != nil }
@@ -323,8 +410,11 @@ final class AppModel: ObservableObject {
             try? await Task.sleep(nanoseconds: 5_000_000_000)
             guard !Task.isCancelled, let self else { return }
             self.pendingDeletes[task.id] = nil
-            if self.voice.debriefTask(task.id) != nil, !(self.snapshot?.tasks.contains { $0.id == task.id } ?? false) {
+            let onMac = self.snapshot?.tasks.contains { $0.id == task.id } ?? false
+            if self.voice.debriefTask(task.id) != nil, !onMac {
                 self.voice.removeTask(task.id)
+            } else if self.sentTask(task.id) != nil, !onMac {
+                self.takeBackTask(task.id)
             } else {
                 self.sendTaskDelete(task.id, title: task.title)
             }
@@ -454,6 +544,14 @@ final class AppModel: ObservableObject {
         case "today":
             voice.showDemoCard()
             voice.closeCard()
+            spoken.showDemoResult()
+            spoken.closeCard()
+        case "dictate":
+            spoken.showDemoListening()
+        case "dictated":
+            spoken.showDemoResult()
+        case "composer":
+            composing = ComposerRequest(draft: DemoSeed.composerDraft(now: Date()), expanded: true)
         default:
             break
         }

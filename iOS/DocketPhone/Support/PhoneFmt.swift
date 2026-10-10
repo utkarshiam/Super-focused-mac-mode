@@ -51,6 +51,41 @@ enum PhoneFmt {
         return r == 0 ? "\(h)h" : "\(h)h \(r)m"
     }
 
+    /// A reminder in a menu: "At the time", "15 minutes before", "1 hour before", "1 day before".
+    static func reminder(_ minutes: Int) -> String {
+        switch minutes {
+        case ..<1: return "At the time"
+        case 60: return "1 hour before"
+        case 24 * 60: return "1 day before"
+        case ..<60: return "\(minutes) minutes before"
+        default: return "\(duration(minutes: minutes)) before"
+        }
+    }
+
+    /// A reminder on a task line: "at the time", "15m before".
+    static func reminderShort(_ minutes: Int) -> String {
+        minutes < 1 ? "at the time" : "\(duration(minutes: minutes)) before"
+    }
+
+    /// "Every weekday", "Every week on Fri", "Every 2 weeks on Fri".
+    static func repeatLabel(_ rule: TaskRepeat) -> String {
+        let label = rule.label
+        return label.prefix(1).uppercased() + label.dropFirst()
+    }
+
+    /// Spoken by Siri: "Fri 16 Oct at 3:00 PM", "Fri 16 Oct".
+    static func spokenDue(_ date: Date, hasTime: Bool, now: Date = Date()) -> String {
+        hasTime ? "\(day(date, now: now)) at \(time(date))" : day(date, now: now)
+    }
+
+    /// Recent's second line for a task: "Due Fri 16 Oct · 15:00 · every weekday".
+    static func taskDetail(_ task: DebriefTask) -> String? {
+        var parts: [String] = []
+        if let due = task.dueDate { parts.append("Due \(self.due(due, hasTime: task.dueHasTime))") }
+        if let rule = task.repeatRule { parts.append(rule.label) }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
     /// A recording length: "0:07", "12:40".
     static func clock(_ seconds: TimeInterval) -> String {
         let s = max(0, Int(seconds))
@@ -100,5 +135,14 @@ enum LinkDetector {
     static func host(_ url: String) -> String {
         guard let host = URL(string: url)?.host else { return url }
         return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+    }
+}
+
+extension DebriefTask {
+    /// As a Today line (before the Mac lists it).
+    var asSnapshot: TaskSnapshot {
+        TaskSnapshot(id: id, title: title, dueDate: dueDate, dueHasTime: dueHasTime, scheduledDate: scheduledDate,
+                     estimateMinutes: estimateMinutes, priority: priority, listName: listName,
+                     repeatRule: repeatRule, reminderMinutes: reminderMinutes.flatMap { $0 >= 0 ? $0 : nil }, isAlarm: isAlarm)
     }
 }

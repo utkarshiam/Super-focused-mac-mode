@@ -49,6 +49,7 @@ enum MainMenu {
             item("Today's Daily Note", #selector(AppDelegate.dailyNote(_:)), "d"),
             item("Quick Capture…", #selector(AppDelegate.quickCaptureAction(_:))),
             item("Record Voice Note", #selector(AppDelegate.recordVoiceNoteAction(_:)), "r", [.command, .shift]),
+            item("Dictate a Task", #selector(AppDelegate.dictateTaskAction(_:)), "d", [.command, .shift]),
             .separator(),
             item("Import Data…", #selector(AppDelegate.importData(_:))),
             item("Export Data…", #selector(AppDelegate.exportData(_:))),

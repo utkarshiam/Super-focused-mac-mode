@@ -130,9 +130,14 @@ public struct TaskSnapshot: Identifiable, Hashable, Codable, Sendable {
     /// nil = Inbox.
     public var listName: String?
     public var done: Bool
+    public var repeatRule: TaskRepeat?
+    /// Minutes before the due time of the first reminder (0 = at it); nil = no reminder.
+    public var reminderMinutes: Int?
+    public var isAlarm: Bool
 
     public init(id: UUID, title: String, dueDate: Date? = nil, dueHasTime: Bool = false, scheduledDate: Date? = nil,
-                estimateMinutes: Int? = nil, priority: Int = 0, listName: String? = nil, done: Bool = false) {
+                estimateMinutes: Int? = nil, priority: Int = 0, listName: String? = nil, done: Bool = false,
+                repeatRule: TaskRepeat? = nil, reminderMinutes: Int? = nil, isAlarm: Bool = false) {
         self.id = id
         self.title = title
         self.dueDate = dueDate
@@ -142,10 +147,14 @@ public struct TaskSnapshot: Identifiable, Hashable, Codable, Sendable {
         self.priority = priority
         self.listName = listName
         self.done = done
+        self.repeatRule = repeatRule
+        self.reminderMinutes = reminderMinutes
+        self.isAlarm = isAlarm
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, title, dueDate, dueHasTime, scheduledDate, estimateMinutes, priority, listName, done
+        case repeatRule, reminderMinutes, isAlarm
     }
 
     public init(from decoder: Decoder) throws {
@@ -159,6 +168,9 @@ public struct TaskSnapshot: Identifiable, Hashable, Codable, Sendable {
         priority = c.value(.priority, default: 0)
         listName = c.value(.listName, default: nil)
         done = c.value(.done, default: false)
+        repeatRule = c.value(.repeatRule, default: nil)
+        reminderMinutes = c.value(.reminderMinutes, default: nil)
+        isAlarm = c.value(.isAlarm, default: false)
     }
 }
 

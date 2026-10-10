@@ -34,7 +34,7 @@ Set these environment variables in the scheme (they're there, switched off) or w
 | Variable | Effect |
 | --- | --- |
 | `DOCKET_PHONE_DEMO=1` | Seeds a throwaway Docket folder in the temp directory with sample memories, tasks and recent captures. Your real folder, Keychain and the network are never touched. |
-| `DOCKET_PHONE_TAB=capture\|record\|debrief\|memory\|topics\|map\|ask\|today\|settings` | The tab to start on (`settings` opens the Settings sheet). `record` shows a recording in progress with a live transcript; `debrief` shows a finished result card (Hindi/English, 3 tasks). |
+| `DOCKET_PHONE_TAB=capture\|record\|debrief\|dictate\|dictated\|composer\|memory\|topics\|map\|ask\|today\|settings` | The tab to start on (`settings` opens the Settings sheet). `record` shows a recording in progress with a live transcript; `debrief` shows a finished result card (Hindi/English, 3 tasks). |
 | `DOCKET_PHONE_ITEM=first\|<index>\|<words>` | Opens that memory (the first one, by index, or by words in its title). |
 | `DOCKET_PHONE_ENTITY=<name>` | Opens that topic's, person's or project's page ("Seed round", "Maya Chen"). |
 | `DOCKET_PHONE_SEARCH=<words>` | Starts Memory → Library with that search. |
@@ -62,6 +62,38 @@ merging and moving happen on the Mac, and the phone says so in one quiet line.
   go back); chips hide kinds; the slider steps through the days things first appeared.
 - **Search** in Library also matches topic, people and project names ("Topics & people", above
   the memories).
+
+## Schedule by voice
+
+Say a task instead of typing it: "Call Rohan next Friday at 3 for half an hour, remind me 15 minutes
+before", or "every weekday at 9:30 standup, alarm" (Hindi, English or both).
+
+- **Where:** the mic in the task composer's title, the small mic on Capture's Task tile (or long-press
+  the tile), and Siri ("Schedule a task in Docket", "Add a task in Docket"). The big mic stays "Record a
+  debrief".
+- **Listening:** live words and a level ring; it stops when you tap stop or pause for about 2 seconds.
+- **With a Gemini key:** `SpokenTaskParser` reads the words (with your lists and the names in your
+  memory) and the tasks are added at once. A card on Capture shows each one with its real date and
+  time, length, reminder or alarm, repeat and list. ✕ takes one back, Undo all takes them all back, and
+  a tap opens it in the composer. A task that hasn't left the phone yet is just dropped; otherwise a
+  `taskDelete` goes to the Mac (and an edit is a `taskDelete` plus a new task).
+- **Offline:** the words wait on the phone and are read when the network is back. After 30 minutes
+  they're added as said, with the date and time the phone could read.
+- **No key:** the phone reads the date, time, "for N minutes" and "remind me N minutes before" itself
+  (NSDataDetector) and opens the composer filled in, so it's one tap on Add. When no date was found,
+  your Mac's quick-add parsing has a go when the task arrives.
+- **Siri** says back what it added: "Added Call Rohan for Fri 16 Oct at 3:00 PM."
+
+The composer has the essentials up top (title, date and time with Today/Tomorrow as quick picks,
+length 15m/30m/1h/custom) and the rest behind More: reminder (the Mac's default, none, at the time,
+5/15/30/60 minutes before) with an Alarm switch, repeat (every day, every weekday, every week or every
+2 weeks on the due day, every month, custom days), Do on (separate from the deadline), list and
+priority. Every task is sent as a `.task` envelope with the whole task (`task`), and shows in Today at
+once as "Just added". Today lines show a repeat icon, a bell or alarm with the reminder, and the Do on
+day when it differs from the deadline.
+
+Demo screenshots: `DOCKET_PHONE_TAB=dictate` (listening), `dictated` (the result card), `composer`
+(every field filled).
 
 ## Voice debriefs
 

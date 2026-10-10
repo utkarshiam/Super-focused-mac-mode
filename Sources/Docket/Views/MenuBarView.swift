@@ -21,12 +21,15 @@ struct MenuBarView: View {
     /// "Added for Mon 5 Oct" for a moment, when the new task isn't one of today's below.
     @State private var confirmation: String?
     @FocusState private var focused: Bool
+    /// The mic in the add field (⇧⌘D while the panel is in front).
+    @StateObject private var dictation = TaskDictation(place: .menuBar)
 
     var body: some View {
         let now = app.clock
         let tasks = store.todayTasks(now: now)
         let minutes = tasks.reduce(0) { $0 + $1.remainingMinutes }
-        let showsOptions = focused || !text.trimmingCharacters(in: .whitespaces).isEmpty || options.hasPicks || chipFocused || hoveringOptions
+        let showsOptions = (focused || !text.trimmingCharacters(in: .whitespaces).isEmpty || options.hasPicks || chipFocused || hoveringOptions)
+            && !dictation.showsStatus
 
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .center) {
@@ -68,11 +71,21 @@ struct MenuBarView: View {
                         .textFieldStyle(.plain)
                         .font(.system(size: 14, weight: .medium))
                         .focused($focused)
-                        .onSubmit(add)
+                        .onSubmit { dictation.isListening ? dictation.finish() : add() }
+                        .dictationOverlay(dictation, text: text, font: .system(size: 14, weight: .medium))
+                    DictateButton(dictation: dictation, start: startDictation)
                 }
-                .padding(.horizontal, 10)
+                .padding(.leading, 10)
+                .padding(.trailing, 8)
                 .frame(height: 42)
                 .background(RoundedRectangle(cornerRadius: Radius.md, style: .continuous).fill(Color.fill))
+                .overlay(RoundedRectangle(cornerRadius: Radius.md, style: .continuous)
+                    .strokeBorder(dictation.isListening ? Color.ink.opacity(0.35) : Color.clear, lineWidth: 1.5))
+
+                if dictation.phase != .idle {
+                    DictationStatus(dictation: dictation, maxRows: 3, stacked: true, opened: close)
+                        .transition(.opacity.combined(with: .offset(y: -4)))
+                }
 
                 if showsOptions {
                     let moment = Date()
@@ -83,9 +96,16 @@ struct MenuBarView: View {
                 }
             }
             .animation(Motion.base, value: showsOptions)
+            .animation(Motion.base, value: dictation.phase)
             .padding(.horizontal, Space.lg)
             .padding(.top, Space.lg)
             .padding(.bottom, Space.sm)
+            .onChange(of: app.dictateRequest) { _ in takeDictateRequest() }
+            .onAppear {
+                dictation.isShown = true
+                dictation.announce = { [weak app] in app?.showToast($0) }
+                takeDictateRequest()
+            }
 
             if focus.isActive {
                 FocusMiniCard()
@@ -240,9 +260,22 @@ struct MenuBarView: View {
         QuickParser(now: now, lists: store.lists, workdayEndMinutes: Prefs.workdayEnd)
     }
 
+    private func takeDictateRequest() {
+        guard app.dictateRequest == .menuBar else { return }
+        app.dictateRequest = nil
+        startDictation()
+    }
+
+    /// Dictated tasks without a date are for today here, as the field says.
+    private func startDictation() {
+        dictation.start(field: $text, context: AddContext(day: Date()))
+        focused = true
+    }
+
     private func add() {
         let raw = text.trimmingCharacters(in: .whitespaces)
         guard !raw.isEmpty else { return }
+        dictation.dismiss()
         let now = Date()
         // Undated tasks are for today here, as the field says.
         let task = options.makeTask(parsed: parser(now).parse(raw), context: AddContext(day: now), lists: store.lists, now: now)

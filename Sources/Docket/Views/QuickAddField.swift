@@ -3,12 +3,15 @@ import SwiftUI
 
 // MARK: - Quick add
 
+/// The add-task bar on the Calendar and the task lists: type a task (quick add reads dates, lengths…), pick
+/// from the dropdowns under it, plan with AI (✨, ⌘J), or dictate it (the mic, ⇧⌘D).
 struct QuickAddField: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var app: AppState
     /// In the calendar: the day new tasks land on when no date is typed or picked.
     var day: Date?
     @State private var text = ""
+    @StateObject private var dictation = TaskDictation(place: .main)
     /// The Date, Time, List and More dropdowns. They win over the typed text and reset after each add.
     @State private var options = AddOptions()
     @State private var picker: AddPicker?
@@ -22,7 +25,8 @@ struct QuickAddField: View {
         let now = Date()
         // The dropdowns show while you're adding: the field has focus or text, something is picked,
         // or the pointer or keyboard is on them.
-        let showsOptions = focused || !trimmed.isEmpty || options.hasPicks || picker != nil || chipFocused || hoveringOptions
+        let showsOptions = (focused || !trimmed.isEmpty || options.hasPicks || picker != nil || chipFocused || hoveringOptions)
+            && !dictation.showsStatus
         VStack(alignment: .leading, spacing: Space.sm) {
             HStack(spacing: 10) {
                 Image(systemName: "plus")
@@ -36,12 +40,14 @@ struct QuickAddField: View {
                     .font(.system(size: 15, weight: .medium))
                     .foregroundStyle(Color.ink)
                     .focused($focused)
-                    .onSubmit(add)
+                    .onSubmit { dictation.isListening ? dictation.finish() : add() }
                     .background(GeometryReader { g in
                         Color.clear
                             .onAppear { fieldWidth = g.size.width }
                             .onChange(of: g.size.width) { fieldWidth = $0 }
                     })
+                    .dictationOverlay(dictation, text: text, font: .system(size: 15, weight: .medium))
+                DictateButton(dictation: dictation, start: startDictation)
                 AIQuickAddButton(text: $text, day: day)
                 if !trimmed.isEmpty {
                     KeyCap(text: "↩")
@@ -53,9 +59,15 @@ struct QuickAddField: View {
             .background(RoundedRectangle(cornerRadius: Radius.md, style: .continuous).fill(Color.fill))
             .overlay(
                 RoundedRectangle(cornerRadius: Radius.md, style: .continuous)
-                    .strokeBorder(focused ? Color.ink.opacity(0.35) : Color.clear, lineWidth: 1.5)
+                    .strokeBorder(focused || dictation.isListening ? Color.ink.opacity(0.35) : Color.clear, lineWidth: 1.5)
             )
             .animation(Motion.fast, value: focused)
+
+            // Dictating: listening, scheduling, what it added, or why not (in place of the dropdowns).
+            if dictation.showsStatus {
+                DictationStatus(dictation: dictation)
+                    .transition(.opacity.combined(with: .offset(y: -4)))
+            }
 
             // What the task will get, as dropdowns (they replace the old parse preview).
             if showsOptions {
@@ -64,15 +76,44 @@ struct QuickAddField: View {
                     .onHover { hoveringOptions = $0 }
                     .transition(.opacity.combined(with: .offset(y: -4)))
             }
+            // No key: the words are in the field as text, with a line saying so.
+            if dictation.phase == .typed {
+                DictationStatus(dictation: dictation)
+            }
         }
         .animation(Motion.base, value: trimmed.isEmpty)
         .animation(Motion.base, value: showsOptions)
+        .animation(Motion.base, value: dictation.phase)
         .onChange(of: app.focusQuickAdd) { _ in focused = true }
         // The list pages share this field; picks made for one page's defaults don't carry over to the next.
         .onChange(of: app.selection) { _ in
             options.reset()
             picker = nil
+            dictation.dismiss()
         }
+        // ⇧⌘D, from the menu or anywhere in the window.
+        .onChange(of: app.dictateRequest) { _ in takeDictateRequest() }
+        .onAppear {
+            dictation.isShown = true
+            takeDictateRequest()
+        }
+        .onDisappear {
+            dictation.isShown = false
+            // Leaving the page mid-sentence: what was said is still scheduled (and announced).
+            dictation.finish()
+        }
+    }
+
+    private func takeDictateRequest() {
+        guard app.dictateRequest == .main else { return }
+        app.dictateRequest = nil
+        startDictation()
+    }
+
+    private func startDictation() {
+        dictation.announce = { [weak app] in app?.showToast($0) }
+        dictation.start(field: $text, context: context)
+        focused = true
     }
 
     /// What this page gives a new task: the Calendar's day, a list, a tag, or High on Important.
@@ -100,6 +141,7 @@ struct QuickAddField: View {
         let task = options.makeTask(parsed: parser(now).parse(text), context: context, lists: store.lists, now: now)
         let added = withAnimation(Motion.gentle) { store.addTask(task) }
         text = ""
+        dictation.dismiss()
         // Picks are for one task; the page's own defaults (its list, its day) come back by themselves.
         options.reset()
         focused = true

@@ -192,8 +192,10 @@ private struct TaskLine: View {
                     .foregroundStyle(done ? Color.ink3 : Color.ink)
                     .strikethrough(done, color: Color.ink3)
                     .lineLimit(2)
-                if let sub = subtitle {
-                    Text(sub).font(.system(size: 12.5, weight: .medium)).foregroundStyle(Color.ink3).lineLimit(1)
+                if done {
+                    Text("Sent to your Mac").font(.system(size: 12.5, weight: .medium)).foregroundStyle(Color.ink3).lineLimit(1)
+                } else if let meta = TaskMeta.text(task, extra: extra, now: now) {
+                    meta.font(.system(size: 12.5, weight: .medium)).foregroundStyle(Color.ink3).lineLimit(2)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -214,14 +216,11 @@ private struct TaskLine: View {
         .padding(.vertical, 6)
     }
 
-    private var subtitle: String? {
-        if done { return "Sent to your Mac" }
-        var parts: [String] = []
-        if let local = model.voice.debriefTask(task.id), model.isPendingFromVoice(task.id) {
-            parts.append("Just added")
-            if let waiting = local.waitingOn { parts.append("Waiting on \(waiting)") }
-        }
-        if let list = task.listName { parts.append(list) }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    /// "Just added" (and who it waits on) for a task sent from here the Mac doesn't list yet.
+    private var extra: [String] {
+        guard model.isJustAdded(task.id) else { return [] }
+        var parts = ["Just added"]
+        if let waiting = (model.voice.debriefTask(task.id) ?? model.sentTask(task.id))?.waitingOn { parts.append("Waiting on \(waiting)") }
+        return parts
     }
 }

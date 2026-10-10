@@ -16,11 +16,21 @@ final class Dictation: ObservableObject {
     /// Stops by itself after this long, in case it's forgotten.
     static let maxDuration: TimeInterval = 120
 
+    /// Set to stop by itself once the speaker pauses this long after saying something (and after 10 s of
+    /// hearing nothing). `onAutoStop` then gets the words.
+    var silenceStop: TimeInterval?
+    /// Input above this (0…1, about -20 dBFS) counts as someone speaking.
+    static let speechLevel = 0.6
+    /// Called after a stop the user didn't ask for (a pause, nothing heard, the time limit) with the words.
+    var onAutoStop: ((String) -> Void)?
+
     private let engine = AVAudioEngine()
     private var transcriber: LiveTranscriber?
     private var levelBox = LevelBox()
     private var timer: Timer?
     private var startedAt = Date()
+    /// When the words last changed.
+    private var lastHeardAt = Date()
 
     /// Starts listening. Returns a sentence when it can't.
     func start() async -> String? {
@@ -35,6 +45,7 @@ final class Dictation: ObservableObject {
         let transcriber = LiveTranscriber { [weak self] words in
             Task { @MainActor in
                 guard let self, self.isActive else { return }
+                if words != self.text { self.lastHeardAt = Date() }
                 self.text = words
             }
         }
@@ -66,13 +77,23 @@ final class Dictation: ObservableObject {
         self.transcriber = transcriber
         text = ""
         startedAt = Date()
+        lastHeardAt = startedAt
         isActive = true
         Haptics.tap()
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.isActive else { return }
                 self.level = self.levelBox.take()
-                if Date().timeIntervalSince(self.startedAt) > Self.maxDuration { _ = await self.stop() }
+                let now = Date()
+                // Still talking (loud input) counts as hearing words even before the recognizer catches up; a
+                // pause is measured from the last new words or speech-level sound, never from recognizer finals.
+                if self.level > Self.speechLevel { self.lastHeardAt = now }
+                let heard = !self.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                let paused = self.silenceStop.map { heard ? now.timeIntervalSince(self.lastHeardAt) > $0 : now.timeIntervalSince(self.startedAt) > 10 } ?? false
+                if paused || now.timeIntervalSince(self.startedAt) > Self.maxDuration {
+                    let words = await self.stop()
+                    self.onAutoStop?(words)
+                }
             }
         }
         return nil

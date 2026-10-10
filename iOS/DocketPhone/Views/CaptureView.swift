@@ -14,7 +14,8 @@ struct CaptureView: View {
     @StateObject private var dictation = Dictation()
     /// The text before dictation started; heard words are added after it.
     @State private var textBeforeDictation = ""
-    @State private var showTask = false
+    /// The field's text when the Task tile opened the composer with it.
+    @State private var textForTask: String?
     @State private var showPhotoChoice = false
     @State private var showPhotos = false
     @State private var photoItems: [PhotosPickerItem] = []
@@ -28,6 +29,7 @@ struct CaptureView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: Space.xl) {
+                    SpokenCardSlot(spoken: model.spoken)
                     VoiceCardSlot(voice: model.voice)
                     RecordButtonCard()
                     editor
@@ -43,9 +45,10 @@ struct CaptureView: View {
             .paperBackground()
             .navigationTitle("Capture")
             .toolbar { ToolbarItem(placement: .topBarTrailing) { SettingsButton() } }
-            .sheet(isPresented: $showTask) {
-                TaskComposer(initialTitle: trimmed) { title, due, hasTime in saveTask(title, due: due, hasTime: hasTime) }
-                    .presentationDetents([.medium, .large])
+            .sheet(item: $model.composing) { request in
+                TaskComposer(draft: request.draft, expanded: request.expanded) { task in saveTask(task) }
+                    .environmentObject(model)
+                    .presentationDetents(request.expanded ? [.large] : [.medium, .large])
                     .presentationBackground(Color.paper)
             }
             .photosPicker(isPresented: $showPhotos, selection: $photoItems, maxSelectionCount: 10,
@@ -144,7 +147,16 @@ struct CaptureView: View {
             }
             ToolButton(symbol: "doc", title: "File") { focused = false; showFiles = true }
             ToolButton(symbol: "link", title: "Paste link") { pasteLink() }
-            ToolButton(symbol: "checkmark.circle", title: "Task") { focused = false; showTask = true }
+            TaskToolButton {
+                focused = false
+                dictation.cancel()
+                textForTask = trimmed.isEmpty ? nil : trimmed
+                model.composing = ComposerRequest(draft: trimmed.isEmpty ? DebriefTask(title: "") : TaskTextParser.draft(trimmed))
+            } speak: {
+                focused = false
+                dictation.cancel()
+                Task { await model.spoken.startListening() }
+            }
         }
     }
 
@@ -240,10 +252,11 @@ struct CaptureView: View {
         text = trimmed.isEmpty ? found : trimmed + "\n" + found
     }
 
-    private func saveTask(_ title: String, due: Date?, hasTime: Bool) {
-        if trimmed == title.trimmingCharacters(in: .whitespacesAndNewlines) { text = "" }
-        model.capture(CaptureEnvelope(kind: .task, title: title, due: due, dueHasTime: hasTime),
-                      title: title, detail: due.map { "Due \(PhoneFmt.due($0, hasTime: hasTime))" })
+    private func saveTask(_ task: DebriefTask) {
+        // The field's text became this task.
+        if let used = textForTask, used == trimmed { text = "" }
+        textForTask = nil
+        model.addTask(task)
     }
 
     private func savePhotos(_ items: [PhotosPickerItem]) {
@@ -306,6 +319,55 @@ private struct ToolButton: View {
             .background(RoundedRectangle(cornerRadius: Radius.md, style: .continuous).fill(Color.fill))
         }
         .buttonStyle(PressScale(scale: 0.95))
+    }
+}
+
+/// The Task tile: tap for the composer, long-press or the small mic to say the task instead.
+private struct TaskToolButton: View {
+    let open: () -> Void
+    let speak: () -> Void
+    @State private var pressed = false
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "checkmark.circle")
+                .font(.system(size: 19, weight: .medium))
+                .frame(height: 22)
+            Text("Task")
+                .font(.system(size: 11.5, weight: .semibold))
+                .lineLimit(1)
+        }
+        .foregroundStyle(Color.ink)
+        .frame(maxWidth: .infinity)
+        .frame(height: 66)
+        .background(RoundedRectangle(cornerRadius: Radius.md, style: .continuous).fill(Color.fill))
+        .contentShape(RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
+        .scaleEffect(pressed ? 0.95 : 1)
+        .opacity(pressed ? 0.85 : 1)
+        .animation(pressed ? Motion.instant : Motion.press, value: pressed)
+        .onTapGesture(perform: open)
+        .onLongPressGesture(minimumDuration: 0.4, perform: {
+            Haptics.tap()
+            speak()
+        }, onPressingChanged: { pressed = $0 })
+        .overlay(alignment: .topTrailing) {
+            Button(action: speak) {
+                Image(systemName: "mic.fill")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(Color.ink)
+                    .frame(width: 24, height: 24)
+                    .background(Circle().fill(Color.card))
+                    .overlay(Circle().strokeBorder(Color.hair, lineWidth: 1))
+                    .padding(5)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(PressScale(scale: 0.88))
+            .accessibilityLabel("Speak a task")
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityLabel("Task")
+        .accessibilityAction(named: "Speak a task", speak)
     }
 }
 

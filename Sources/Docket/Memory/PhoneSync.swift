@@ -10,7 +10,7 @@ import MemoryKit
 ///   complete, reopen or delete it, and a voice note becomes its tasks and a memory (`VoiceIntake`).
 /// - **Out**: ten seconds after memory, the brain or the tasks change, the library and brain are published for the phone
 ///   (`PhoneBridge.publish`) with the tasks it shows (open ones overdue, today and the next 7 days, recent ones
-///   from voice notes, and today's finished ones) and the list names.
+///   from voice notes, dictation and the phone, and today's finished ones) and the list names.
 /// Never runs in tests or screenshot mode (`isAllowed`), so iCloud Drive is never touched there.
 @MainActor
 final class PhoneSync: ObservableObject {
@@ -154,18 +154,37 @@ final class PhoneSync: ObservableObject {
         noteSynced(now)
     }
 
-    /// A task envelope from the phone: "task" adds a task (the due date it carries, or one read from its title
-    /// as quick add would), "taskDone" completes one, "taskUndone" reopens it, "taskDelete" deletes it (and the
-    /// ledger remembers, so a voice note arriving late doesn't bring it back). True when it's dealt with (a task
-    /// that's gone counts).
+    /// A task envelope from the phone: "task" adds a task (everything the phone parsed when it carries a `task`,
+    /// as dictated scheduling does; else the due date it carries, or one read from its title as quick add
+    /// would), "taskDone" completes one, "taskUndone" reopens it, "taskDelete" deletes it (and the ledger
+    /// remembers, so a voice note arriving late doesn't bring it back). True when it's dealt with (a task that's
+    /// gone counts).
     @discardableResult
     static func apply(_ env: CaptureEnvelope, to store: Store, ledger: VoiceLedger? = nil, now: Date = Date()) -> Bool {
         switch env.kind {
         case .task:
             let raw = (env.title ?? env.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !raw.isEmpty else { return true }
+            let spokenTitle = env.task?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !raw.isEmpty || !spokenTitle.isEmpty else { return true }
+            // The phone shows the task under the envelope's id until the next snapshot (an edited voice-note
+            // task comes back this way too), so the Mac keeps that id; a repeat or deleted one isn't re-added.
+            guard store.task(env.id) == nil, ledger?.isDeleted(env.id) != true else { return true }
             var task: TaskItem
-            if let due = env.due {
+            if var spoken = env.task {
+                spoken.id = env.id
+                if spokenTitle.isEmpty { spoken.title = raw }
+                // Not scheduled on the phone (no key there, or Siri): quick add reads the title, filling in what
+                // the payload left open ("call bank fri 3pm" → Fri 15:00).
+                var parsedList: UUID?
+                if spoken.dueDate == nil {
+                    let parser = QuickParser(now: now, lists: store.lists, workdayEndMinutes: Prefs.workdayEnd)
+                    let parsed = parser.parse(spoken.title)
+                    Self.fill(&spoken, from: parsed)
+                    parsedList = parsed.listID
+                }
+                task = VoiceIntake.task(from: spoken, recordedAt: env.createdAt, store: store, fromVoiceNote: false)
+                if task.listID == nil { task.listID = parsedList }
+            } else if let due = env.due {
                 task = TaskItem(title: raw)
                 task.dueHasTime = env.dueHasTime
                 task.dueDate = env.dueHasTime ? due : store.calendar.startOfDay(for: due)
@@ -177,12 +196,14 @@ final class PhoneSync: ObservableObject {
                 task = TaskItem(parsed: parser.parse(raw), defaultReminder: Prefs.defaultReminder, defaultIsAlarm: Prefs.defaultReminderIsAlarm)
                 if task.title.isEmpty { task.title = raw }
             }
-            if let text = env.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty, text != raw { task.notes = text }
-            // The phone shows the task under the envelope's id until the next snapshot (an edited voice-note
-            // task comes back this way too), so the Mac keeps that id; a repeat or deleted one isn't re-added.
+            if task.notes.isEmpty, let text = env.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty,
+               text != raw, text != task.title {
+                task.notes = text
+            }
             task.id = env.id
-            guard store.task(env.id) == nil, ledger?.isDeleted(env.id) != true else { return true }
             store.addTask(task)
+            // On the phone's list whatever its date, so it doesn't vanish there when the snapshot comes back.
+            ledger?.noteAdded([env.id], at: now)
             return true
         case .taskDone:
             if let id = env.taskID, let t = store.task(id), !t.isCompleted { store.setCompleted(id, true) }
@@ -198,6 +219,23 @@ final class PhoneSync: ObservableObject {
         default:
             return false
         }
+    }
+
+    /// What quick add read from a phone task's title, for whatever the phone's payload didn't say.
+    static func fill(_ t: inout DebriefTask, from p: ParsedTask) {
+        if !p.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { t.title = p.title }
+        if t.dueDate == nil, let due = p.dueDate {
+            t.dueDate = due
+            t.dueHasTime = p.dueHasTime
+        }
+        if t.estimateMinutes == nil { t.estimateMinutes = p.estimateMinutes }
+        if t.priority == 0 { t.priority = p.priority.rawValue }
+        if t.repeatRule == nil { t.repeatRule = p.recurrence?.taskRepeat }
+        if t.reminderMinutes == nil, let r = p.reminders.first {
+            t.reminderMinutes = r.minutesBefore
+            t.isAlarm = t.isAlarm || r.isAlarm
+        }
+        for tag in p.tags where !t.tags.contains(where: { $0.caseInsensitiveCompare(tag) == .orderedSame }) { t.tags.append(tag) }
     }
 
     // MARK: Out
@@ -262,8 +300,24 @@ final class PhoneSync: ObservableObject {
         return (open + done).map { t in
             TaskSnapshot(id: t.id, title: t.title, dueDate: t.dueDate, dueHasTime: t.dueHasTime, scheduledDate: t.scheduledDate,
                          estimateMinutes: t.estimateMinutes, priority: t.priority.rawValue, listName: store.list(t.listID)?.name,
-                         done: t.isCompleted)
+                         done: t.isCompleted, repeatRule: t.recurrence?.taskRepeat,
+                         reminderMinutes: reminderMinutes(t, calendar: cal), isAlarm: t.reminders.contains { $0.isAlarm && !$0.isSnooze })
         }
+    }
+
+    /// How long before the due time the task's first reminder rings (0 = at it), as the phone shows it; nil
+    /// without one (snoozes don't count). A reminder at a set time counts when it's before the deadline.
+    static func reminderMinutes(_ t: TaskItem, allDayHour: Int = Prefs.allDayHour, calendar: Calendar = .current) -> Int? {
+        for r in t.reminders where !r.isSnooze {
+            switch r.trigger {
+            case .beforeDue(let minutes):
+                return max(0, minutes)
+            case .absolute(let date):
+                guard let due = t.dueDateTime(allDayHour: allDayHour, calendar: calendar), date <= due else { continue }
+                return Int((due.timeIntervalSince(date) / 60).rounded())
+            }
+        }
+        return nil
     }
 
     private func noteSynced(_ date: Date) {

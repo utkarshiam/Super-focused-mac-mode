@@ -6,7 +6,8 @@ import MemoryKit
 
 /// What Docket remembers about voice notes beside the memories themselves, in `<library>/voice.json`:
 /// which tasks each voice note made (so its memory can list them, and the phone's task list can include
-/// them), and the ids of voice tasks that were deleted (so a late or repeated envelope never brings one back).
+/// them), the tasks dictated or added on the phone (the phone's list includes those too), and the ids of
+/// voice tasks that were deleted (so a late or repeated envelope never brings one back).
 @MainActor
 final class VoiceLedger: ObservableObject {
     struct Entry: Codable, Hashable {
@@ -18,11 +19,29 @@ final class VoiceLedger: ObservableObject {
     private struct FileContents: Codable {
         var entries: [Entry] = []
         var deleted: [UUID: Date] = [:]
+        var added: [UUID: Date] = [:]
+
+        init(entries: [Entry], deleted: [UUID: Date], added: [UUID: Date]) {
+            self.entries = entries
+            self.deleted = deleted
+            self.added = added
+        }
+
+        private enum CodingKeys: String, CodingKey { case entries, deleted, added }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            entries = c.value(.entries, default: [])
+            deleted = c.value(.deleted, default: [:])
+            added = c.value(.added, default: [:])
+        }
     }
 
     let fileURL: URL
     @Published private(set) var entries: [Entry] = []
     private(set) var deleted: [UUID: Date] = [:]
+    /// Tasks dictated here or added on the phone, and when (kept as long as deleted ids).
+    private(set) var added: [UUID: Date] = [:]
 
     /// Deleted ids are kept this long (long after any envelope could still arrive).
     static let deletedKeep: TimeInterval = 90 * 86_400
@@ -32,6 +51,7 @@ final class VoiceLedger: ObservableObject {
         if let data = try? Data(contentsOf: fileURL), let file = try? MemoryCoding.decoder.decode(FileContents.self, from: data) {
             entries = file.entries
             deleted = file.deleted
+            added = file.added
         }
     }
 
@@ -40,6 +60,13 @@ final class VoiceLedger: ObservableObject {
     func markDeleted(_ ids: [UUID], at date: Date = Date()) {
         guard !ids.isEmpty else { return }
         for id in ids { deleted[id] = date }
+        save()
+    }
+
+    /// Records tasks scheduled by dictation or from the phone, so the phone's list shows them whatever their date.
+    func noteAdded(_ ids: [UUID], at date: Date = Date()) {
+        guard !ids.isEmpty else { return }
+        for id in ids { added[id] = date }
         save()
     }
 
@@ -63,15 +90,16 @@ final class VoiceLedger: ObservableObject {
         entries.first { $0.taskIDs.contains(taskID) }?.itemID
     }
 
-    /// Tasks from voice notes made since `date`.
+    /// Tasks from voice notes, dictation and the phone made since `date`.
     func taskIDs(since date: Date) -> Set<UUID> {
-        Set(entries.filter { $0.createdAt >= date }.flatMap(\.taskIDs))
+        Set(entries.filter { $0.createdAt >= date }.flatMap(\.taskIDs)).union(added.filter { $0.value >= date }.keys)
     }
 
     private func save() {
         let cutoff = Date().addingTimeInterval(-Self.deletedKeep)
         deleted = deleted.filter { $0.value >= cutoff }
-        let file = FileContents(entries: entries, deleted: deleted)
+        added = added.filter { $0.value >= cutoff }
+        let file = FileContents(entries: entries, deleted: deleted, added: added)
         do {
             try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             try MemoryCoding.encoder.encode(file).write(to: fileURL, options: .atomic)
@@ -191,22 +219,61 @@ final class VoiceIntake {
         return tasks.map(\.id)
     }
 
-    /// One Store task for a debrief task: same id, the voice note in its notes, the list by name.
-    static func task(from t: DebriefTask, recordedAt: Date, store: Store) -> TaskItem {
+    /// One Store task for a debrief task (a voice note's, a dictated one, or the phone's): same id, the list by
+    /// name, and everything it was scheduled with. A voice note's tasks say where they came from in their notes.
+    /// - The deadline (or time slot) is the task's due date; "Do on" is only its plan day and never moves it.
+    /// - A repeat without a date starts on its first day from `recordedAt`.
+    /// - Reminder: the minutes asked for (0 = at the time), an alarm when asked; nothing asked (nil) means the
+    ///   app's default, and only for a task with a time; below 0 means none at all. Without a deadline, a
+    ///   reminder rings on the "Do on" day.
+    static func task(from t: DebriefTask, recordedAt: Date, store: Store, fromVoiceNote: Bool = true,
+                     defaultReminder: Int = Prefs.defaultReminder, defaultIsAlarm: Bool = Prefs.defaultReminderIsAlarm,
+                     allDayHour: Int = Prefs.allDayHour) -> TaskItem {
+        let cal = store.calendar
         var task = TaskItem(title: t.title.trimmingCharacters(in: .whitespacesAndNewlines))
         task.id = t.id
-        task.notes = VoiceText.taskNotes(t.notes, recordedAt: recordedAt)
+        task.notes = fromVoiceNote ? VoiceText.taskNotes(t.notes, recordedAt: recordedAt)
+                                   : t.notes.trimmingCharacters(in: .whitespacesAndNewlines)
         if let due = t.dueDate {
             task.dueHasTime = t.dueHasTime
-            task.dueDate = t.dueHasTime ? due : store.calendar.startOfDay(for: due)
-            if t.dueHasTime, Prefs.defaultReminder >= 0 {
-                task.reminders = [Reminder(trigger: .beforeDue(minutes: Prefs.defaultReminder), isAlarm: Prefs.defaultReminderIsAlarm)]
+            task.dueDate = t.dueHasTime ? due : cal.startOfDay(for: due)
+        }
+        if let rule = t.repeatRule {
+            let recurrence = Recurrence(rule)
+            task.recurrence = recurrence
+            if task.dueDate == nil {
+                task.dueDate = recurrence.firstOccurrence(onOrAfter: recordedAt, calendar: cal)
+                task.dueHasTime = false
             }
         }
+        if let doOn = t.scheduledDate { task.scheduledDate = cal.startOfDay(for: doOn) }
+
+        // Below 0: "no reminder" was picked (the phone's "None"), so not even the default.
+        let asked = t.reminderMinutes.map { max(0, $0) }
+        if let minutes = t.reminderMinutes, minutes < 0 {
+            task.reminders = []
+        } else if task.dueDate != nil {
+            if let minutes = asked {
+                task.reminders = [Reminder(trigger: .beforeDue(minutes: minutes), isAlarm: t.isAlarm)]
+            } else if t.isAlarm {
+                // "Alarm" with no time to it: the default lead for a timed task, the all-day hour otherwise.
+                task.reminders = [Reminder(trigger: .beforeDue(minutes: task.dueHasTime ? max(0, defaultReminder) : 0), isAlarm: true)]
+            } else if task.dueHasTime, defaultReminder >= 0 {
+                task.reminders = [Reminder(trigger: .beforeDue(minutes: defaultReminder), isAlarm: defaultIsAlarm)]
+            }
+        } else if let doOn = task.scheduledDate, asked != nil || t.isAlarm,
+                  let morning = cal.date(bySettingHour: allDayHour, minute: 0, second: 0, of: doOn) {
+            task.reminders = [Reminder(trigger: .absolute(morning.addingTimeInterval(-Double(asked ?? 0) * 60)), isAlarm: t.isAlarm)]
+        }
+
         if let minutes = t.estimateMinutes, minutes > 0 { task.estimateMinutes = minutes }
         task.priority = Priority(rawValue: max(0, min(4, t.priority))) ?? .none
         if let waiting = t.waitingOn?.trimmingCharacters(in: .whitespacesAndNewlines), !waiting.isEmpty { task.waitingOn = waiting }
         task.listID = list(named: t.listName, in: store.lists)?.id
+        for tag in t.tags {
+            let clean = tag.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !clean.isEmpty, !task.tags.contains(clean) { task.tags.append(clean) }
+        }
         return task
     }
 
@@ -329,6 +396,21 @@ final class VoiceIntake {
         guard let url, let data = try? Data(contentsOf: url, options: .mappedIfSafe), !data.isEmpty,
               data.count <= MemoryInlinePart.maxBytes else { return nil }
         return MemoryInlinePart(mimeType: MimeType.forExtension(url.pathExtension), data: data)
+    }
+}
+
+// MARK: - Repeat rules
+
+extension Recurrence {
+    /// A repeat rule from the phone or Gemini (same numbers: 1 = Sunday … 7 = Saturday).
+    init(_ rule: TaskRepeat) {
+        let frequency = Frequency(rawValue: rule.frequency.rawValue) ?? .weekly
+        self.init(frequency: frequency, interval: rule.interval, weekdays: frequency == .weekly ? rule.weekdays : [])
+    }
+
+    /// The same rule for the phone.
+    var taskRepeat: TaskRepeat {
+        TaskRepeat(frequency: TaskRepeat.Frequency(rawValue: frequency.rawValue) ?? .weekly, interval: interval, weekdays: weekdays)
     }
 }
 

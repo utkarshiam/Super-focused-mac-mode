@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import MemoryKit
 import Speech
 
 /// Why recording or dictation couldn't start, in a sentence.
@@ -68,7 +69,9 @@ enum VoicePermissions {
 
 /// On-device speech recognition from the microphone (Apple's, no network when the language supports it), as
 /// rough text while someone speaks. Server recognition stops after about a minute, so a new request picks up
-/// where the last one ended.
+/// where the last one ended. The running text is a `TranscriptAccumulator`: after a long pause the recognizer
+/// starts a new utterance whose partials hold only the new words, and an ended request can still deliver a late
+/// result; the accumulator keeps what was said and ignores results from requests that were replaced.
 @MainActor
 final class LiveTranscriber {
     /// The text so far (called on the main actor).
@@ -80,12 +83,13 @@ final class LiveTranscriber {
     private var recognizer: SFSpeechRecognizer?
     private let box = RequestBox()
     private var task: SFSpeechRecognitionTask?
-    private var committed = ""
-    private var current = ""
+    private var transcript = TranscriptAccumulator()
+    /// The current request heard something (a request that keeps ending empty is an error: not restarted forever).
+    private var heardInRequest = false
     private var emptyRestarts = 0
     private(set) var isRunning = false
 
-    var text: String { [committed, current].filter { !$0.isEmpty }.joined(separator: " ") }
+    var text: String { transcript.text }
 
     /// Starts listening. Throws when speech recognition isn't available or the input won't start.
     func start(locale: Locale = .current) throws {
@@ -94,8 +98,7 @@ final class LiveTranscriber {
             throw VoiceError.speechUnavailable
         }
         self.recognizer = recognizer
-        committed = ""
-        current = ""
+        transcript.reset()
         emptyRestarts = 0
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
@@ -125,31 +128,31 @@ final class LiveTranscriber {
         task = nil
     }
 
+    /// A new request, its results tagged with a new generation (what the old one heard is kept; its late
+    /// results are ignored).
     private func beginRequest() {
         guard isRunning, let recognizer else { return }
+        task?.finish()
+        let generation = transcript.restart()
+        heardInRequest = false
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
         if recognizer.supportsOnDeviceRecognition { request.requiresOnDeviceRecognition = true }
         request.addsPunctuation = true
         box.request = request
-        task = recognizer.recognitionTask(with: request, resultHandler: Self.handler { [weak self] text, isFinal in
-            DispatchQueue.main.async { self?.received(text, isFinal: isFinal) }
+        task = recognizer.recognitionTask(with: request, resultHandler: Self.handler { [weak self] text, start, isFinal in
+            DispatchQueue.main.async { self?.received(text, start: start, isFinal: isFinal, generation: generation) }
         })
     }
 
-    private func received(_ text: String?, isFinal: Bool) {
-        guard isRunning else { return }
-        if let text { current = text }
+    private func received(_ text: String?, start: TimeInterval?, isFinal: Bool, generation: Int) {
+        guard isRunning, generation == transcript.generation else { return }
+        if let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { heardInRequest = true }
+        transcript.receive(text ?? "", generation: generation, start: start, isFinal: isFinal)
         if isFinal {
-            // The recognizer stopped (a server time limit, a long pause): keep what it heard, listen on. One
-            // that keeps ending without hearing anything (an error) is left alone.
-            if current.isEmpty {
-                emptyRestarts += 1
-            } else {
-                committed = committed.isEmpty ? current : committed + " " + current
-                emptyRestarts = 0
-            }
-            current = ""
+            // The recognizer stopped (a server time limit, a long pause, an error): keep what it heard, listen on
+            // with a new request. One that keeps ending without hearing anything (an error) is left alone.
+            emptyRestarts = heardInRequest ? 0 : emptyRestarts + 1
             if emptyRestarts < 3 { beginRequest() }
         }
         onText?(self.text)
@@ -163,9 +166,12 @@ final class LiveTranscriber {
         }
     }
 
-    private nonisolated static func handler(_ send: @escaping @Sendable (String?, Bool) -> Void) -> (SFSpeechRecognitionResult?, Error?) -> Void {
+    /// Text, when its first segment starts in the request's audio, and whether the request ended (a final
+    /// result or an error).
+    private nonisolated static func handler(_ send: @escaping @Sendable (String?, TimeInterval?, Bool) -> Void) -> (SFSpeechRecognitionResult?, Error?) -> Void {
         { result, error in
-            send(result?.bestTranscription.formattedString, result?.isFinal ?? (error != nil))
+            send(result?.bestTranscription.formattedString, result?.bestTranscription.segments.first?.timestamp,
+                 (result?.isFinal ?? false) || error != nil)
         }
     }
 }

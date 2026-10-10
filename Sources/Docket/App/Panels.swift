@@ -64,6 +64,14 @@ final class StatusItemController: NSObject {
     init(delegate: AppDelegate) {
         self.delegate = delegate
         super.init()
+        // Dictating in the panel's add field: the microphone prompt mustn't close it, nor a click elsewhere
+        // while it listens. Esc or the icon still close it, cancelling what's being heard.
+        panel.staysOpen = { TaskDictation.current.map { $0.place == .menuBar && $0.isBusy } ?? false }
+        panel.onHide = {
+            guard let dictation = TaskDictation.current, dictation.place == .menuBar else { return }
+            dictation.isShown = false
+            if dictation.isListening { dictation.cancel() }
+        }
     }
 
     /// Built fresh on every open so it always matches the current light/dark appearance
@@ -210,12 +218,15 @@ final class QuickCaptureController {
     private let panel = QuickCapturePanel(size: NSSize(width: 640, height: VoiceCaptureLayout.base))
     /// The voice note under way, kept across openings so closing the panel never loses a recording.
     let voice: VoiceCaptureModel
+    /// Task mode's dictation, kept across openings like the voice note.
+    let dictation = TaskDictation(place: .capture)
 
     init(delegate: AppDelegate) {
         self.delegate = delegate
         voice = VoiceCaptureModel(intake: MemoryCenter.shared.voice)
         panel.level = .modalPanel
-        panel.staysOpen = { [weak voice] in voice?.isBusy ?? false }
+        panel.staysOpen = { [weak voice, weak dictation] in (voice?.isBusy ?? false) || (dictation?.isBusy ?? false) }
+        dictation.announce = { [weak delegate] in delegate?.app.showToast($0) }
         panel.onHide = { [weak self] in self?.panelHidden() }
         voice.announce = { [weak delegate] outcome in
             guard let delegate else { return }
@@ -240,9 +251,12 @@ final class QuickCaptureController {
     }
 
     /// Hidden by Esc, a click elsewhere or the shortcut: a recording is stopped and saved (never thrown
-    /// away), a finished result is dismissed.
+    /// away), a finished result is dismissed. Dictation still listening is cancelled (as Esc does); one
+    /// already scheduling finishes and is announced.
     private func panelHidden() {
         voice.isPresented = false
+        dictation.isShown = false
+        if dictation.isListening { dictation.cancel() } else { dictation.dismiss() }
         switch voice.phase {
         case .recording: voice.stop()
         case .starting: voice.cancel()
@@ -263,11 +277,13 @@ final class QuickCaptureController {
     func show() {
         guard let delegate else { return }
         // Fresh view each time so the field starts empty and focused.
-        panel.contentView = NSHostingView(rootView: CapturePanelView(voice: voice, close: { [weak self] in self?.panel.hide() },
+        panel.contentView = NSHostingView(rootView: CapturePanelView(voice: voice, dictation: dictation,
+                                                                     close: { [weak self] in self?.panel.hide() },
                                                                      resize: { [weak self] h in self?.resize(to: h) })
             .environmentObject(delegate.store)
             .environmentObject(delegate.app))
         voice.isPresented = true
+        dictation.isShown = true
         let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main
         if let frame = screen?.visibleFrame {
             let height = voice.panelHeight

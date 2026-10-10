@@ -5,11 +5,13 @@ import UniformTypeIdentifiers
 
 /// Spotlight-style capture panel opened by the global shortcut: a task, a note, or something to remember
 /// (text, a link, or files dropped on it). ⇥ switches between them; the last one used comes back next time.
-/// The mic records a voice note (any mode): the panel grows for the recording and its result.
+/// The mic dictates a task in Task mode (the words fill the field, then Gemini schedules them) and records a
+/// voice note in Note and Memory mode: the panel grows for the recording, and for either's result.
 struct CapturePanelView: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var app: AppState
     @ObservedObject var voice: VoiceCaptureModel
+    @ObservedObject var dictation: TaskDictation
     var close: () -> Void
     /// The panel's height changed (recording, a result).
     var resize: (CGFloat) -> Void = { _ in }
@@ -41,7 +43,7 @@ struct CapturePanelView: View {
         }
         .padding(.horizontal, Space.xxl)
         .padding(.vertical, Space.xl)
-        .frame(width: 640, height: voice.panelHeight, alignment: .topLeading)
+        .frame(width: 640, height: panelHeight, alignment: .topLeading)
         .floatingPanelChrome()
         .overlay {
             if dropTargeted {
@@ -55,17 +57,22 @@ struct CapturePanelView: View {
         .onChange(of: mode) { m in
             if !DebugSnapshot.isActive { UserDefaults.standard.set(m.rawValue, forKey: Prefs.Key.captureMode) }
         }
-        .onChange(of: voice.panelHeight) { h in resize(h) }
+        .onChange(of: panelHeight) { h in resize(h) }
         .onChange(of: voice.isActive) { active in
             if !active { DispatchQueue.main.async { focused = true } }
         }
+        // ⇧⌘D while the panel is in front.
+        .onChange(of: app.dictateRequest) { _ in takeDictateRequest() }
         .onAppear {
-            resize(voice.panelHeight)
+            resize(panelHeight)
             DispatchQueue.main.async { focused = true }
+            takeDictateRequest()
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
                 guard event.window is QuickCapturePanel, event.window?.isKeyWindow == true else { return event }
                 if voice.isActive { return voiceKey(event) ? nil : event }
                 guard event.keyCode == 48 else { return event }
+                // Dictating is Task mode's: no switching away mid-sentence.
+                if dictation.isBusy { return nil }
                 let all = Mode.allCases
                 let next = all[(all.firstIndex(of: mode)! + (event.modifierFlags.contains(.shift) ? all.count - 1 : 1)) % all.count]
                 withAnimation(Motion.snappy) { mode = next }
@@ -76,6 +83,28 @@ struct CapturePanelView: View {
             if let monitor { NSEvent.removeMonitor(monitor) }
             monitor = nil
         }
+    }
+
+    /// The voice note's height, else what dictation shows.
+    private var panelHeight: CGFloat {
+        guard !voice.isActive else { return voice.panelHeight }
+        let rows = dictation.result.map { $0.undone ? 0 : $0.taskIDs.count } ?? 0
+        return DictationLayout.capturePanel(dictation.phase, rows: rows, base: VoiceCaptureLayout.base, maxRows: Self.dictationRows)
+    }
+
+    static let dictationRows = 4
+
+    private func takeDictateRequest() {
+        guard app.dictateRequest == .capture, !voice.isActive else { return }
+        app.dictateRequest = nil
+        startDictation()
+    }
+
+    private func startDictation() {
+        if mode != .task { withAnimation(Motion.snappy) { mode = .task } }
+        confirmation = nil
+        dictation.start(field: $text, context: AddContext())
+        focused = true
     }
 
     /// Return or Esc while recording stops and saves; on the result they close it; Esc while Gemini works hides the
@@ -119,14 +148,23 @@ struct CapturePanelView: View {
                     .foregroundStyle(Color.ink)
                     .focused($focused)
                     .onSubmit(save)
-                Button { voice.start() } label: { Image(systemName: "mic") }
-                    .buttonStyle(IconButtonStyle(size: 34, filled: true))
-                    .help("Record a voice note: Docket turns it into tasks and a memory")
-                    .accessibilityLabel("Record a voice note")
+                    .dictationOverlay(dictation, text: text, font: .system(size: 26, weight: .bold), tracking: -0.6)
+                if mode == .task {
+                    DictateButton(dictation: dictation, size: 34, filled: true, start: startDictation)
+                } else {
+                    Button { voice.start() } label: { Image(systemName: "mic") }
+                        .buttonStyle(IconButtonStyle(size: 34, filled: true))
+                        .help("Record a voice note: Docket turns it into tasks and a memory")
+                        .accessibilityLabel("Record a voice note")
+                }
             }
 
             Group {
-                if let confirmation {
+                if mode == .task, dictation.phase != .idle {
+                    // Dictating: listening, scheduling, what it added, or why not.
+                    DictationStatus(dictation: dictation, maxRows: Self.dictationRows, opened: close)
+                        .transition(.opacity)
+                } else if let confirmation {
                     HStack(spacing: Space.sm) {
                         Image(systemName: "checkmark")
                             .font(.system(size: 10, weight: .heavy))
@@ -158,7 +196,7 @@ struct CapturePanelView: View {
                         .transition(.opacity)
                 }
             }
-            .frame(height: 26, alignment: .leading)
+            .frame(height: dictation.phase == .idle || mode != .task ? 26 : nil, alignment: .leading)
             .animation(Motion.base, value: confirmation)
         }
     }
@@ -176,11 +214,16 @@ struct CapturePanelView: View {
     }
 
     private func save() {
+        if dictation.isListening {
+            dictation.finish()
+            return
+        }
         let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty else {
             close()
             return
         }
+        dictation.dismiss()
         switch mode {
         case .task:
             let now = Date()

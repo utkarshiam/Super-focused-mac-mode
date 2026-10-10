@@ -119,6 +119,8 @@ final class AppState: ObservableObject {
     @Published var hotkeyRegistered = true
     /// Bumped to move keyboard focus into the quick-add field.
     @Published var focusQuickAdd = 0
+    /// ⇧⌘D: the add field that should start dictating a task. That field clears it as it starts.
+    @Published var dictateRequest: TaskDictation.Place?
     /// Tasks that were just ticked stay visible for a moment so the list doesn't jump.
     @Published private(set) var recentlyCompleted: Set<UUID> = []
 

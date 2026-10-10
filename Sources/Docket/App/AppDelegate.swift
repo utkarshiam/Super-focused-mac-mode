@@ -125,6 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     /// multi-selection and then closes the details, Delete removes the selected tasks, and t / m / w / x
     /// move them to today / tomorrow / next Monday or tick them off.
     private func handleKey(_ event: NSEvent) -> Bool {
+        if dictationKey(event) { return true }
         guard event.window === mainWindow, !app.showPalette, !(mainWindow.firstResponder is NSText) else { return false }
         let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
         let inTasks = app.selection.isTaskView
@@ -331,6 +332,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc func dailyNote(_ sender: Any?) {
         app.reveal(note: store.dailyNote().id)
+    }
+
+    /// Dictation's keys, in any of Docket's windows: ⇧⌘D starts (or stops) it, Return stops and schedules,
+    /// Esc cancels (and closes the main window's result).
+    private func dictationKey(_ event: NSEvent) -> Bool {
+        let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        if mods == [.command, .shift], event.charactersIgnoringModifiers?.lowercased() == "d" {
+            dictateTaskAction(nil)
+            return true
+        }
+        guard mods.isEmpty, let dictation = TaskDictation.current else { return false }
+        switch event.keyCode {
+        case 36, 76: // return, enter
+            guard dictation.phase == .listening else { return false }
+            dictation.finish()
+            return true
+        case 53: // esc
+            if dictation.isBusy { return dictation.escape() }
+            // The main window's result closes; a panel's closes with the panel.
+            return dictation.place == .main && event.window === mainWindow && dictation.escape()
+        default:
+            return false
+        }
+    }
+
+    /// ⇧⌘D: dictate a task into the add field in front: Quick Capture's (in Task mode), the menu bar's, or
+    /// the main window's (opening the Calendar when the page has none). Again while listening: stop and schedule.
+    @objc func dictateTaskAction(_ sender: Any?) {
+        if let dictation = TaskDictation.current, dictation.isListening {
+            dictation.finish()
+            return
+        }
+        let key = NSApp.keyWindow
+        if key is QuickCapturePanel, key?.isVisible == true {
+            app.dictateRequest = .capture
+        } else if key is FloatingPanel, key?.isVisible == true {
+            app.dictateRequest = .menuBar
+        } else {
+            showMainWindow()
+            if !app.selection.isTaskView || app.selection == .search || app.selection == .completed { app.selection = .calendar }
+            if app.selection == .calendar { app.calendarMode = .agenda }
+            app.dictateRequest = .main
+        }
     }
 
     @objc func quickCaptureAction(_ sender: Any?) { quickCapture.toggle() }

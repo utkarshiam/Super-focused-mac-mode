@@ -353,10 +353,7 @@ final class VoiceCenter: ObservableObject {
             $0.debrief?.tasks[i] = replacement
         }
         model?.sendTaskDelete(task.id, title: task.title)
-        model?.capture(CaptureEnvelope(id: replacement.id, kind: .task, title: replacement.title, text: replacement.notes.isEmpty ? nil : replacement.notes,
-                                       due: replacement.dueDate, dueHasTime: replacement.dueHasTime),
-                       title: replacement.title, detail: replacement.dueDate.map { "Due \(PhoneFmt.due($0, hasTime: replacement.dueHasTime))" },
-                       quiet: true)
+        model?.capture(.task(replacement), title: replacement.title, detail: PhoneFmt.taskDetail(replacement), quiet: true)
     }
 
     /// "Undo all": none of its tasks get added. The recording and its memory stay.
@@ -385,8 +382,7 @@ final class VoiceCenter: ObservableObject {
         jobs.filter { $0.status == .ready || $0.status == .written }
             .flatMap(\.tasks)
             .filter { !known.contains($0.id) }
-            .map { TaskSnapshot(id: $0.id, title: $0.title, dueDate: $0.dueDate, dueHasTime: $0.dueHasTime,
-                                estimateMinutes: $0.estimateMinutes, priority: $0.priority, listName: $0.listName) }
+            .map(\.asSnapshot)
     }
 
     func debriefTask(_ id: UUID) -> DebriefTask? {

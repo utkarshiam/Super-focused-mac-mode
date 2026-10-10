@@ -253,16 +253,11 @@ struct DebriefCardView: View {
         .padding(Space.lg)
         .hairlineCard()
         .sheet(item: $editing) { task in
-            TaskComposer(initialTitle: task.title, initialDue: task.dueDate, initialHasTime: task.dueHasTime,
-                         heading: "Edit task", confirmTitle: "Save",
-                         onRemove: { model.voice.removeTask(task.id) }) { title, due, hasTime in
-                var changed = task
-                changed.title = title
-                changed.dueDate = due
-                changed.dueHasTime = hasTime
+            TaskComposer(draft: task, heading: "Edit task", confirmTitle: "Save", expanded: task.hasExtras, voiceMode: .fillsFields,
+                         onRemove: { model.voice.removeTask(task.id) }) { changed in
                 model.voice.updateTask(changed)
             }
-            .presentationDetents([.medium, .large])
+            .presentationDetents(task.hasExtras ? [.large] : [.medium, .large])
             .presentationBackground(Color.paper)
         }
     }

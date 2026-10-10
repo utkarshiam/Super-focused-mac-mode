@@ -727,7 +727,7 @@ private struct AINotice: View {
 
 /// Three dots breathing in turn while Gemini thinks. Still (and half-lit) with Reduce Motion.
 /// Driven by the clock rather than a repeating animation, so it can never sway the layout around it.
-private struct ThinkingDots: View {
+struct ThinkingDots: View {
     var size: CGFloat = 8
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 

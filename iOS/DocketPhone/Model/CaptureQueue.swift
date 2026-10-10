@@ -22,6 +22,25 @@ struct CaptureRecord: Identifiable, Hashable, Codable {
     var state: State
 }
 
+/// A task this phone sent (composer, dictation, Siri), shown in Today as "Just added" until the Mac's task
+/// list has it.
+struct SentTask: Codable, Identifiable, Equatable {
+    var task: DebriefTask
+    var sentAt: Date
+    /// When the phone saw the Mac take its envelope from the Inbox.
+    var receivedAt: Date?
+
+    var id: UUID { task.id }
+}
+
+extension CaptureEnvelope {
+    /// A `.task` envelope carrying every field (its id is the task's), plus title/due for older Macs.
+    static func task(_ task: DebriefTask) -> CaptureEnvelope {
+        CaptureEnvelope(id: task.id, kind: .task, title: task.title, text: task.notes.isEmpty ? nil : task.notes,
+                        due: task.dueDate, dueHasTime: task.dueDate != nil && task.dueHasTime, device: "iPhone", task: task)
+    }
+}
+
 /// What a capture carries besides its envelope.
 enum CaptureAttachment {
     /// A file on disk; `move` when it's ours to take (a finished recording).
@@ -39,6 +58,7 @@ struct LocalStore: Sendable {
     var recordsURL: URL { root.appendingPathComponent("captures.json") }
     var completedURL: URL { root.appendingPathComponent("completed-tasks.json") }
     var deletedURL: URL { root.appendingPathComponent("deleted-tasks.json") }
+    var sentTasksURL: URL { root.appendingPathComponent("sent-tasks.json") }
 
     static let recentLimit = 30
 
@@ -60,6 +80,14 @@ struct LocalStore: Sendable {
             break
         }
         try MemoryCoding.encoder.encode(env).write(to: pendingURL.appendingPathComponent(env.fileName), options: .atomic)
+    }
+
+    /// Takes a capture back out of Pending before it went anywhere (an attachment-less one). True when it was
+    /// still there, so the Mac will never see it.
+    func unstage(_ id: UUID) -> Bool {
+        let url = pendingURL.appendingPathComponent("\(id.uuidString).capture.json")
+        guard FileManager.default.fileExists(atPath: url.path) else { return false }
+        return (try? FileManager.default.removeItem(at: url)) != nil
     }
 
     /// Envelopes waiting in Pending, oldest first.
@@ -130,6 +158,8 @@ struct LocalStore: Sendable {
     func saveCompleted(_ completed: [UUID: Date]) { save(completed, to: completedURL) }
     func loadDeleted() -> [UUID: Date] { load([UUID: Date].self, from: deletedURL) ?? [:] }
     func saveDeleted(_ deleted: [UUID: Date]) { save(deleted, to: deletedURL) }
+    func loadSentTasks() -> [SentTask] { load([SentTask].self, from: sentTasksURL) ?? [] }
+    func saveSentTasks(_ tasks: [SentTask]) { save(tasks, to: sentTasksURL) }
 
     private func load<T: Decodable>(_ type: T.Type, from url: URL) -> T? {
         guard let data = try? Data(contentsOf: url) else { return nil }

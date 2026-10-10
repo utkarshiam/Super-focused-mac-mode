@@ -232,7 +232,7 @@ enum DebugSnapshot {
                 d.app.selection = .memory
                 d.app.selectedMemoryID = MemoryCenter.shared.library.items.first { $0.title == "Seed round: investor feedback" }?.id
             }),
-        ] + brainSteps(d)
+        ] + brainSteps(d) + dictationSteps(d)
 
         let t0 = ProcessInfo.processInfo.systemUptime
         func stamp() -> String {
@@ -468,6 +468,81 @@ enum DebugSnapshot {
                 d.app.selectedMemoryID = library.items.first { $0.title == "Pricing follow-up with Mehta Traders" }?.id
             }),
             ("58d-voice-memory-bottom", { scrollDetail(in: d.mainWindow) }),
+        ]
+    }
+
+    /// Dictating a task into the Calendar's add field, without the microphone or Gemini: listening (made-up
+    /// words and level), the result of two scheduled tasks (one repeating, with an alarm and a "Do on" day),
+    /// and that task's details.
+    static func dictationSteps(_ d: AppDelegate) -> [(String, () -> Void)] {
+        let cal = Calendar.current
+        let call = day(3, hour: 15)
+        // The Friday at least two days out (its Thursday is the "Do on" day), at 17:00.
+        let friday = (2...8).map { day($0) }.first { cal.component(.weekday, from: $0) == 6 }!
+        let update = cal.date(bySettingHour: 17, minute: 0, second: 0, of: friday)!
+        let thursday = cal.date(byAdding: .day, value: -1, to: friday)!
+        let weekday = { (d: Date) in d.formatted(.dateTime.weekday(.wide)) }
+        let words = "Call Rohan Mehta about the quote on \(weekday(call)) at 3 for half an hour, remind me 15 minutes before. "
+            + "And every Friday at 5 the investor update, I'll work on it \(weekday(thursday)), one hour, alarm 30 minutes before"
+        let tasks = [
+            DebriefTask(title: "Call Rohan Mehta about the quote", dueDate: call, dueHasTime: true, estimateMinutes: 30,
+                        listName: "Work", reminderMinutes: 15),
+            DebriefTask(title: "Send the weekly investor update", dueDate: update, dueHasTime: true, estimateMinutes: 60,
+                        listName: "Work", scheduledDate: thursday, reminderMinutes: 30, isAlarm: true,
+                        repeatRule: TaskRepeat(frequency: .weekly, weekdays: [6])),
+        ]
+        func hidePanels() { for panel in NSApp.windows where panel is FloatingPanel && panel.isVisible { (panel as? FloatingPanel)?.hide() } }
+        // Copies with new ids (the ids above are taken once added).
+        func fresh(_ tasks: [DebriefTask]) -> [DebriefTask] { tasks.map { var t = $0; t.id = UUID(); return t } }
+        return [
+            ("66-dictate-listening", {
+                NSApp.windows.first { $0.title == "Docket Settings" }?.close()
+                NSApp.windows.first { $0.title == galleryTitle }?.close()
+                hidePanels()
+                d.app.showsMemoryProfile = false
+                d.app.showPalette = false
+                d.app.selectedTaskID = nil
+                d.app.selection = .calendar
+                d.app.calendarMode = .agenda
+                d.app.dictateRequest = .main
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    guard let dictation = TaskDictation.current else { return note("66: no dictation started") }
+                    dictation.debugHear(words, levels: [0.35, 0.8, 0.55, 0.95, 0.6])
+                }
+            }),
+            ("66b-dictate-added", {
+                guard let dictation = TaskDictation.current else { return note("66b: no dictation") }
+                dictation.debugSchedule(tasks)
+                note("66b: " + (dictation.result?.taskIDs.compactMap { d.store.task($0) }.map { t in
+                    "\(t.title) | \(DictationText.when(t)) | est=\(t.estimateMinutes ?? 0) | "
+                        + DictationText.details(t, listName: d.store.list(t.listID)?.name).map(\.text).joined(separator: " · ")
+                }.joined(separator: " // ") ?? "no result"))
+            }),
+            ("66c-dictate-task-detail", { d.app.selectedTaskID = tasks[1].id }),
+            // The same in Quick Capture's Task mode and in the menu bar panel.
+            ("66d-dictate-capture-listening", {
+                d.app.selectedTaskID = nil
+                d.debugShowQuickCapture()
+                d.app.dictateRequest = .capture
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    TaskDictation.current?.debugHear("Every weekday at 9:30 standup, alarm", levels: [0.5, 0.9, 0.4, 0.7, 0.3])
+                }
+            }),
+            ("66e-dictate-capture-added", {
+                TaskDictation.current?.debugSchedule(fresh(tasks))
+            }),
+            ("66f-dictate-menubar", {
+                hidePanels()
+                // After the main window has taken the focus back from Quick Capture, or it would close the panel.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    d.debugShowMenuBarPanel()
+                    d.app.dictateRequest = .menuBar
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+                    guard let dictation = TaskDictation.current, dictation.place == .menuBar else { return note("66f: no menu bar dictation") }
+                    dictation.debugSchedule(Array(fresh(tasks).suffix(1)))
+                }
+            }),
         ]
     }
 

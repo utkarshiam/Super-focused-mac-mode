@@ -5,7 +5,7 @@ import MemoryKit
 /// `MemoryLibrary.debugSeed` and published the way the Mac does, a few tasks, a few recent captures
 /// and a canned Ask answer. Nothing touches the user's real folder, Keychain or the network.
 ///
-/// Launch options: `DOCKET_PHONE_TAB=capture|record|debrief|memory|topics|map|ask|today|settings`,
+/// Launch options: `DOCKET_PHONE_TAB=capture|record|debrief|dictate|dictated|composer|memory|topics|map|ask|today|settings`,
 /// `DOCKET_PHONE_ITEM=first|<index>|<words in a title>` opens that item, `DOCKET_PHONE_ENTITY=<name>` opens
 /// that topic's or person's page.
 enum DemoSeed {
@@ -32,7 +32,7 @@ enum DemoSeed {
         brain.flush()
         // Published a little while ago, like a Mac that synced this afternoon.
         let published = now.addingTimeInterval(-14 * 60)
-        try? await PhoneBridge(root: root).publish(library, tasks: tasks(now: now), now: published, brain: brain)
+        try? await PhoneBridge(root: root).publish(library, tasks: tasks(now: now), listNames: listNames, now: published, brain: brain)
         if let n = ProcessInfo.processInfo.environment["DOCKET_PHONE_MAP_NODES"].flatMap(Int.init) { padMap(root: root, to: n) }
         try? fm.createDirectory(at: PhoneBridge(root: root).inboxURL, withIntermediateDirectories: true)
         return Seeded(root: root, records: records(now: now))
@@ -69,6 +69,8 @@ enum DemoSeed {
         if let out = try? MemoryCoding.encoder.encode(snapshot) { try? out.write(to: url, options: .atomic) }
     }
 
+    static let listNames = ["Board", "Sales", "Seed round", "Team", "Billing API", "Pricing refresh"]
+
     static func tasks(now: Date) -> [TaskSnapshot] {
         let cal = Calendar.current
         let today = cal.startOfDay(for: now)
@@ -87,10 +89,13 @@ enum DemoSeed {
             TaskSnapshot(id: id(1), title: "Send Q3 board deck to Alex Kim", dueDate: day(-1), estimateMinutes: 45, priority: 3, listName: "Board"),
             TaskSnapshot(id: id(2), title: "Review Acme security questionnaire", dueDate: soon, dueHasTime: true, estimateMinutes: 30, priority: 2, listName: "Sales"),
             TaskSnapshot(id: id(3), title: "Reply to Priya about the term sheet", dueDate: day(0), estimateMinutes: 15, priority: 3, listName: "Seed round"),
-            TaskSnapshot(id: id(4), title: "1:1 with Maya Chen", dueDate: later, dueHasTime: true, estimateMinutes: 30, listName: "Team"),
-            TaskSnapshot(id: id(5), title: "Write the double-charge postmortem", dueDate: day(2), estimateMinutes: 60, priority: 2, listName: "Billing API"),
+            TaskSnapshot(id: id(4), title: "1:1 with Maya Chen", dueDate: later, dueHasTime: true, estimateMinutes: 30, listName: "Team",
+                         repeatRule: TaskRepeat(frequency: .weekly, weekdays: [cal.component(.weekday, from: later)]), reminderMinutes: 10),
+            TaskSnapshot(id: id(5), title: "Write the double-charge postmortem", dueDate: day(4), scheduledDate: day(2), estimateMinutes: 60, priority: 2,
+                         listName: "Billing API"),
             TaskSnapshot(id: id(6), title: "Pricing page: first draft", scheduledDate: day(3), estimateMinutes: 90, listName: "Pricing refresh"),
-            TaskSnapshot(id: id(7), title: "Book the offsite venue", dueDate: day(5, hour: 11), dueHasTime: true, estimateMinutes: 20),
+            TaskSnapshot(id: id(7), title: "Book the offsite venue", dueDate: day(5, hour: 11), dueHasTime: true, estimateMinutes: 20,
+                         reminderMinutes: 0, isAlarm: true),
         ]
     }
 
@@ -103,6 +108,45 @@ enum DemoSeed {
             CaptureRecord(id: UUID(), kind: .photo, title: "Whiteboard after the onboarding review", detail: nil, createdAt: ago(60 * 26), state: .received),
             CaptureRecord(id: UUID(), kind: .note, title: "Leo: partner pilot could start in November", detail: nil, createdAt: ago(60 * 50), state: .received),
         ]
+    }
+
+    // MARK: Spoken tasks
+
+    /// What "Speak a task" hears in the dictate screenshot.
+    static let spokenWords = "Every weekday at 9:30 standup with the team, set an alarm. And work on the board deck on Monday, it's due Friday, block an hour and a half"
+
+    /// The dictated screenshot's two tasks: a repeating weekday standup with an alarm, and one with a Do on day
+    /// before its deadline.
+    static func spokenTasks(now: Date) -> [DebriefTask] {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: now)
+        func next(_ weekday: Int, after day: Date) -> Date {
+            cal.nextDate(after: day, matching: DateComponents(weekday: weekday), matchingPolicy: .nextTime) ?? day
+        }
+        // The next weekday morning at 9:30 that's still ahead.
+        var standup = cal.date(bySettingHour: 9, minute: 30, second: 0, of: today)!
+        while standup <= now || [1, 7].contains(cal.component(.weekday, from: standup)) {
+            standup = cal.date(byAdding: .day, value: 1, to: standup)!
+        }
+        let monday = next(2, after: today)
+        let friday = next(6, after: monday)
+        return [
+            DebriefTask(title: "Team standup", dueDate: standup, dueHasTime: true, estimateMinutes: 15, listName: "Team",
+                        reminderMinutes: 0, isAlarm: true, repeatRule: TaskRepeat(frequency: .weekly, weekdays: [2, 3, 4, 5, 6])),
+            DebriefTask(title: "Work on the board deck", dueDate: friday, estimateMinutes: 90, priority: 3, listName: "Board",
+                        scheduledDate: monday),
+        ]
+    }
+
+    /// The composer screenshot: every field filled.
+    static func composerDraft(now: Date) -> DebriefTask {
+        let cal = Calendar.current
+        let thursday = cal.nextDate(after: cal.startOfDay(for: now), matching: DateComponents(weekday: 5), matchingPolicy: .nextTime)!
+        let friday = cal.date(byAdding: .day, value: 1, to: thursday)!
+        let at = cal.date(bySettingHour: 15, minute: 0, second: 0, of: friday)!
+        return DebriefTask(title: "Pipeline review with Rohan Mehta", dueDate: at, dueHasTime: true, estimateMinutes: 30, priority: 3,
+                           listName: "Sales", scheduledDate: thursday, reminderMinutes: 15, isAlarm: true,
+                           repeatRule: TaskRepeat(frequency: .weekly, interval: 2, weekdays: [6]))
     }
 
     // MARK: Voice

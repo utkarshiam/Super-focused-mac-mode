@@ -73,6 +73,8 @@ extension Color {
     static let hairStrong = Color(uiColor: Palette.hairStrong)
     static let primaryFill = Color(uiColor: Palette.primary)
     static let onPrimary = Color(uiColor: Palette.onPrimary)
+    /// A switch that's on: ink in light; a mid grey in dark, where a paper-white track would swallow the knob.
+    static let toggleOn = Color(uiColor: UIColor.dynamic(0x0E0E0C, 0x6E6E6A))
     static let danger = Color(uiColor: Palette.dangerSolid)
     static let dangerText = Color(uiColor: Palette.dangerFg)
 }

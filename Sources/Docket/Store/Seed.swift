@@ -150,6 +150,9 @@ extension NoteTemplate {
         ## Plan with AI
         Press **⌘J** (or the ✨ in the add field), write what's on your mind, and Docket turns it into tasks with dates, durations and steps. You check them before anything is added. **Break down with AI** in a task's checklist splits big work into steps, and **Order my day** (✨ in Calendar) suggests an order for today. Add a Google Gemini key in **Settings → AI**.
 
+        ## Dictate a task
+        Click the mic in any add field (or press **⇧⌘D**) and say it: "call Rohan next Friday at 3 for half an hour, remind me 15 minutes before", "every weekday at 9:30 standup, alarm". Stop with a click, Return, or just pause. Docket adds it with its date, time, length, reminder or alarm, repeat and list, and shows what it added (✕ removes one, Undo all takes them back). Without a Gemini key the words go into the field and quick add reads them.
+
         ## Your calendar
         **Calendar** is every dated task in one list, overdue first. Each line shows its real date, time and how long it takes. Drag tasks to reorder a day (dragging never changes a date), switch to **Month** to drop a task on another day, and press **⌥⌘C** for compact rows when the list gets long.
 
@@ -178,7 +181,7 @@ extension NoteTemplate {
         Write meeting notes with checklists like the sample note, then click **Extract action items**. Each open item becomes a task. Ticking it in the note completes the task, and completing the task ticks it in the note. **Find Tasks with AI** (in the note's ⋯ menu) catches the ones without checkboxes.
 
         ## Shortcuts
-        - ⌘N new task · ⇧⌘N new note · ⌘K jump to anything · ⌘F search · ⌘J plan with AI
+        - ⌘N new task · ⇧⌘N new note · ⌘K jump to anything · ⌘F search · ⌘J plan with AI · ⇧⌘D dictate a task
         - ⌘1 Calendar · ⌘2 Inbox · ⌘3 Notes · ⌘8 Waiting
         - ↑ ↓ move through tasks · ⇧↑ ⇧↓ select more · esc close
         - T today · M tomorrow · W next week · X done (on the selected tasks)
