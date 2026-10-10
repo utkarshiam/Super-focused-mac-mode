@@ -1169,7 +1169,7 @@ final class IntegrationsFlowTests: XCTestCase {
         XCTAssertEqual(server.requests.count, calls)
     }
 
-    func testAIKeepsOnlyMentionsThatNeedYouAndASaveBringsOneBack() async throws {
+    func testMentionsAlwaysShowAndAIOnlyDraftsTheTask() async throws {
         let now = Date()
         slackAnswers(now: now, reactions: Fixture.reactions(now: now), Fixture.reactions(now: now, extra: Fixture.savedHiringDM(now: now)))
         let log = TriageLog()
@@ -1191,19 +1191,21 @@ final class IntegrationsFlowTests: XCTestCase {
         XCTAssertEqual(log.batches[0].count, 4, "saved messages and mentions go to AI together")
         XCTAssertTrue(log.batches[0].contains { $0.text == "@Maya Chen can you approve the Q4 budget today?" }, "AI reads plain text")
         let hiringID = "slack:D0DM/\(Fixture.ts(now.addingTimeInterval(-1800)))"
-        XCTAssertFalse(integrations.suggestions.contains { $0.id == hiringID }, "AI saw nothing to do")
-        let budget = try XCTUnwrap(integrations.suggestions.first { $0.trigger == .mention })
+        // AI saw nothing to do in it, but it's addressed to Maya: it shows, with a plain draft.
+        let hiring = try XCTUnwrap(integrations.suggestions.first { $0.id == hiringID })
+        XCTAssertEqual(hiring.trigger, .mention)
+        XCTAssertEqual(hiring.draft?.title, "Slack: @Maya Chen quick question about hiring")
+        let budget = try XCTUnwrap(integrations.suggestions.first { $0.draft?.title == "Approve the Q4 budget" })
+        XCTAssertEqual(budget.trigger, .mention)
         XCTAssertEqual(budget.draft?.title, "Approve the Q4 budget")
         XCTAssertEqual(budget.draft?.estimateMinutes, 15)
         XCTAssertEqual(budget.draft?.source, budget.source)
         XCTAssertEqual(integrations.suggestions.filter { $0.trigger == .reaction }.count, 2, "saved ones stay, with a plain draft")
         XCTAssertNil(integrations.aiProblem)
 
-        // Maya saves the DM with 📌 afterwards: flagged on purpose, it shows up.
+        // Maya saves the DM with 📌 afterwards: still the one card.
         await integrations.refreshNow(now: now.addingTimeInterval(60))
-        let hiring = try XCTUnwrap(integrations.suggestions.first { $0.id == hiringID })
-        XCTAssertEqual(hiring.trigger, .reaction)
-        XCTAssertEqual(hiring.draft?.title, "Slack: @Maya Chen quick question about hiring")
+        XCTAssertEqual(integrations.suggestions.filter { $0.id == hiringID }.count, 1)
     }
 
     func testAIFailureLeavesMentionsForNextTimeAndSaysSoOnce() async throws {
@@ -1213,14 +1215,15 @@ final class IntegrationsFlowTests: XCTestCase {
         let (integrations, _) = try make(slackConnected(), triage: triage)
 
         await integrations.refreshNow(now: now)
-        XCTAssertEqual(integrations.suggestions.map(\.trigger), [.reaction, .reaction], "explicit saves still show, mentions wait")
+        XCTAssertEqual(Set(integrations.suggestions.map(\.trigger)), [.reaction, .mention], "mentions show even when AI can't sort them")
+        XCTAssertEqual(integrations.suggestions.count, 4)
         let problem = try XCTUnwrap(integrations.aiProblem)
         XCTAssertTrue(problem.contains(AIError.rateLimited.localizedDescription))
         XCTAssertNil(integrations.slackProblem, "Slack itself was fine")
 
         integrations.triage = .none
         await integrations.refreshNow(now: now)
-        XCTAssertEqual(integrations.suggestions.count, 4, "the mentions were looked at again")
+        XCTAssertEqual(integrations.suggestions.count, 4, "nothing doubled up")
         XCTAssertNil(integrations.aiProblem)
     }
 
@@ -1274,7 +1277,7 @@ final class IntegrationsFlowTests: XCTestCase {
         XCTAssertEqual(integrations.suggestions.filter { $0.id.hasPrefix("slack:D0DM/") }.count, 1)
     }
 
-    func testAIKeepsOnlyDirectMessagesThatNeedYou() async throws {
+    func testDirectMessagesAlwaysShowAndAIDraftsTheOnesThatNeedYou() async throws {
         let now = Date()
         Fixture.directMessages(on: server, now: now)
         slackAnswers(now: now)
@@ -1292,9 +1295,11 @@ final class IntegrationsFlowTests: XCTestCase {
         await integrations.refreshNow(now: now)
         let labels = Set(log.batches.flatMap { $0 }.map(\.source.label))
         XCTAssertTrue(labels.isSuperset(of: ["DM · Sam Lee", "Group DM · Priya, Sam"]), "DMs go to AI with mentions")
-        let sam = try XCTUnwrap(integrations.suggestions.first { $0.trigger == .directMessage })
+        let sam = try XCTUnwrap(integrations.suggestions.first { $0.id.hasPrefix("slack:D0DM/") })
         XCTAssertEqual(sam.draft?.title, "Send Sam the offer letter template")
-        XCTAssertEqual(integrations.suggestions.filter { $0.trigger == .directMessage }.count, 1, "AI saw nothing to do in the group")
+        let group = try XCTUnwrap(integrations.suggestions.first { $0.id.hasPrefix("slack:C0MPDM/") })
+        XCTAssertEqual(group.trigger, .directMessage, "AI saw nothing to do in the group, but it was sent to you: it shows")
+        XCTAssertNotEqual(group.draft?.title, "Send Sam the offer letter template")
         XCTAssertEqual(integrations.suggestions.filter { $0.trigger == .reaction }.count, 2)
     }
 

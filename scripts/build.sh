@@ -7,6 +7,7 @@
 #   SIGN_IDENTITY="Developer ID Application: Your Company (TEAMID)" \
 #   NOTARY_PROFILE="docket-notary" scripts/build.sh
 #   (create the profile once: xcrun notarytool store-credentials docket-notary --apple-id you@x.com --team-id TEAMID)
+#   or, instead of NOTARY_PROFILE, an App Store Connect API key: ASC_KEY_ID=… ASC_ISSUER_ID=… [ASC_KEY_PATH=…]
 #
 # Optional: VERSION=1.2.0 BUNDLE_ID=com.yourco.docket
 #
@@ -183,11 +184,20 @@ if [[ -n "${SIGN_IDENTITY:-}" ]]; then
   codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG"
 fi
 
-if [[ -n "${SIGN_IDENTITY:-}" && -n "${NOTARY_PROFILE:-}" ]]; then
+# Notarise with a notarytool keychain profile, or with an App Store Connect API key (ASC_KEY_ID, ASC_ISSUER_ID and
+# the .p8 at ASC_KEY_PATH, default ~/.appstoreconnect/private_keys/AuthKey_<id>.p8).
+NOTARY_AUTH=()
+if [[ -n "${NOTARY_PROFILE:-}" ]]; then
+  NOTARY_AUTH=(--keychain-profile "$NOTARY_PROFILE")
+elif [[ -n "${ASC_KEY_ID:-}" && -n "${ASC_ISSUER_ID:-}" ]]; then
+  NOTARY_AUTH=(--key "${ASC_KEY_PATH:-$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8}" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID")
+fi
+if [[ -n "${SIGN_IDENTITY:-}" && ${#NOTARY_AUTH[@]} -gt 0 ]]; then
   step "Notarizing (this takes a few minutes)"
-  xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun notarytool submit "$DMG" "${NOTARY_AUTH[@]}" --wait
   xcrun stapler staple "$DMG"
   xcrun stapler staple "$APP"
+  spctl --assess --type open --context context:primary-signature -v "$DMG"
 fi
 
 ditto -c -k --keepParent "$APP" "$ZIP"

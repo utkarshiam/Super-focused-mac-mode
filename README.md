@@ -251,6 +251,7 @@ Full feature list, setup and build steps: **[iOS/README.md](iOS/README.md)**.
   never written to the data file or to logs.
 - iPhone sync is off until you turn it on, and goes only through your own iCloud Drive.
 - The microphone is on only while you record or dictate.
+- Full details: [PRIVACY.md](PRIVACY.md).
 
 ## Install
 
@@ -448,6 +449,16 @@ never publish a DMG built that way. `.env` is git-ignored.
 Open `iOS/DocketPhone.xcodeproj` in Xcode 26 and run the `DocketPhone` scheme. It uses the shared
 `MemoryKit` package from this repo. To run it on your own phone, sign it with your own Apple ID or team.
 Step by step, including demo mode for screenshots: [iOS/README.md](iOS/README.md).
+
+### Shipping a release
+
+`scripts/release.sh` ships builds with an App Store Connect API key. It reads `APPLE_TEAM_ID`, `ASC_KEY_ID`
+and `ASC_ISSUER_ID` from the environment or the git-ignored `.env`, plus the key's `.p8`, which goes in
+`~/.appstoreconnect/private_keys/` and never in the repo.
+
+- `scripts/release.sh ios`: archives the iPhone app, signs it for your team and uploads it to TestFlight.
+- `scripts/release.sh mac`: builds the Mac app with your team's Developer ID certificate, then notarises and
+  staples the DMG, so it opens without the "Open Anyway" step.
 
 ## How it's built
 

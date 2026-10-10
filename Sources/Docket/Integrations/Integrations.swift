@@ -355,9 +355,9 @@ enum IntegrationHTTP {
 /// No tokens: those stay in the secrets file.
 struct IntegrationsFile: Codable {
     /// 2 added the inbox: notes, replies, complete messages, granted permissions. 3 added stars (on items and
-    /// on messages of their threads). 4 added thread summaries. Older files load as they are (the new fields
-    /// start empty).
-    static let currentVersion = 5
+    /// on messages of their threads). 4 added thread summaries. 6: Slack mentions and DMs are always shown, so
+    /// the ones AI passed over before come back. Older files load as they are (the new fields start empty).
+    static let currentVersion = 6
 
     var version = currentVersion
     var suggestions: [Suggestion] = []
@@ -365,6 +365,9 @@ struct IntegrationsFile: Codable {
     var handled: [String: Date] = [:]
     /// Message ids AI looked at and found nothing to do for. Not suggested.
     var skipped: [String: Date] = [:]
+    /// Not saved: Slack messages this load took out of `skipped` (an older file). They come back without a
+    /// notification, since they aren't new.
+    var restored: Set<String> = []
     var lastRefresh: Date?
     var slack: SlackAccount?
     var gmailAddress: String?
@@ -399,6 +402,11 @@ struct IntegrationsFile: Codable {
         skipped = c.value(.skipped, default: [:])
         // Before version 5, DMs were only found as @mentions and often skipped: give them a fresh look.
         if version < 5 { skipped = skipped.filter { !$0.key.hasPrefix("slack:D") } }
+        // Before version 6, AI could hide an @mention or DM it saw no task in; they're always shown now.
+        if version < 6 {
+            restored = Set(skipped.keys.filter { $0.hasPrefix("slack:") })
+            skipped = skipped.filter { !restored.contains($0.key) }
+        }
         lastRefresh = c.value(.lastRefresh, default: nil)
         slack = c.value(.slack, default: nil)
         gmailAddress = c.value(.gmailAddress, default: nil)
@@ -723,6 +731,8 @@ final class Integrations: ObservableObject {
     private var fileURL: URL?
     private var handled: [String: Date] = [:]
     private var skipped: [String: Date] = [:]
+    /// Messages coming back after an update (passed over before) that shouldn't notify.
+    private var quietIDs: Set<String> = []
     private var focusRecord: SlackFocusRecord?
     private var started = false
     private var refreshTask: Task<Void, Never>?
@@ -819,6 +829,7 @@ final class Integrations: ObservableObject {
         suggestions = file.suggestions
         handled = file.handled
         skipped = file.skipped
+        quietIDs = file.restored
         lastRefresh = file.lastRefresh
         slackAccount = file.slack
         gmailAddress = file.gmailAddress
@@ -934,14 +945,15 @@ final class Integrations: ObservableObject {
         save()
 
         let arrived = suggestions.filter { s in
-            guard !waiting.contains(s.id), !fromMe.contains(s.id), !(s.trigger?.isExplicit ?? false) else { return false }
+            guard !waiting.contains(s.id), !fromMe.contains(s.id), !quietIDs.contains(s.id),
+                  !(s.trigger?.isExplicit ?? false) else { return false }
             switch s.source.kind {
             case .slack: return notifiable.contains(.slack)
             case .gmail: return notifiable.contains(.gmail)
             case .ai: return false
             }
         }
-        if slack.checked { primed.insert(.slack) }
+        if slack.checked { primed.insert(.slack); quietIDs = [] }
         if gmail.checked { primed.insert(.gmail) }
         announce(arrived, settings: settings)
     }
@@ -1060,7 +1072,8 @@ final class Integrations: ObservableObject {
         return slackNames.filter { ids.contains($0.key) }
     }
 
-    /// Splits new messages into suggestions (with drafts) and ones AI found nothing to do for.
+    /// Splits new messages into suggestions (with drafts) and ones AI found nothing to do for. A Slack @mention or DM
+    /// is addressed to the user, so it always shows: AI only decides whether a task comes ready-made.
     private func sort(_ found: [SuggestionCandidate], store: Store, now: Date) async -> (accepted: [Suggestion], skipped: [String]) {
         guard !found.isEmpty else {
             aiProblem = nil
@@ -1095,10 +1108,11 @@ final class Integrations: ObservableObject {
         for candidate in newestFirst {
             var s = candidate.suggestion
             let explicit = s.trigger?.isExplicit ?? true
+            let addressed = s.source.kind == .slack && (s.trigger == .mention || s.trigger == .directMessage)
             if let draft = drafts[s.id] {
                 s.draft = SuggestionDrafts.prepared(draft, for: s)
                 accepted.append(s)
-            } else if explicit {
+            } else if explicit || addressed {
                 s.draft = SuggestionDrafts.fallback(for: s)
                 accepted.append(s)
             } else if looked.contains(s.id) {

@@ -471,12 +471,17 @@ final class InboxTests: XCTestCase {
 
         let saved = try Data(contentsOf: dir.appendingPathComponent("integrations.json"))
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: saved) as? [String: Any])
-        XCTAssertEqual(json["version"] as? Int, 5)
-        XCTAssertEqual(IntegrationsFile.currentVersion, 5)
-        // Files from before DMs were a source forget earlier skips of DM messages (and only those).
-        let old = #"{"version":4,"skipped":{"slack:D0DM/1.000":"2026-10-01T00:00:00Z","slack:C0LEAD/2.000":"2026-10-01T00:00:00Z"}}"#
+        XCTAssertEqual(json["version"] as? Int, 6)
+        XCTAssertEqual(IntegrationsFile.currentVersion, 6)
+        // Files from before mentions and DMs always showed forget AI's earlier Slack skips (emails stay skipped);
+        // the Slack ones come back quietly.
+        let old = #"{"version":5,"skipped":{"slack:D0DM/1.000":"2026-10-01T00:00:00Z","slack:C0LEAD/2.000":"2026-10-01T00:00:00Z","gmail:t1/m1":"2026-10-01T00:00:00Z"}}"#
         let loaded = try Persistence.decoder.decode(IntegrationsFile.self, from: Data(old.utf8))
-        XCTAssertEqual(Set(loaded.skipped.keys), ["slack:C0LEAD/2.000"])
+        XCTAssertEqual(Set(loaded.skipped.keys), ["gmail:t1/m1"])
+        XCTAssertEqual(loaded.restored, ["slack:D0DM/1.000", "slack:C0LEAD/2.000"])
+        let current = try Persistence.decoder.decode(IntegrationsFile.self, from: Data(old.replacingOccurrences(of: #""version":5"#, with: #""version":6"#).utf8))
+        XCTAssertEqual(current.skipped.count, 3, "a current file keeps its skips")
+        XCTAssertTrue(current.restored.isEmpty)
 
         let again = relaunch(store)
         let slack = try XCTUnwrap(again.suggestion(Sample.threadReplyID))
