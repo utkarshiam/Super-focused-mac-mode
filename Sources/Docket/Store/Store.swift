@@ -134,6 +134,22 @@ final class Store: ObservableObject {
         return t
     }
 
+    /// Adds several tasks (ids kept) as one undoable step.
+    @discardableResult
+    func addTasks(_ new: [TaskItem], undo name: String) -> [TaskItem] {
+        guard !new.isEmpty else { return [] }
+        let now = Date()
+        let made = new.map { t -> TaskItem in
+            var t = t
+            t.createdAt = now
+            t.updatedAt = now
+            return t
+        }
+        undoable(name) { tasks.append(contentsOf: made) }
+        changed()
+        return made
+    }
+
     func updateTask(_ task: TaskItem) {
         guard let i = tasks.firstIndex(where: { $0.id == task.id }), tasks[i] != task else { return }
         var t = task

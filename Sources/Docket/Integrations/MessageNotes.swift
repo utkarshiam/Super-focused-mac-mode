@@ -206,6 +206,7 @@ extension Integrations {
         let note = store.addNote(body: body)
         undo?.setActionName("Save as Note")
         undo?.endUndoGrouping()
+        messageUsed?(s, note)
         return note
     }
 

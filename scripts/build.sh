@@ -125,6 +125,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSHumanReadableCopyright</key><string>© $(date +%Y) Docket</string>
   <key>NSCalendarsUsageDescription</key><string>Docket reads today's meetings to work out how much free time you have for your tasks.</string>
   <key>NSCalendarsFullAccessUsageDescription</key><string>Docket reads today's meetings to work out how much free time you have for your tasks.</string>
+  <key>NSMicrophoneUsageDescription</key><string>Docket records the voice notes you start, and turns them into tasks and memories.</string>
+  <key>NSSpeechRecognitionUsageDescription</key><string>Docket shows what you're saying while you record a voice note or ask your memory, using Apple's speech recognition.</string>
 ${SECRET_PLIST}</dict>
 </plist>
 PLIST
@@ -147,6 +149,7 @@ cat > "$ENTITLEMENTS" <<ENT
 <plist version="1.0">
 <dict>
   <key>com.apple.security.personal-information.calendars</key><true/>
+  <key>com.apple.security.device.audio-input</key><true/>
 </dict>
 </plist>
 ENT

@@ -117,3 +117,32 @@ enum HotKeyPreset: String, CaseIterable, Identifiable {
     case commandOptionK = "⌥⌘K"
     var id: String { rawValue }
 }
+
+// MARK: - Memory
+
+extension Prefs.Key {
+    /// "Remember my work automatically" in Settings → Memory: the switch over the three below.
+    static let memoryAutoCapture = "memoryAutoCapture"
+    static let memoryCaptureNotes = "memoryCaptureNotes"
+    static let memoryCaptureTasks = "memoryCaptureTasks"
+    static let memoryCaptureMessages = "memoryCaptureMessages"
+    /// "Sync with iPhone" (off until turned on) and the shared folder's path ("" = the iCloud Drive default).
+    static let phoneSync = "memoryPhoneSync"
+    static let phoneFolder = "memoryPhoneFolder"
+    /// When the phone folder was last read or written (seconds since 1970).
+    static let phoneLastSync = "memoryPhoneLastSync"
+    /// Set once the existing notes and recently finished tasks were added to memory (first launch with Memory).
+    static let memoryBackfilled = "memoryBackfilled"
+    /// Quick capture's last mode (Task, Note or Memory).
+    static let captureMode = "quickCaptureMode"
+}
+
+extension Prefs {
+    private static func on(_ key: String) -> Bool { UserDefaults.standard.object(forKey: key) as? Bool ?? true }
+
+    /// What Docket remembers by itself. Each is on unless the user turned it (or the master switch) off.
+    static var memoryCapturesNotes: Bool { on(Key.memoryAutoCapture) && on(Key.memoryCaptureNotes) }
+    static var memoryCapturesTasks: Bool { on(Key.memoryAutoCapture) && on(Key.memoryCaptureTasks) }
+    static var memoryCapturesMessages: Bool { on(Key.memoryAutoCapture) && on(Key.memoryCaptureMessages) }
+    static var phoneSync: Bool { UserDefaults.standard.bool(forKey: Key.phoneSync) }
+}

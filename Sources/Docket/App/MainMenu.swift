@@ -48,6 +48,7 @@ enum MainMenu {
             item("New Note from Clipboard", #selector(AppDelegate.newNoteFromClipboard(_:)), "v", [.command, .option]),
             item("Today's Daily Note", #selector(AppDelegate.dailyNote(_:)), "d"),
             item("Quick Capture…", #selector(AppDelegate.quickCaptureAction(_:))),
+            item("Record Voice Note", #selector(AppDelegate.recordVoiceNoteAction(_:)), "r", [.command, .shift]),
             .separator(),
             item("Import Data…", #selector(AppDelegate.importData(_:))),
             item("Export Data…", #selector(AppDelegate.exportData(_:))),
@@ -110,6 +111,8 @@ enum MainMenu {
         // Go (the order matches AppDelegate.go(_:)'s targets)
         let places = ["Calendar", "Inbox", "Notes", "Important", "All Tasks", "Completed", "Insights", "Waiting", "Messages"]
         var goItems = places.enumerated().map { i, name in item(name, #selector(AppDelegate.go(_:)), "\(i + 1)", tag: i) }
+        // Memory sits with Notes; ⌘1…⌘9 are taken, so it's ⇧⌘M.
+        goItems.insert(item("Memory", #selector(AppDelegate.goToMemory(_:)), "m", [.command, .shift]), at: 3)
         goItems += [
             .separator(),
             item("Jump to…", #selector(AppDelegate.commandPalette(_:)), "k"),

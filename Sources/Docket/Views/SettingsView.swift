@@ -4,9 +4,10 @@ import SwiftUI
 import UserNotifications
 
 struct SettingsView: View {
-    // Six tabs at 94pt fit the 620pt window; labels stay one short word (the longest, "Connections", is ~72pt).
+    // Seven tabs at 80pt fit the 620pt window; labels stay one short word (the longest, "Connections", is ~72pt).
     enum Tab: String, CaseIterable, Identifiable {
-        case general = "General", alerts = "Reminders", planner = "Planner", ai = "AI", connections = "Connections", data = "Data"
+        case general = "General", alerts = "Reminders", planner = "Planner", ai = "AI", memory = "Memory", connections = "Connections"
+        case data = "Data"
         var id: String { rawValue }
         var icon: String {
             switch self {
@@ -14,6 +15,7 @@ struct SettingsView: View {
             case .alerts: "alarm"
             case .planner: "calendar"
             case .ai: "sparkles"
+            case .memory: "brain"
             case .connections: "link"
             case .data: "externaldrive"
             }
@@ -43,7 +45,7 @@ struct SettingsView: View {
                             Text(t.rawValue).font(.system(size: 11.5, weight: .semibold))
                         }
                         .foregroundStyle(tab == t ? Color.onPrimary : Color.ink2)
-                        .frame(width: 94, height: 56)
+                        .frame(width: 80, height: 56)
                         .background {
                             if tab == t {
                                 RoundedRectangle(cornerRadius: Radius.md, style: .continuous)
@@ -64,6 +66,7 @@ struct SettingsView: View {
                 case .alerts: AlertSettings()
                 case .planner: PlannerSettings()
                 case .ai: AISettingsPage()
+                case .memory: MemorySettingsPage()
                 case .connections: ConnectionsSettingsPage()
                 case .data: DataSettings()
                 }

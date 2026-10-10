@@ -1,4 +1,5 @@
 import AppKit
+import MemoryKit
 import SwiftUI
 
 // The open message's whole Slack thread or email conversation, shown as a conversation: every message oldest
@@ -585,6 +586,9 @@ struct ConversationSection: View {
                 preview
             }
             if filesBlocked, hasFiles(shown) { filesNote }
+            // What's already known about this conversation: a quiet line, hidden when nothing is related.
+            FromMemoryStrip(text: memoryText, excluding: Self.memoryRefs(item))
+                .padding(.top, Space.xs)
         }
         .animation(Motion.base, value: conversation.phase)
         .task(id: item.id) { await conversation.start() }
@@ -592,6 +596,29 @@ struct ConversationSection: View {
             guard phase == .loaded else { return }
             revealHighlighted()
         }
+    }
+
+    // MARK: From memory
+
+    /// What "From memory" looks for: the subject and the conversation's words (the preview until it's in).
+    private var memoryText: String {
+        var parts = [item.subject ?? ""]
+        switch conversation.thread {
+        case .slack(let messages, _)?: parts += messages.map(\.text)
+        case .email(let emails, _)?: parts += emails.map(\.content.text)
+        case nil: parts.append(content?.text ?? item.snippet)
+        }
+        return String(parts.filter { !$0.isEmpty }.joined(separator: "\n").prefix(2000))
+    }
+
+    /// The memories of this conversation itself (saved with "Remember" or captured on their own), left out.
+    static func memoryRefs(_ item: Suggestion) -> [String] {
+        if let ids = InboxIDs.slack(item.id) {
+            return [SourceRef.slack(channel: ids.channel, ts: ids.ts)]
+                + (item.threadTS.map { [SourceRef.slack(channel: ids.channel, ts: $0)] } ?? [])
+        }
+        if let ids = InboxIDs.gmail(item.id) { return [SourceRef.gmail(threadID: ids.thread)] }
+        return []
     }
 
     // MARK: Header and status

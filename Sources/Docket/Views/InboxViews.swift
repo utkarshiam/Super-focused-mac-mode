@@ -742,6 +742,7 @@ private struct InboxList: View {
             NotificationCenter.default.post(name: InboxModel.saveEditsNow, object: nil)
             InboxNotes.save(item: item.id, app: app)
         }
+        Button("Remember") { MemoryActions.rememberMessage(item.id, app: app) }
         if item.source.url?.scheme == "https" {
             Button(SourceStyle.openTitle(item.source.kind)) { integrations.open(item) }
         }
@@ -1717,12 +1718,16 @@ private struct InboxActionBar: View {
         }
     }
 
-    /// ⋯: save as a note (the whole thread, or just this message), summarize.
+    /// ⋯: save as a note (the whole thread, or just this message), remember it in Memory, summarize.
     private var more: some View {
         Menu {
             Button(messageCount > 1 ? "Save Thread as Note" : "Save as Note") { saveAsNote(nil) }
             if messageCount > 1 {
                 Button("Save This Message as Note") { saveAsNote(InboxThread.bareMessageID(item.id)) }
+            }
+            Button("Remember") {
+                saveEdits()
+                MemoryActions.rememberMessage(item.id, app: app)
             }
             if integrations.showsSummaries {
                 Divider()
@@ -1738,7 +1743,7 @@ private struct InboxActionBar: View {
                 .frame(width: 32, height: 32)
         }
         .menuChrome(Circle())
-        .help("Save as a note with its attachments, or summarize the thread")
+        .help("Save as a note with its attachments, remember it in Memory, or summarize the thread")
         .accessibilityLabel("More")
     }
 

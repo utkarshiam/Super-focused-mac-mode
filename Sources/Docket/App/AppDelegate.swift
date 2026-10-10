@@ -41,9 +41,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         app.showMainWindow = { [weak self] in self?.showMainWindow() }
         app.showSettings = { [weak self] in self?.showSettings() }
         app.showQuickCapture = { [weak self] in self?.quickCapture.toggle() }
+        app.recordVoiceNote = { [weak self] in self?.quickCapture.record() }
 
         // Before any window reads a secret: screenshot mode never touches the secrets file or the network.
         if DebugSnapshot.isActive { Keychain.useInMemoryStore() } else { Integrations.shared.start(store: store, app: app) }
+        // Docket Memory: remembers work as it happens and syncs the iPhone folder when that's on.
+        MemoryCenter.shared.start(store: store)
 
         // Docket doesn't use window tabs (this also keeps tab items out of the View menu).
         NSWindow.allowsAutomaticWindowTabbing = false
@@ -114,6 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         focus.stop(markDone: false)
         alarms.persist()
         store.saveNow()
+        MemoryCenter.shared.flush()
     }
 
     /// The main window's keys, never while typing. Arrows move through tasks and notes (⇧ grows the
@@ -330,6 +334,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     @objc func quickCaptureAction(_ sender: Any?) { quickCapture.toggle() }
+    @objc func recordVoiceNoteAction(_ sender: Any?) { quickCapture.record() }
+    /// Screenshots: the capture panel's voice note.
+    var debugVoiceCapture: VoiceCaptureModel { quickCapture.voice }
+    func debugShowQuickCapture() { quickCapture.show() }
     @objc func showSettingsAction(_ sender: Any?) { showSettings() }
     @objc func showMainWindowAction(_ sender: Any?) { showMainWindow() }
     @objc func toggleSidebar(_ sender: Any?) {

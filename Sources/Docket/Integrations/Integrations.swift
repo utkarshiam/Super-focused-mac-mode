@@ -685,6 +685,9 @@ final class Integrations: ObservableObject {
     @Published var summarizing: Set<String> = []
     /// Why the last summary of an item couldn't be written, in plain words.
     @Published var summaryProblems: [String: String] = [:]
+    /// A message was made into a task or (with the note) saved as a note: Docket Memory remembers it. Set by
+    /// `MemoryCenter.start`; nil in tests.
+    var messageUsed: ((Suggestion, Note?) -> Void)?
 
     // Dependencies. Tests swap them, so nothing reaches the network, Gemini or a browser.
     var transport: IntegrationHTTP.Transport
@@ -1614,6 +1617,7 @@ final class Integrations: ObservableObject {
         let undo = store.undoManager
         undo?.beginUndoGrouping()
         let task = store.addTask(Self.task(for: current, lists: store.lists))
+        messageUsed?(current, nil)
         retire([current.id]) // usually done already, as the task appeared
         undo?.setActionName("Add Task")
         undo?.endUndoGrouping()

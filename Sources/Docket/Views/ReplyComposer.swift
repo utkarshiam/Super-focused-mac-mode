@@ -704,6 +704,7 @@ struct ReplyComposer: View {
             do {
                 try await integrations.sendReply(body, for: id, replyingTo: request.replyingTo, replyAll: request.replyAll)
                 Haptics.success()
+                MemoryCenter.shared.replySent(body, for: id)
                 conversation.didSend()
                 withAnimation(Motion.base) {
                     if text == body { text = "" }

@@ -1,4 +1,6 @@
+import AVFoundation
 import AppKit
+import MemoryKit
 import SwiftUI
 
 /// Development aid: with DOCKET_SNAPSHOT_DIR set, Docket walks through its main screens,
@@ -208,6 +210,7 @@ enum DebugSnapshot {
                 Integrations.shared.disconnectSlack()
                 Integrations.shared.disconnectGmail()
             }),
+        ] + memorySteps(d) + voiceSteps(d) + [
             ("18-pickers-light", {
                 NSApp.windows.first { $0.title == "Docket Settings" }?.close()
                 UserDefaults.standard.set(SettingsView.Tab.general.rawValue, forKey: SettingsView.tabKey)
@@ -224,6 +227,11 @@ enum DebugSnapshot {
                 d.app.selection = .calendar
                 d.app.selectedTaskID = firstTask()?.id
             }),
+            // Memory in the other appearance.
+            ("57-memory-other-appearance", {
+                d.app.selection = .memory
+                d.app.selectedMemoryID = MemoryCenter.shared.library.items.first { $0.title == "Seed round: investor feedback" }?.id
+            }),
         ]
 
         let t0 = ProcessInfo.processInfo.systemUptime
@@ -239,7 +247,10 @@ enum DebugSnapshot {
         // moment to start) is done before the next step changes the screen.
         let settle = min(step - 0.7, max(0.9, step * 0.55))
         var delay = 1.2
-        for (name, action) in steps + interactive {
+        // DOCKET_SNAPSHOT_ONLY="5,57" runs only the steps whose names start with one of those (a quick look at one area).
+        let only = (ProcessInfo.processInfo.environment["DOCKET_SNAPSHOT_ONLY"] ?? "").split(separator: ",").map(String.init)
+        let walk = (steps + interactive).filter { step in only.isEmpty || only.contains { step.0.hasPrefix($0) } }
+        for (name, action) in walk {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 if ProcessInfo.processInfo.environment["DOCKET_SNAPSHOT_TRACE"] != nil { note("step \(name) begin: \(stamp())") }
                 action()
@@ -259,10 +270,174 @@ enum DebugSnapshot {
                 capture(panel, to: dir.appendingPathComponent("10-alarm.png"))
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                // An open sheet would hold up quitting.
+                d.app.showsMemoryProfile = false
                 d.alarms.dismiss()
                 NSApp.terminate(nil)
             }
         }
+    }
+
+    /// Memory, seeded with neutral samples (`DOCKET_DATA_DIR` keeps it away from real data): the lens card,
+    /// the library and its media grid, an item rich in decisions and promises, an answer with citations (made
+    /// here, no network), the same question without a key, the profile, and a task with "From memory".
+    static func memorySteps(_ d: AppDelegate) -> [(String, () -> Void)] {
+        let library = MemoryCenter.shared.library
+        func item(_ title: String) -> MemoryItem? { library.items.first { $0.title == title } }
+        return [
+            ("50-memory-onboarding", {
+                NSApp.windows.first { $0.title == "Docket Settings" }?.close()
+                // The menu bar panel from the Messages steps would be captured instead of the window.
+                for panel in NSApp.windows where panel is FloatingPanel && panel.isVisible { panel.orderOut(nil) }
+                d.app.selectedTaskID = nil
+                d.app.sidebarVisible = true
+                MemoryView.debugOnboarding = true
+                d.app.selection = .memory
+            }),
+            ("51-memory-library", {
+                MemoryView.debugOnboarding = false
+                library.debugSeed(now: Date(), lenses: [.founder, .manager])
+                d.app.memoryAsk.clear()
+                d.app.memoryScope = .all
+                d.app.selectedMemoryID = nil
+                d.app.selection = .memory
+            }),
+            ("51b-memory-media", { d.app.memoryScope = .media }),
+            ("52-memory-item", {
+                d.app.memoryScope = .all
+                d.app.selectedMemoryID = item("Seed round: investor feedback")?.id
+            }),
+            ("52b-memory-item-bottom", { scrollDetail(in: d.mainWindow) }),
+            ("52c-memory-photo", { d.app.selectedMemoryID = item("Whiteboard: onboarding flow v2")?.id }),
+            ("53-memory-answer", {
+                d.app.selectedMemoryID = nil
+                let question = "What did investors push back on?"
+                let sources = ["Seed round: investor feedback", "Market sizing: SMB bookkeeping", "Pricing: annual discount question"].compactMap(item)
+                let json: [String: Any] = [
+                    "answer": "Harbor Capital's main pushback was that CAC payback is unclear and the market slide feels too broad [1]. "
+                        + "They responded well to the 92% logo retention [1]. A bottom-up sizing answers the market point: about 1.2M US "
+                        + "small businesses spending $4,800 a year, roughly $5.8B [2].",
+                    "answerable": true,
+                    "citations": [["source": 1, "quote": "CAC payback is unclear"], ["source": 2]],
+                    "followUps": ["What did Priya Shah promise to send?", "How should the market slide change?"],
+                ]
+                guard let data = try? JSONSerialization.data(withJSONObject: json),
+                      let answer = try? MemoryAsk.parse(data, question: question, sources: sources) else { return note("53: answer didn't parse") }
+                Task { @MainActor in
+                    let hits = await library.search(question, limit: 60)
+                    d.app.memoryAsk.debugShow(answer, hits: hits)
+                }
+            }),
+            // No key: the question becomes a search, and Memory says where the key goes.
+            ("53b-memory-no-key", {
+                d.app.memoryAsk.clear()
+                d.app.askMemory("pricing page")
+            }),
+            ("54-memory-profile", {
+                d.app.memoryAsk.clear()
+                d.app.showsMemoryProfile = true
+            }),
+            ("55-task-from-memory", {
+                d.app.showsMemoryProfile = false
+                UserDefaults.standard.set(false, forKey: "fromMemoryExpanded")
+                var t = TaskItem(title: "Send Jordan Lee the SOC 2 bridge letter")
+                t.notes = "The Acme renewal is blocked until their security team has it."
+                t.estimateMinutes = 20
+                let added = d.store.addTask(t)
+                d.app.reveal(task: added.id, in: d.store)
+            }),
+            ("55b-task-from-memory-open", { UserDefaults.standard.set(true, forKey: "fromMemoryExpanded") }),
+            ("55c-task-from-memory-bottom", { scrollDetail(in: d.mainWindow) }),
+        ]
+    }
+
+    /// Voice notes, without the microphone or Gemini: the capture panel recording (made-up levels and words),
+    /// the result of a canned debrief (real tasks and a memory with a silent recording), and that memory open
+    /// with its player, tasks and transcript.
+    static func voiceSteps(_ d: AppDelegate) -> [(String, () -> Void)] {
+        let library = MemoryCenter.shared.library
+        let voice = d.debugVoiceCapture
+        func hidePanels() { for panel in NSApp.windows where panel is FloatingPanel && panel.isVisible { (panel as? FloatingPanel)?.hide() } }
+        return [
+            ("58-voice-recording", {
+                NSApp.windows.first { $0.title == "Docket Settings" }?.close()
+                hidePanels()
+                d.app.showsMemoryProfile = false
+                var levels: [Float] = []
+                for i in 0..<VoiceRecorder.levelCount {
+                    // Speech-like: syllables over a slow swell, the same every run.
+                    let swell = 0.55 + 0.35 * sin(Double(i) / 4.3)
+                    let syllable = 0.5 + 0.5 * abs(sin(Double(i) * 1.7) * cos(Double(i) * 0.63))
+                    levels.append(i < 6 ? 0 : Float(max(0.05, min(1, swell * syllable))))
+                }
+                voice.debugShowRecording(levels: levels, elapsed: 74,
+                                         transcript: "Just walked out of the Mehta Traders meeting. Rohan wants the revised quote by Friday, "
+                                            + "and Priya will send the pilot numbers on Monday. I need to call Anil about the delivery dates.")
+                d.debugShowQuickCapture()
+            }),
+            ("58b-voice-result", {
+                if !library.lensesChosen { library.debugSeed(now: Date(), lenses: [.founder, .manager]) }
+                let outcome = debugApplyVoiceNote()
+                if let outcome { voice.show(outcome) } else { note("58b: the canned voice note didn't apply") }
+            }),
+            ("58c-voice-memory", {
+                hidePanels()
+                VoiceTranscriptSection.startsExpanded = true
+                VoiceMemoryPlayer.debugPosition = 41
+                d.app.memoryAsk.clear()
+                d.app.memoryScope = .all
+                d.app.selectedTaskID = nil
+                d.app.selection = .memory
+                d.app.selectedMemoryID = library.items.first { $0.title == "Pricing follow-up with Mehta Traders" }?.id
+            }),
+            ("58d-voice-memory-bottom", { scrollDetail(in: d.mainWindow) }),
+        ]
+    }
+
+    /// Applies a canned debrief (three tasks, a memory with a silent recording) as if Gemini had made it.
+    static func debugApplyVoiceNote() -> VoiceOutcome? {
+        let cal = Calendar.current
+        let now = Date()
+        let recordedAt = cal.date(byAdding: .minute, value: -12, to: now)!
+        let today = cal.startOfDay(for: now)
+        func day(_ d: Int, hour: Int? = nil) -> Date {
+            let base = cal.date(byAdding: .day, value: d, to: today)!
+            return hour.map { cal.date(bySettingHour: $0, minute: 0, second: 0, of: base)! } ?? base
+        }
+        // Weekday names follow the canned dates, so what's "said" matches the tasks' dates on any day.
+        let weekday = { (d: Date) in d.formatted(.dateTime.weekday(.wide)) }
+        let transcript = "Just walked out of the Mehta Traders meeting. Rohan liked the new pricing but wants a revised quote with "
+            + "the annual discount by \(weekday(day(2))), so I need to send that. Priya Shah will send the pilot numbers on \(weekday(day(3))). "
+            + "I also have to call Anil about the delivery dates, tomorrow at three. They decided to start with two stores "
+            + "before rolling out to all twelve. Overall a good meeting, they're keen to sign before Diwali."
+        let debrief = VoiceDebrief(
+            transcript: transcript, title: "Pricing follow-up with Mehta Traders",
+            summary: "Rohan Mehta liked the new pricing and wants a revised quote with the annual discount; Mehta Traders will pilot in two stores first.",
+            keyTakeaways: ["Revised quote with the annual discount due \(weekday(day(2)))", "Pilot in 2 stores before all 12", "Keen to sign before Diwali"],
+            people: ["Rohan Mehta", "Priya Shah", "Anil Kapoor"], projects: ["Mehta Traders"], tags: ["sales", "pricing"],
+            moments: [Moment(kind: .decision, text: "Start the pilot in two stores before rolling out to all twelve.", who: "Mehta Traders"),
+                      Moment(kind: .promise, text: "Priya Shah sends the pilot numbers.", who: "Priya Shah", due: day(3), direction: .theirs)],
+            tasks: [DebriefTask(title: "Send revised quote to Rohan Mehta", notes: "Include the annual discount.", dueDate: day(2),
+                                estimateMinutes: 30, priority: 3, listName: "Work", people: ["Rohan Mehta"]),
+                    DebriefTask(title: "Call Anil about delivery dates", dueDate: day(1, hour: 15), dueHasTime: true, estimateMinutes: 30,
+                                listName: "Work", people: ["Anil Kapoor"]),
+                    DebriefTask(title: "Check Priya's pilot numbers", dueDate: day(3), waitingOn: "Priya Shah", people: ["Priya Shah"])],
+            recordedAt: recordedAt, madeBy: "Mac")
+        let audio = silentRecording(seconds: 134)
+        return try? MemoryCenter.shared.voice.apply(debrief, audio: audio, moveAudio: true, sourceRef: SourceRef.voice(UUID()),
+                                                    origin: .manual, capturedFrom: "Mac", processed: true)
+    }
+
+    /// A quiet AAC recording, so the player has something real to load.
+    static func silentRecording(seconds: Double) -> URL? {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("docket-snapshot-\(UUID().uuidString).m4a")
+        let settings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 22_050, AVNumberOfChannelsKey: 1]
+        guard let file = try? AVAudioFile(forWriting: url, settings: settings),
+              let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 22_050) else { return nil }
+        buffer.frameLength = 22_050
+        if let data = buffer.floatChannelData { for i in 0..<22_050 { data[0][i] = 0 } }
+        for _ in 0..<Int(seconds) { try? file.write(from: buffer) }
+        return url
     }
 
     /// A note exercising every rendered element, with sample media from DOCKET_SNAPSHOT_MEDIA ("photo:video").

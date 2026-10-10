@@ -22,6 +22,8 @@ final class NotificationService: NSObject, ObservableObject {
         static let message = "MESSAGE"
         /// Several new messages at once.
         static let messages = "MESSAGES"
+        /// Tasks from a voice note recorded on the phone: a click opens them.
+        static let voice = "VOICE"
     }
 
     enum Action {
@@ -61,6 +63,7 @@ final class NotificationService: NSObject, ObservableObject {
                                              UNNotificationAction(identifier: Action.dismiss, title: "Dismiss")],
                                    intentIdentifiers: []),
             UNNotificationCategory(identifier: Category.messages, actions: [], intentIdentifiers: []),
+            UNNotificationCategory(identifier: Category.voice, actions: [], intentIdentifiers: []),
         ])
         requestAuthorization()
     }
@@ -214,6 +217,20 @@ final class NotificationService: NSObject, ObservableObject {
         center.add(UNNotificationRequest(identifier: "n|\(UUID())", content: content, trigger: nil))
     }
 
+    /// A voice note from the phone became tasks: "3 tasks from your voice note" over the first titles. A click
+    /// opens Docket on the first task (or on the memory, when it made no tasks, which isn't announced).
+    func deliverVoiceNote(_ outcome: VoiceOutcome, tasks: [TaskItem]) {
+        guard let center, let text = VoiceText.notification(tasks: tasks) else { return }
+        let content = UNMutableNotificationContent()
+        content.title = text.title
+        content.body = text.body
+        content.sound = .default
+        content.categoryIdentifier = Category.voice
+        content.threadIdentifier = "voice"
+        content.userInfo = ["taskIDs": tasks.map(\.id.uuidString), "memoryID": outcome.itemID.uuidString]
+        center.add(UNNotificationRequest(identifier: "v|\(outcome.itemID)", content: content, trigger: nil))
+    }
+
     /// The notification identifier of a message's notification ("m|slack:C0LEAD/1712345678.000100").
     static func messageIdentifier(_ itemID: String) -> String { "m|\(itemID)" }
 
@@ -254,10 +271,22 @@ final class NotificationService: NSObject, ObservableObject {
 
     // MARK: Actions
 
-    fileprivate func handle(action: String, taskID: UUID?, isAlarm: Bool, category: String, messageID: String?) {
+    fileprivate func handle(action: String, taskID: UUID?, isAlarm: Bool, category: String, messageID: String?,
+                            voiceTaskIDs: [UUID] = [], memoryID: UUID? = nil) {
         guard let store, let app else { return }
         if category == Category.message || category == Category.messages {
             return handleMessage(action: action, id: messageID, app: app)
+        }
+        if category == Category.voice {
+            guard action == UNNotificationDefaultActionIdentifier else { return }
+            if let first = voiceTaskIDs.first(where: { store.task($0) != nil }) {
+                app.reveal(task: first, in: store)
+            } else if let memoryID {
+                app.reveal(memory: memoryID)
+            } else {
+                app.showMainWindow()
+            }
+            return
         }
         switch action {
         case Action.complete:
@@ -324,10 +353,13 @@ extension NotificationService: UNUserNotificationCenterDelegate {
         let taskID = (content.userInfo["taskID"] as? String).flatMap(UUID.init(uuidString:))
         let isAlarm = content.userInfo["isAlarm"] as? Bool ?? false
         let messageID = content.userInfo["messageID"] as? String
+        let voiceTaskIDs = ((content.userInfo["taskIDs"] as? [String]) ?? []).compactMap(UUID.init(uuidString:))
+        let memoryID = (content.userInfo["memoryID"] as? String).flatMap(UUID.init(uuidString:))
         let action = response.actionIdentifier
         let category = content.categoryIdentifier
         Task { @MainActor in
-            NotificationService.shared.handle(action: action, taskID: taskID, isAlarm: isAlarm, category: category, messageID: messageID)
+            NotificationService.shared.handle(action: action, taskID: taskID, isAlarm: isAlarm, category: category, messageID: messageID,
+                                              voiceTaskIDs: voiceTaskIDs, memoryID: memoryID)
             completionHandler()
         }
     }

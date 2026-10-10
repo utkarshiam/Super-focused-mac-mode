@@ -119,6 +119,15 @@ struct MenuBarView: View {
                 }
                 .buttonStyle(SecondaryPill(height: 30))
                 KeyCap(text: Prefs.hotkeyPreset.rawValue)
+                Button {
+                    close()
+                    app.recordVoiceNote()
+                } label: {
+                    Image(systemName: "mic")
+                }
+                .buttonStyle(IconButtonStyle(size: 30, filled: true))
+                .help("Record a voice note")
+                .accessibilityLabel("Record a voice note")
                 Spacer()
                 Button("Quit") { NSApp.terminate(nil) }
                     .buttonStyle(PressScale())

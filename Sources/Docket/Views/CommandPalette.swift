@@ -1,7 +1,8 @@
 import AppKit
+import MemoryKit
 import SwiftUI
 
-/// ⌘K: jump to any task, note or view, or create a task from what you typed.
+/// ⌘K: jump to any task, note, memory or view, ask your memory, or create a task from what you typed.
 struct CommandPalette: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var app: AppState
@@ -125,6 +126,7 @@ struct CommandPalette: View {
             },
             Item(id: "c-inbox", icon: "tray", title: "Go to Inbox", subtitle: "⌘2") { app.selection = .inbox },
             Item(id: "c-notes", icon: "doc.text", title: "Go to Notes", subtitle: "⌘3") { app.selection = .notes },
+            Item(id: "c-memory", icon: "brain", title: "Go to Memory", subtitle: "⇧⌘M") { app.selection = .memory },
             Item(id: "c-important", icon: "flag", title: "Go to Important", subtitle: "⌘4") { app.selection = .important },
             Item(id: "c-completed", icon: "checkmark.circle", title: "Go to Completed", subtitle: "⌘6") { app.selection = .completed },
             Item(id: "c-insights", icon: "chart.bar", title: "Go to Insights", subtitle: "⌘7") { app.selection = .insights },
@@ -160,6 +162,13 @@ struct CommandPalette: View {
         if let e = parsed.estimateMinutes { detail.append(Fmt.duration(minutes: e)) }
         if let l = store.list(parsed.listID) { detail.append(l.name) }
 
+        let ask = Item(id: "ask", icon: "sparkle.magnifyingglass", title: "Ask memory: “\(q)”",
+                       subtitle: MemoryCenter.shared.hasAI ? "Answer from what you've saved" : "Search your memory") {
+            app.askMemory(q)
+        }
+        // A question goes to memory first; anything else waits below the tasks and notes.
+        let question = PaletteMemory.looksLikeQuestion(q)
+        if question { items.append(ask) }
         items += commands.filter { $0.title.localizedCaseInsensitiveContains(q) }
         items += store.searchTasks(q, limit: 15).map { t in
             let when = t.dueDate.map { Fmt.due($0, hasTime: t.dueHasTime) }
@@ -173,6 +182,13 @@ struct CommandPalette: View {
                 app.reveal(note: n.id)
             }
         }
+        items += MemoryCenter.shared.library.items(matching: MemoryFilter(text: q)).prefix(5).map { m in
+            Item(id: "m-\(m.id)", icon: m.kind.symbolName, title: m.displayTitle,
+                 subtitle: "Memory · \(MemoryText.date(m.createdAt, now: app.clock))") {
+                app.reveal(memory: m.id)
+            }
+        }
+        if !question { items.append(ask) }
         items.append(Item(id: "create", icon: "plus", title: "Create task “\(parsed.title)”",
                           subtitle: detail.isEmpty ? "Inbox" : detail.joined(separator: " · ")) {
             let t = store.addTask(TaskItem(parsed: parsed, defaultReminder: Prefs.defaultReminder, defaultIsAlarm: Prefs.defaultReminderIsAlarm))

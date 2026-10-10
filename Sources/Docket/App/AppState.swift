@@ -6,12 +6,13 @@ enum SidebarItem: Hashable {
     case list(UUID)
     case tag(String)
     case notes
+    case memory
     case insights
     case search, waiting, suggestions
 
     var isTaskView: Bool {
         switch self {
-        case .notes, .insights, .suggestions: false
+        case .notes, .memory, .insights, .suggestions: false
         default: true
         }
     }
@@ -128,8 +129,40 @@ final class AppState: ObservableObject {
     var showMainWindow: () -> Void = {}
     var showSettings: () -> Void = {}
     var showQuickCapture: () -> Void = {}
+    /// Opens the capture panel and starts recording a voice note.
+    var recordVoiceNote: () -> Void = {}
 
     private var toastWork: DispatchWorkItem?
+
+    // MARK: Memory
+
+    /// The memory open on the right of the Memory view.
+    @Published var selectedMemoryID: UUID?
+    /// What the Memory library shows: a kind, or a person, project or kind of moment.
+    @Published var memoryScope: MemoryScope = .all
+    /// A question to ask once the Memory view is up (⌘K "Ask memory: …"). The view asks it and clears it.
+    @Published var memoryQuestion: String?
+    /// "What Docket knows about me" is open.
+    @Published var showsMemoryProfile = false
+    /// The Ask field, its answer and the search behind it. Kept here so they're still there after a detour.
+    let memoryAsk = MemoryAskModel()
+
+    /// Opens Memory on one item.
+    func reveal(memory id: UUID) {
+        selection = .memory
+        selectedMemoryID = id
+        showMainWindow()
+    }
+
+    /// Opens Memory and asks `question` there.
+    func askMemory(_ question: String) {
+        let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return }
+        selection = .memory
+        selectedMemoryID = nil
+        memoryQuestion = q
+        showMainWindow()
+    }
 
     /// Opens Messages, on the message `id` when it's still there.
     func reveal(message id: String?) {

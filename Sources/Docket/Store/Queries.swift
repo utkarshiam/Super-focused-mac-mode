@@ -331,7 +331,7 @@ extension Store {
             let ordered = sort == .smart ? waitingOrder(items) : sorted(items, by: sort)
             return [TaskSection(id: "waiting", title: "Waiting on others", tasks: ordered)].filter { !$0.tasks.isEmpty }
 
-        case .notes, .insights, .search, .suggestions:
+        case .notes, .memory, .insights, .search, .suggestions:
             return []
         }
     }

@@ -6,6 +6,9 @@ import UniformTypeIdentifiers
 /// and hides itself when it loses focus or Esc is pressed.
 class FloatingPanel: NSPanel {
     var onHide: (() -> Void)?
+    /// While true the panel stays up when another window takes the focus (a recording in progress, or the
+    /// microphone permission prompt).
+    var staysOpen: () -> Bool = { false }
     private(set) var lastHidden = Date.distantPast
 
     init(size: NSSize) {
@@ -32,7 +35,7 @@ class FloatingPanel: NSPanel {
 
     override func resignKey() {
         super.resignKey()
-        hide()
+        if !staysOpen() { hide() }
     }
 
     override func cancelOperation(_ sender: Any?) { hide() }
@@ -188,8 +191,9 @@ final class StatusItemController: NSObject {
         let menu = NSMenu()
         let open = NSMenuItem(title: "Open Docket", action: #selector(AppDelegate.showMainWindowAction(_:)), keyEquivalent: "")
         let capture = NSMenuItem(title: "Quick Capture", action: #selector(AppDelegate.quickCaptureAction(_:)), keyEquivalent: "")
+        let record = NSMenuItem(title: "Record Voice Note", action: #selector(AppDelegate.recordVoiceNoteAction(_:)), keyEquivalent: "")
         let settings = NSMenuItem(title: "Settings…", action: #selector(AppDelegate.showSettingsAction(_:)), keyEquivalent: "")
-        [open, capture, settings].forEach { $0.target = delegate; menu.addItem($0) }
+        [open, capture, record, settings].forEach { $0.target = delegate; menu.addItem($0) }
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Docket", action: #selector(NSApplication.terminate(_:)), keyEquivalent: ""))
         item.menu = menu
@@ -203,27 +207,72 @@ final class StatusItemController: NSObject {
 @MainActor
 final class QuickCaptureController {
     private weak var delegate: AppDelegate?
-    private let panel = QuickCapturePanel(size: NSSize(width: 640, height: 172))
+    private let panel = QuickCapturePanel(size: NSSize(width: 640, height: VoiceCaptureLayout.base))
+    /// The voice note under way, kept across openings so closing the panel never loses a recording.
+    let voice: VoiceCaptureModel
 
     init(delegate: AppDelegate) {
         self.delegate = delegate
+        voice = VoiceCaptureModel(intake: MemoryCenter.shared.voice)
         panel.level = .modalPanel
+        panel.staysOpen = { [weak voice] in voice?.isBusy ?? false }
+        panel.onHide = { [weak self] in self?.panelHidden() }
+        voice.announce = { [weak delegate] outcome in
+            guard let delegate else { return }
+            let tasks = outcome.taskIDs.compactMap(delegate.store.task)
+            if tasks.isEmpty {
+                delegate.app.showToast("Your voice note is in Memory")
+            } else {
+                NotificationService.shared.deliverVoiceNote(outcome, tasks: tasks)
+                delegate.app.showToast("\(VoiceText.headline(tasks: tasks.count)) from your voice note")
+            }
+        }
     }
 
     func toggle() {
         panel.isVisible ? panel.hide() : show()
     }
 
+    /// Opens the panel recording (or on the voice note already under way).
+    func record() {
+        show()
+        if !voice.isActive || voice.phase == .result { voice.start() }
+    }
+
+    /// Hidden by Esc, a click elsewhere or the shortcut: a recording is stopped and saved (never thrown
+    /// away), a finished result is dismissed.
+    private func panelHidden() {
+        voice.isPresented = false
+        switch voice.phase {
+        case .recording: voice.stop()
+        case .starting: voice.cancel()
+        case .result, .failed: voice.reset()
+        default: break
+        }
+    }
+
+    /// Grows or shrinks the panel, keeping its top edge where it is.
+    private func resize(to height: CGFloat) {
+        var frame = panel.frame
+        guard abs(frame.height - height) > 0.5 else { return }
+        frame.origin.y += frame.height - height
+        frame.size.height = height
+        panel.setFrame(frame, display: true, animate: false)
+    }
+
     func show() {
         guard let delegate else { return }
         // Fresh view each time so the field starts empty and focused.
-        panel.contentView = NSHostingView(rootView: QuickCaptureView(close: { [weak self] in self?.panel.hide() })
+        panel.contentView = NSHostingView(rootView: CapturePanelView(voice: voice, close: { [weak self] in self?.panel.hide() },
+                                                                     resize: { [weak self] h in self?.resize(to: h) })
             .environmentObject(delegate.store)
             .environmentObject(delegate.app))
+        voice.isPresented = true
         let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main
         if let frame = screen?.visibleFrame {
-            let size = panel.frame.size
-            panel.setFrameOrigin(NSPoint(x: frame.midX - size.width / 2, y: frame.minY + frame.height * 0.68))
+            let height = voice.panelHeight
+            panel.setFrame(NSRect(x: frame.midX - 320, y: frame.minY + frame.height * 0.68 + VoiceCaptureLayout.base - height,
+                                  width: 640, height: height), display: false)
         }
         panel.makeKeyAndOrderFront(nil)
         // Put the cursor in the field now, not on the next SwiftUI update, so the first keystrokes

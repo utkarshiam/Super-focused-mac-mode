@@ -1,3 +1,4 @@
+import MemoryKit
 import SwiftUI
 
 struct TaskDetailView: View {
@@ -61,6 +62,8 @@ struct TaskDetailView: View {
                 setSection(task, binding)
                 if showsChecklist(task) { checklistSection(task, binding) }
                 addSection(task, binding)
+                // What's already known about it: a quiet line, hidden when nothing is related.
+                FromMemoryStrip(text: task.title + "\n" + task.notes, excluding: [SourceRef.task(taskID)])
 
                 SourceLinkButton(taskID: taskID)
                 if let noteID = task.linkedNoteID, let note = store.note(noteID) {

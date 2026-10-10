@@ -45,6 +45,7 @@ struct RootView: View {
     @ViewBuilder private var content: some View {
         switch app.selection {
         case .notes: NotesView()
+        case .memory: MemoryView()
         case .insights: InsightsView()
         case .search: SearchView()
         case .suggestions: SuggestionsView()
@@ -114,6 +115,7 @@ struct SidebarView: View {
     @EnvironmentObject var app: AppState
     @EnvironmentObject var focus: FocusTimer
     @ObservedObject private var integrations = Integrations.shared
+    @ObservedObject private var memory = MemoryCenter.shared.library
     @State private var editingList: TaskList?
     @State private var listToDelete: TaskList?
     /// The "More" and "Tags" sections start collapsed; the choice is remembered.
@@ -160,6 +162,7 @@ struct SidebarView: View {
                         navRow(.suggestions, "Messages", "tray.and.arrow.down", count: integrations.pendingCount)
                     }
                     navRow(.notes, "Notes", "doc.text", count: store.notes.count)
+                    navRow(.memory, "Memory", "brain", count: memory.count)
 
                     sectionLabel("Lists") {
                         Button {
